@@ -37,7 +37,7 @@ async fn snapshot_before_sha_tracks_working_tree_state() {
     // Clean tree: the change under test is the last commit, so the diff base
     // is HEAD^ (an equal-tree HEAD..S would be empty).
     let clean_run: RunId = "66666666-6666-4666-8666-666666666666".parse().unwrap();
-    let clean = create_workspace_snapshot(&state_dir, &workspace, clean_run, None, None)
+    let clean = create_workspace_snapshot(&state_dir, &workspace, clean_run, None, None, None)
         .await
         .expect("clean-tree snapshot should succeed");
     assert_eq!(
@@ -50,7 +50,7 @@ async fn snapshot_before_sha_tracks_working_tree_state() {
     // base is HEAD itself.
     fs::write(workspace.join("file.txt"), "three (uncommitted)\n").unwrap();
     let dirty_run: RunId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
-    let dirty = create_workspace_snapshot(&state_dir, &workspace, dirty_run, None, None)
+    let dirty = create_workspace_snapshot(&state_dir, &workspace, dirty_run, None, None, None)
         .await
         .expect("dirty-tree snapshot should succeed");
     assert_ne!(
@@ -229,10 +229,10 @@ async fn workspace_snapshots_reuse_large_base_objects_and_materialize_changes() 
     let second_run: RunId = "33333333-3333-4333-8333-333333333333".parse().unwrap();
     let changed_run: RunId = "44444444-4444-4444-8444-444444444444".parse().unwrap();
 
-    let first = create_workspace_snapshot(&state_dir, &workspace, first_run, None, None)
+    let first = create_workspace_snapshot(&state_dir, &workspace, first_run, None, None, None)
         .await
         .expect("first snapshot should succeed");
-    let second = create_workspace_snapshot(&state_dir, &workspace, second_run, None, None)
+    let second = create_workspace_snapshot(&state_dir, &workspace, second_run, None, None, None)
         .await
         .expect("second unchanged snapshot should succeed");
     let first_repository = state_dir.join(&first.repository);
@@ -266,7 +266,7 @@ async fn workspace_snapshots_reuse_large_base_objects_and_materialize_changes() 
     fs::create_dir_all(workspace.join("ignored-dir")).unwrap();
     fs::write(workspace.join("ignored-dir/hidden.txt"), b"ignored\n").unwrap();
 
-    let changed = create_workspace_snapshot(&state_dir, &workspace, changed_run, None, None)
+    let changed = create_workspace_snapshot(&state_dir, &workspace, changed_run, None, None, None)
         .await
         .expect("changed snapshot should succeed");
     let changed_repository = state_dir.join(&changed.repository);
@@ -737,6 +737,291 @@ jobs:
     );
 }
 
+/// The snapshot Git endpoint is authenticated by the job runtime credential —
+/// the value pinned into a redirected checkout step and exported to workflow
+/// code as `ACTIONS_RUNTIME_TOKEN`. That credential is spent with its attempt:
+/// once the job has completed (or been reaped), its token must not keep
+/// fetching the run's snapshot for the rest of its lifetime.
+#[tokio::test]
+async fn snapshot_git_rejects_a_completed_jobs_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    let accepted = submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+"#,
+        "owner/repo",
+    )
+    .await;
+    let run_id: RunId = accepted["run_id"].as_str().unwrap().parse().unwrap();
+
+    let acquired = acquire_queued_job(&app, "snapshot-settled").await;
+    let checkout = acquired["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the acquired job should contain the checkout step");
+    let runtime_token = delivered_step_input(checkout, "token")
+        .expect("the claimed checkout carries the runtime token");
+
+    let advertisement = |app: axum::Router, token: String| async move {
+        app.oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/snapshots/{run_id}/info/refs?service=git-upload-pack"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    };
+    // While the attempt is live, its checkout credential fetches the snapshot.
+    let live = advertisement(app.clone(), runtime_token.to_owned()).await;
+    assert_eq!(live.status(), StatusCode::OK);
+    // Settle the attempt — what `completejob` (or the reaper) does.
+    let request_id = {
+        let job_id = JobId("build".to_owned());
+        state
+            .test_db_mutate(move |tx| {
+                tx.request_key_for(run_id, &job_id)
+                    .unwrap()
+                    .expect("the claimed attempt")
+                    .0
+            })
+            .await
+    };
+    state
+        .test_db_mutate(move |tx| {
+            tx.update_request(request_id, None, None, Some("success"), None)
+                .unwrap();
+        })
+        .await;
+
+    let settled = advertisement(app.clone(), runtime_token.to_owned()).await;
+    assert_eq!(
+        settled.status(),
+        StatusCode::FORBIDDEN,
+        "a completed job's token must not keep fetching the run's snapshot"
+    );
+    let bytes = to_bytes(settled.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["error"],
+        "snapshot Git token belongs to a completed job"
+    );
+}
+
+/// A job that declares a `timeout-minutes` above the six-hour default must
+/// still get a runtime token that outlives it: the attempt presents that one
+/// credential on every job-scoped route — lease renewal, completion, the step
+/// and job log uploads — and can never be issued another, so a token that
+/// expired before the job's own timeout would hand the lease to the reaper
+/// while the job was still running.
+#[tokio::test]
+async fn claimed_runtime_token_covers_a_declared_longer_job_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 1200
+    steps:
+      - uses: actions/checkout@v4
+"#,
+        "owner/repo",
+    )
+    .await;
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": 1, "name": "long-timeout-runner"},
+            "ownerName": "long timeout test",
+            "sessionId": "00000000-0000-0000-0000-000000000001",
+            "useFipsEncryption": false
+        }),
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let broker_message = request_json(
+        &app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+        ),
+        Value::Null,
+    )
+    .await;
+    let broker_body: Value =
+        serde_json::from_str(broker_message["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = broker_body["runner_request_id"]
+        .as_str()
+        .expect("broker message should identify the queued request");
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "long-timeout-runner", &["self-hosted"], None).await;
+
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/broker/1/acquirejob",
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &runner_token,
+    )
+    .await;
+    let checkout = acquired["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the acquired job should contain the checkout step");
+    let claimed_token = delivered_step_input(checkout, "token").expect("claimed pinned token");
+    let claims = state
+        .verify_local_jwt_claims(claimed_token)
+        .expect("the claimed token must verify as a local JWT");
+    let iat = claims["iat"].as_u64().expect("iat is minted");
+    let exp = claims["exp"].as_u64().expect("exp is minted");
+    assert!(
+        exp - iat >= 1200 * 60 + 4 * 60 * 60,
+        "a claimed runtime token must outlive the job's declared timeout plus the pause credit, \
+         got {}s",
+        exp - iat
+    );
+}
+
+/// A fork's `timeout-minutes` is untrusted input, and a job's value is not
+/// range-checked the way a step's 1..=360 is. Both the timeout the runner is
+/// given and the credential sizing it are clamped to GitHub's own maximum
+/// (five days): the service cancels a job at that point regardless of what the
+/// workflow declared, so a longer declaration must not buy a longer lease nor
+/// an arbitrarily long-lived token on this server.
+#[tokio::test]
+async fn claimed_job_timeout_and_token_are_clamped_to_the_github_maximum() {
+    use preloop_gha_parser::job_builder::MAX_JOB_TIMEOUT_SECONDS;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (state_dir, workspace) = create_snapshot_fixture(temp.path());
+    let mut state = AppState::new(state_dir.clone()).await.unwrap();
+    state.local_workspace = Some(workspace.clone());
+    let app = app(state.clone(), CancellationToken::new());
+
+    submit_yaml(
+        &app,
+        r#"
+on: push
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 100000
+    steps:
+      - uses: actions/checkout@v4
+"#,
+        "owner/repo",
+    )
+    .await;
+
+    let session = request_json(
+        &app,
+        Method::POST,
+        "/runner/server/_apis/distributedtask/pools/1/sessions",
+        json!({
+            "agent": {"id": 1, "name": "over-max-runner"},
+            "ownerName": "clamped timeout test",
+            "sessionId": "00000000-0000-0000-0000-000000000002",
+            "useFipsEncryption": false
+        }),
+    )
+    .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    let broker_message = request_json(
+        &app,
+        Method::GET,
+        &format!(
+            "/runner/server/_apis/distributedtask/pools/1/messages?sessionId={session_id}&waitSeconds=0"
+        ),
+        Value::Null,
+    )
+    .await;
+    let broker_body: Value =
+        serde_json::from_str(broker_message["body"].as_str().unwrap()).unwrap();
+    let runner_request_id = broker_body["runner_request_id"]
+        .as_str()
+        .expect("broker message should identify the queued request");
+    let (_runner_id, runner_token) =
+        register_runner_with_token(&app, "over-max-runner", &["self-hosted"], None).await;
+
+    let acquired = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/broker/1/acquirejob",
+        json!({
+            "jobMessageId": runner_request_id,
+            "billingOwnerId": "local",
+            "runnerOS": "linux"
+        }),
+        &runner_token,
+    )
+    .await;
+    assert_eq!(
+        acquired["jobTimeout"].as_i64(),
+        Some(MAX_JOB_TIMEOUT_SECONDS),
+        "the delivered jobTimeout must be clamped to GitHub's maximum, got {}",
+        acquired["jobTimeout"]
+    );
+
+    let checkout = acquired["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["reference"]["name"].as_str() == Some("actions/checkout"))
+        .expect("the acquired job should contain the checkout step");
+    let claimed_token = delivered_step_input(checkout, "token").expect("claimed pinned token");
+    let claims = state
+        .verify_local_jwt_claims(claimed_token)
+        .expect("the claimed token must verify as a local JWT");
+    let iat = claims["iat"].as_u64().expect("iat is minted");
+    let exp = claims["exp"].as_u64().expect("exp is minted");
+    let max_seconds = MAX_JOB_TIMEOUT_SECONDS as u64;
+    let pause_credit = MAX_PAUSE_CREDIT.as_secs();
+    assert!(
+        exp - iat >= max_seconds + pause_credit,
+        "the token must cover the clamped timeout plus the pause credit, got {}s",
+        exp - iat
+    );
+    assert!(
+        exp - iat <= max_seconds + pause_credit + 10 * 60,
+        "an over-max declaration must not stretch the token past the clamped ceiling, got {}s",
+        exp - iat
+    );
+}
+
 /// A retry verdict must carry a freshly minted snapshot credential: the
 /// worker replays the failed step from the message it already holds, whose
 /// pinned token may be long expired.
@@ -858,6 +1143,7 @@ async fn verdict_poll_releases_inner_before_the_backend_read() {
         temp.path().to_path_buf(),
         crate::config::config_path(),
         Some(&pg_url),
+        None,
     )
     .await
     .unwrap();
@@ -3345,6 +3631,149 @@ async fn results_uuid_spellings_use_canonical_paths_and_metadata_keys() {
             .get(&format!("results:{plan}:{canonical}:job:{canonical}"))
             .map(|meta| (meta.byte_count, meta.line_count)),
         Some((400, 5))
+    );
+}
+
+/// A runner addresses its own job on the action path with
+/// `system.orchestrationId` as the plan segment (`{planId}.{base}.__default`).
+/// Authorization accepts that spelling, but Results storage stays under the
+/// token's own plan: a replay path or metadata key built from the
+/// orchestration spelling would name a namespace no reader resolves, so the
+/// logs would be written somewhere nothing reads them back from.
+#[tokio::test]
+async fn results_storage_uses_the_tokens_own_plan_not_the_orchestration_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+    let plan = uuid::Uuid::new_v4().to_string();
+    let job = uuid::Uuid::new_v4();
+    let canonical = job.to_string();
+    let orchestration = format!("{plan}.build.__default");
+    let token = state.mint_runtime_token(&plan, &job);
+    // Results writes require a live job record.
+    register_live_job(&state, job, &plan).await;
+
+    for (uri, field) in [
+        (
+            "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+            "logs_url",
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/GetStepLogsSignedBlobURL",
+            "logs_url",
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/GetStepSummarySignedBlobURL",
+            "summary_url",
+        ),
+    ] {
+        let payload = request_json_with_bearer(
+            &app,
+            Method::POST,
+            uri,
+            json!({
+                "workflow_run_backend_id": orchestration,
+                "workflow_job_run_backend_id": canonical,
+                "step_backend_id": "step-1",
+            }),
+            &token,
+        )
+        .await;
+        let url = payload[field].as_str().unwrap();
+        assert!(
+            url.contains(&format!("/replay/results/{plan}/{canonical}/")),
+            "the minted path must stay under the token's own plan: {url}"
+        );
+        assert!(
+            !url.contains("__default"),
+            "the orchestration spelling is not a storage namespace: {url}"
+        );
+    }
+
+    // A job-log upload through the minted URL lands where the reader looks.
+    let job_logs = request_json_with_bearer(
+        &app,
+        Method::POST,
+        "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL",
+        json!({
+            "workflow_run_backend_id": orchestration,
+            "workflow_job_run_backend_id": canonical,
+        }),
+        &token,
+    )
+    .await;
+    let uploaded = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(job_logs["logs_url"].as_str().unwrap())
+                .body(Body::from("merged job log"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    assert_eq!(
+        tokio::fs::read_to_string(
+            temp.path()
+                .join("replay")
+                .join("results")
+                .join(&plan)
+                .join(&canonical)
+                .join("job-logs.txt"),
+        )
+        .await
+        .unwrap(),
+        "merged job log"
+    );
+
+    for (uri, body) in [
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepSummaryMetadata",
+            json!({
+                "workflow_run_backend_id": orchestration,
+                "workflow_job_run_backend_id": canonical,
+                "step_backend_id": "step-1",
+                "size": 17,
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateStepLogsMetadata",
+            json!({
+                "workflow_run_backend_id": orchestration,
+                "workflow_job_run_backend_id": canonical,
+                "step_backend_id": "step-1",
+                "line_count": 3,
+            }),
+        ),
+        (
+            "/twirp/results.services.receiver.Receiver/CreateJobLogsMetadata",
+            json!({
+                "workflow_run_backend_id": orchestration,
+                "workflow_job_run_backend_id": canonical,
+                "line_count": 5,
+            }),
+        ),
+    ] {
+        request_json_with_bearer(&app, Method::POST, uri, body, &token).await;
+    }
+    let inner = state.inner.lock().await;
+    let keys = inner
+        .log_metadata
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<String>>();
+    let expected = [
+        format!("results:{plan}:{canonical}:summary:step-1"),
+        format!("results:{plan}:{canonical}:step:step-1"),
+        format!("results:{plan}:{canonical}:job:{canonical}"),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<String>>();
+    assert_eq!(
+        keys, expected,
+        "metadata must stay in the token's plan namespace, never the orchestration spelling"
     );
 }
 

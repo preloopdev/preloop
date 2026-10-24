@@ -89,12 +89,15 @@ an incident report.
 
 ## Dependency bumps (`renovate.json`, `versions.toml`)
 
-- `smolvm_min_version` is the runtime floor compiled into the CLI and the VM
-  crate; it must stay at the first release that satisfies every runtime
-  invariant (fork freeze-source flag, packed-machine UID/GID restoration for
-  an unprivileged smolvm). `smolvm_golden_version` is Renovate-managed and
-  tracks the last release verified by `smolvm-release-verify.yml` (real-VM E2E
-  on GitHub-hosted KVM). SmolVM bumps auto-merge once that check and `ci.yml`
-  pass.
+- `smolvm_min_version` is the runtime floor compiled into the VM crate
+  (`crates/preloop-vm/build.rs`, which the CLI's updater reads); it must stay
+  at the first release that satisfies every runtime invariant (fork
+  freeze-source flag, packed-machine UID/GID restoration for an unprivileged
+  smolvm, the x86_64 virtio device budget that SmolVM 1.23.0 raised from 11 to
+  19 MMIO IRQ lines). `smolvm_golden_version` is Renovate-managed and tracks
+  the last release verified by `smolvm-release-verify.yml` (real-VM E2E on
+  GitHub-hosted KVM); it feeds the next bake, not the golden already published
+  as a digest-pinned OCI artifact. SmolVM bumps auto-merge once that check and
+  `ci.yml` pass.
 - The `actions/runner` bump is a tripwire for the runner-watch pipeline and
   never auto-merges: the protocol delta needs goldens and review first.

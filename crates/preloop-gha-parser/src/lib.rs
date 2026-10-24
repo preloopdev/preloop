@@ -24,6 +24,8 @@ pub use expand::{
     expand_jobs_with_reusables, expand_jobs_with_reusables_and_shas,
     expand_jobs_with_reusables_and_shas_and_inputs,
     expand_jobs_with_reusables_and_shas_and_inputs_and_event, expand_reusable_call,
+    is_local_workflow_ref, is_plain_path, is_plain_segment, is_reusable_workflow_path,
+    same_repository_path, scope_same_repository_ref,
 };
 pub use models::*;
 pub use secrets::{

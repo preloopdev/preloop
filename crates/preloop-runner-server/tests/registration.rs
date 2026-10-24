@@ -28,7 +28,7 @@ async fn broker_claim_restates_narrowed_repository_permissions() {
             get(|| async { Json(json!([{"id": 4242, "account": {"login": "owner"}}])) }),
         )
         .route(
-            "/app/installations/:installation_id",
+            "/app/installations/{installation_id}",
             get(|Path(installation_id): Path<u64>| async move {
                 assert_eq!(installation_id, 4242);
                 Json(json!({
@@ -41,7 +41,7 @@ async fn broker_claim_restates_narrowed_repository_permissions() {
             }),
         )
         .route(
-            "/app/installations/:installation_id/access_tokens",
+            "/app/installations/{installation_id}/access_tokens",
             post({
                 let access_token_calls = access_token_calls.clone();
                 move |Path(installation_id): Path<u64>, body: Json<Value>| {
@@ -81,7 +81,7 @@ async fn broker_claim_restates_narrowed_repository_permissions() {
     let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
     let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", api_base);
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
@@ -262,7 +262,7 @@ async fn a_completed_job_drops_its_deferred_token_request() {
         format!("http://127.0.0.1:{closed_port}"),
     );
 
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
@@ -414,7 +414,7 @@ async fn persisted_token_request_without_trust_metadata_fails_closed() {
     // Broker/mint assertion: an old request (untrusted by fail-closed
     // default) under the `pat` policy must not receive the PAT when the mint
     // fails — `local-workspace-only` fails before any network I/O.
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     let mut creds = GitHubAppCredentials::for_tests("424", private_key, MintFailurePolicy::Pat);
@@ -853,7 +853,7 @@ async fn cache_v2_namespace_follows_the_job_token_not_the_request_body() {
 /// connection-refused instead of reaching api.github.com, where a fake PAT
 /// would 401 and fail the run. The scopes are then `Unverifiable`, so the PAT
 /// is withheld from jobs while the run itself still proceeds.
-
+///
 /// A PAT-only deployment embeds the static PAT into job messages at build
 /// time. That override must never reach a fork-restricted job: the job keeps
 /// the local job-scoped runtime token, which authenticates only against this
@@ -1000,6 +1000,7 @@ async fn fork_pull_request_webhook_jobs_are_downgraded_and_secrets_denied() {
     .unwrap();
 
     let base_sha = commit_workflow_fixture(&ws_dir, &[".github/workflows/test.yml"]);
+    add_fixture_origin(temp.path(), &ws_dir);
 
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.webhook_secret = Some("super-secret".to_owned());
@@ -1296,7 +1297,7 @@ async fn app_token_mint_failure_follows_the_configured_policy() {
     // A key is needed to populate the credentials but is never exercised: a
     // `repository` with no `owner/repo` slug cannot be scoped to a repository,
     // so the mint fails before it signs anything or opens a socket.
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
 
     for policy in [MintFailurePolicy::LocalJwt, MintFailurePolicy::Error] {
         let temp = tempfile::tempdir().unwrap();
@@ -1362,7 +1363,7 @@ async fn a_dispatch_refused_by_the_mint_policy_fails_its_run_without_the_reaper(
 
     // `local-workspace-only` carries no `owner/repo` slug, so the mint fails
     // before it signs anything or opens a socket.
-    let private_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
@@ -1580,7 +1581,7 @@ async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
             }),
         )
         .route(
-            "/app/installations/:installation_id/access_tokens",
+            "/app/installations/{installation_id}/access_tokens",
             post(|Path(installation_id): Path<u64>| async move {
                 assert_eq!(installation_id, 4242);
                 Json(json!({
@@ -1626,7 +1627,7 @@ async fn app_only_server_fetches_webhook_workflows_with_installation_token() {
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
-        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+        RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
         MintFailurePolicy::LocalJwt,
     ));
     let shared = Arc::new(SharedState {
@@ -1741,7 +1742,7 @@ async fn app_only_server_resolves_pull_request_changed_files_with_installation_t
             }),
         )
         .route(
-            "/app/installations/:installation_id/access_tokens",
+            "/app/installations/{installation_id}/access_tokens",
             post(
                 |Path(installation_id): Path<u64>, body: Json<Value>| async move {
                     assert_eq!(installation_id, 4242);
@@ -1782,7 +1783,7 @@ async fn app_only_server_resolves_pull_request_changed_files_with_installation_t
     let mut state = AppState::new(temp.path().to_path_buf()).await.unwrap();
     state.github_app = Some(GitHubAppCredentials::for_tests(
         "424",
-        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap(),
+        RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap(),
         MintFailurePolicy::LocalJwt,
     ));
     let shared = Arc::new(SharedState {
@@ -2519,13 +2520,12 @@ async fn starvation_sweep_does_not_close_the_stream_while_jobs_remain_queued() {
         if let NdjsonEvent::RunStatus {
             run_id: id, status, ..
         } = event
+            && id == run_id
         {
-            if id == run_id {
-                if status.is_terminal() {
-                    saw_terminal_run_status = true;
-                } else {
-                    saw_non_terminal_run_status = true;
-                }
+            if status.is_terminal() {
+                saw_terminal_run_status = true;
+            } else {
+                saw_non_terminal_run_status = true;
             }
         }
     }
@@ -2598,13 +2598,12 @@ async fn starvation_sweep_publishes_final_run_status_when_every_job_starves() {
         if let NdjsonEvent::RunStatus {
             run_id: id, status, ..
         } = event
+            && id == run_id
         {
-            if id == run_id {
-                if status.is_terminal() {
-                    saw_terminal_run_status = true;
-                } else {
-                    saw_non_terminal_run_status = true;
-                }
+            if status.is_terminal() {
+                saw_terminal_run_status = true;
+            } else {
+                saw_non_terminal_run_status = true;
             }
         }
     }
@@ -3007,7 +3006,7 @@ async fn debug_session_suspends_job_timeout() {
 }
 
 /// Status of a bearer-authenticated request, for asserting rejections.
-
+///
 /// One job's debug-worker token must not reach another job's debug session.
 ///
 /// Token validity alone used to authorize every worker route, so any live job
@@ -3264,7 +3263,7 @@ async fn the_job_message_never_carries_the_debug_worker_token() {
 }
 
 /// Open a debug session as a worker would, for exchange tests.
-
+///
 /// The exchange that replaces the removed variable is as narrow as the
 /// credential it issues.
 ///
@@ -3799,11 +3798,7 @@ async fn preserve_on_failure_carries_the_run_id_for_the_debug_session() {
         .await;
         let run_id = accepted["run_id"].as_str().unwrap().to_owned();
 
-        let queued = {
-            let inner = state.test_tx().await;
-            let q = inner.ready().next().cloned().unwrap();
-            q
-        };
+        let queued = state.test_tx().await.ready().next().cloned().unwrap();
         assert_eq!(
             queued.message.preloop_debug_run_id.as_deref() == Some(run_id.as_str()),
             expect_run_id,

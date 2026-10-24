@@ -3,7 +3,7 @@ use preloop_orchestrator::{
     DEBUG_MARKER_IDLE, JobVmDiskReserve, RUNNER_BUSY_LINE, RunnerPool, RunnerPoolConfig,
     artifact_payload, node_externals,
 };
-use preloop_vm::{
+use preloop_sandbox::drivers::smolvm::cli::{
     ExecOutput, MachineName, MachineSpec, MachineState, NetworkPolicy, OutputChunk,
     ProviderCapabilities, SecretSource, SocketMount, VmError, VmProvider, VolumeMount,
 };
@@ -51,10 +51,16 @@ struct RecordingVmProvider {
     state: Mutex<ProviderState>,
     run_actions: Mutex<Vec<RunAction>>,
     changed: Notify,
-    /// Whether packs are host files (SmolVM) or live server-side (AgentENV).
+    /// Whether packs are host files (SmolVM) or live server-side (a snapshot backend).
     /// A backend without host-side packs has no artifact to unpack, so its
     /// golden is baked in the guest instead.
     file_packs: bool,
+    /// When set, `start` records the machine as running and then blocks until
+    /// notified, so a test can observe the pool mid-provision.
+    start_gate: Option<Arc<Notify>>,
+    /// When set, `pack` fails: the artifact build leaves its builder behind,
+    /// which is what the pool's error path must clean up.
+    fail_pack: bool,
 }
 
 impl RecordingVmProvider {
@@ -71,13 +77,29 @@ impl RecordingVmProvider {
             run_actions: Mutex::new(run_actions),
             changed: Notify::new(),
             file_packs: true,
+            start_gate: None,
+            fail_pack: false,
         }
     }
 
-    /// Model a backend whose packs are not host files (AgentENV): there is no
+    /// Model a backend whose packs are not host files: there is no
     /// artifact to unpack, so the pool prepares its golden in the guest.
     fn no_packs(mut self) -> Self {
         self.file_packs = false;
+        self
+    }
+
+    /// Block `start` until the gate is released, so a shutdown can be sent
+    /// while a machine is booting.
+    fn with_start_gate(mut self, gate: Arc<Notify>) -> Self {
+        self.start_gate = Some(gate);
+        self
+    }
+
+    /// Fail `pack`, standing in for a packaging error after the builder
+    /// booted.
+    fn with_failing_pack(mut self) -> Self {
+        self.fail_pack = true;
         self
     }
 
@@ -105,6 +127,7 @@ impl RecordingVmProvider {
             created_specs: state.created_specs.clone(),
             events: state.events.clone(),
             pack_calls: state.pack_calls,
+            run_calls: state.run_calls,
         }
     }
 
@@ -119,6 +142,8 @@ struct ProviderStateSnapshot {
     created_specs: Vec<MachineSpec>,
     events: Vec<Event>,
     pack_calls: usize,
+    /// Guest-runner `exec_stream` calls so far, cumulative across pool runs.
+    run_calls: usize,
 }
 
 fn output() -> ExecOutput {
@@ -169,6 +194,9 @@ impl VmProvider for RecordingVmProvider {
         state.events.push(Event::Start(name.as_str().to_owned()));
         drop(state);
         self.notify_changed();
+        if let Some(gate) = &self.start_gate {
+            gate.notified().await;
+        }
         Ok(())
     }
 
@@ -295,6 +323,15 @@ impl VmProvider for RecordingVmProvider {
     }
 
     async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
+        {
+            let mut state = self.state.lock().await;
+            state.pack_calls += 1;
+            state.events.push(Event::Pack(name.as_str().to_owned()));
+        }
+        self.notify_changed();
+        if self.fail_pack {
+            return Err(provider_error("pack"));
+        }
         // Mirror the smolvm 1.7.2 pack contract: `<output>` is an ELF
         // launcher stub and `<output>.smolmachine` carries the packed VM
         // data. The orchestrator consumes the sidecar; the stub is discarded.
@@ -302,22 +339,38 @@ impl VmProvider for RecordingVmProvider {
         let sidecar = PathBuf::from(format!("{}.smolmachine", output.display()));
         fs::write(&stub, b"elf-launcher-stub").map_err(|_| provider_error("pack"))?;
         fs::write(&sidecar, b"immutable-runner-artifact").map_err(|_| provider_error("pack"))?;
-        let mut state = self.state.lock().await;
-        state.pack_calls += 1;
-        state.events.push(Event::Pack(name.as_str().to_owned()));
-        drop(state);
-        self.notify_changed();
         Ok(())
     }
 }
 
 struct Fixture {
-    _env_guard: std::sync::MutexGuard<'static, ()>,
+    // Fields drop in declaration order, so the pins go back while the lock is
+    // still held: releasing it first lets the next test repin and then have its
+    // pins clobbered by this fixture's late restore.
     _hermetic_env: HermeticEnvGuard,
+    _lock_still_held: EnvLockStillHeld,
+    _env_guard: std::sync::MutexGuard<'static, ()>,
     root: PathBuf,
     config: RunnerPoolConfig,
     token_env: String,
     token: String,
+}
+
+/// Asserts, on drop, that `TEST_ENV_LOCK` is still held.
+///
+/// `Fixture` drops it between `HermeticEnvGuard` and the lock guard, so releasing
+/// the lock first — the order this fixture had before the fix — fails here
+/// instead of letting the next test repin under the lock and then have its pins
+/// clobbered by this fixture's late restore.
+struct EnvLockStillHeld;
+
+impl Drop for EnvLockStillHeld {
+    fn drop(&mut self) {
+        assert!(
+            TEST_ENV_LOCK.try_lock().is_err(),
+            "Fixture released TEST_ENV_LOCK before HermeticEnvGuard restored the environment"
+        );
+    }
 }
 
 /// Pins the host-sensitive environment for the fixture's lifetime and
@@ -393,6 +446,15 @@ impl Fixture {
         fs::create_dir(&bundle).unwrap();
         let externals_dir = root.join("host-externals");
         stage_fake_node_externals(&externals_dir.join("externals"));
+        // The bundle carries its own copy of the same trees — the release
+        // layout the pool mounts as-is, without the copy `ensure_host_externals`
+        // makes for an incomplete bundle. That copy runs as a child process
+        // with a regular deadline, and a test that pauses the clock drives that
+        // deadline to expiry the moment the runtime goes idle, so the copy would
+        // be killed and the pool would refuse to start. Staging both trees keeps
+        // paused-clock tests free of real process I/O; the copy path itself is
+        // covered by the crate's non-paused lifecycle tests.
+        stage_fake_node_externals(&bundle.join("externals"));
         let artifact_stem = root.join("runner-image");
         if payload_exists {
             fs::write(
@@ -443,10 +505,12 @@ impl Fixture {
             pending_registrations: None,
             preparing_signal: None,
             observability: None,
+            github: None,
         };
         Self {
-            _env_guard: env_guard,
             _hermetic_env: HermeticEnvGuard::new(&root),
+            _lock_still_held: EnvLockStillHeld,
+            _env_guard: env_guard,
             root,
             config,
             token_env,
@@ -626,8 +690,20 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
         1
     );
 
+    // The reuse pass must boot a runner of its own. Wait for one `run` call
+    // more than the first pass produced rather than for a fixed total: the
+    // first pass is cancelled the moment the pack lands, so whether it boots a
+    // runner first depends on where the pool yields between the pack and the
+    // slot's first shutdown check — not on what this test asserts.
+    let boots_before_reuse = provider.snapshot().await.run_calls;
     let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
-    run_until_cancelled(pool, &provider, CancellationToken::new(), 2).await;
+    run_until_cancelled(
+        pool,
+        &provider,
+        CancellationToken::new(),
+        boots_before_reuse + 1,
+    )
+    .await;
     let second = provider.snapshot().await;
     assert_eq!(second.pack_calls, 1);
     assert_eq!(
@@ -637,6 +713,46 @@ async fn artifact_preparation_runs_once_and_reuses_payload_on_next_run() {
             .filter(|event| matches!(event, Event::Create(name) if name.ends_with("-builder")))
             .count(),
         1
+    );
+}
+
+/// An artifact build that fails after the builder booted must not strand the
+/// builder: the pool's error path tears its machines down like every other
+/// exit. The CLI's exit guard only reaps hypervisor processes — not the
+/// layer mounts a killed hypervisor holds, and not provider-owned sandboxes.
+#[tokio::test]
+async fn artifact_build_failure_tears_the_builder_down() {
+    let fixture = Fixture::new("artifact-fail", false);
+    let provider = Arc::new(RecordingVmProvider::with_machines(&[], vec![]).with_failing_pack());
+    let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
+    let error = pool
+        .run(CancellationToken::new())
+        .await
+        .expect_err("a failed pack must fail the pool");
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("pack"),
+        "the pack failure must be reported: {error}"
+    );
+
+    let builder = format!("{}-builder", fixture.config.name_prefix);
+    let snapshot = provider.snapshot().await;
+    assert!(
+        snapshot.events.contains(&Event::Start(builder.clone())),
+        "the fixture must have booted the builder: {:?}",
+        snapshot.events
+    );
+    assert!(
+        !snapshot.machines.contains_key(&builder),
+        "the failed build's builder must be deleted: {:?}",
+        snapshot.events
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &builder)),
+        "the teardown must delete the builder: {:?}",
+        snapshot.events
     );
 }
 
@@ -785,9 +901,10 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     assert_eq!(spec.network, NetworkPolicy::PublicOnly);
     // A packed machine reaches node through the artifact's baked symlink
     // (`<root>/externals -> /opt/preloop/bin/externals`): the externals ride
-    // the bundle mount instead of a third virtiofs mount, which the packed
-    // launcher has no IRQ budget for. Only a machine booted from a raw image
-    // carries the separate externals mount.
+    // the bundle mount instead of a third virtiofs mount, which keeps the
+    // device-heaviest launcher config at two mounts (see `runner_volumes`).
+    // Only a machine booted from a raw image carries the separate externals
+    // mount.
     assert_eq!(
         &spec.volumes,
         &vec![
@@ -818,22 +935,26 @@ async fn runner_keeps_public_only_egress_and_wires_control_socket_and_environmen
     // to tell a controller which VM to open a shell into. The environment is
     // applied by the launcher shell that sources the image's
     // `/etc/environment`, so the argv is `sh -c <launcher>` followed by the
-    // `KEY=value` entries in the same order `env` receives them.
-    let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
+    // `KEY=value` entries in the same order `env` receives them. PATH is not
+    // one of those entries: the launcher exports the image's own PATH and only
+    // falls back to the pool's list when the image declares none.
+    let fallback = preloop_orchestrator::guest_runner_path(&config);
     let machine = format!("PRELOOP_MACHINE_NAME={runner}");
     let expected_prefix = vec![
         "sh".to_owned(),
         "-c".to_owned(),
         [
-            "if [ -r /etc/environment ]; then . /etc/environment; fi; ",
+            "PATH=; ",
+            "if [ -r '/etc/environment' ]; then set -a; . '/etc/environment'; set +a; fi; ",
+            &format!("[ -n \"$PATH\" ] || PATH='{fallback}'; "),
+            "export PATH; ",
             "exec /usr/bin/env ",
-            &format!("'{path}' '{machine}' "),
+            &format!("'{machine}' "),
             "'PRELOOP_CONTROL_ORIGIN=https://preloop.example' ",
             "'PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock' ",
             "\"$0\" \"$@\"",
         ]
         .concat(),
-        path.clone(),
         machine.clone(),
         "PRELOOP_CONTROL_ORIGIN=https://preloop.example".to_owned(),
         "PRELOOP_CONTROL_SOCKET=/run/preloop-control/engine.sock".to_owned(),
@@ -959,13 +1080,13 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .map(String::as_str)
             .collect();
         let machine_name = format!("PRELOOP_MACHINE_NAME={runner}");
-        // The runner's fallback PATH is the system directories a hosted step
-        // shell sees; the launcher replaces it with the image's
-        // `/etc/environment` PATH whenever the image declares one. The deleted
-        // Rust/Go language installs (and their `/usr/local/cargo/bin` and
+        // PATH is the launcher's: it exports the image's `/etc/environment`
+        // PATH whenever the image declares one, and only falls back to the
+        // pool's system directories when it does not. The deleted Rust/Go
+        // language installs (and their `/usr/local/cargo/bin` and
         // `/usr/local/go/bin` entries) are gone.
-        let path = format!("PATH={}", preloop_orchestrator::guest_runner_path(&config));
-        let mut entries = vec![path.clone(), machine_name.clone()];
+        let fallback = preloop_orchestrator::guest_runner_path(&config);
+        let mut entries = vec![machine_name.clone()];
         entries.extend(expected.iter().map(|entry| (*entry).to_owned()));
         let pairs = entries
             .iter()
@@ -973,7 +1094,10 @@ async fn guest_environment_tracks_control_socket_and_debug_dir_independently() {
             .collect::<Vec<_>>()
             .join(" ");
         let launcher = [
-            "if [ -r /etc/environment ]; then . /etc/environment; fi; ",
+            "PATH=; ",
+            "if [ -r '/etc/environment' ]; then set -a; . '/etc/environment'; set +a; fi; ",
+            &format!("[ -n \"$PATH\" ] || PATH='{fallback}'; "),
+            "export PATH; ",
             "exec /usr/bin/env ",
             &pairs,
             " \"$0\" \"$@\"",
@@ -1068,6 +1192,107 @@ async fn stale_owned_machines_are_removed_without_touching_unrelated_machines() 
             .iter()
             .any(|event| matches!(event, Event::Delete(name) if name == unrelated))
     );
+}
+
+/// A shutdown that arrives while a slot is booting a runner must stop the
+/// pool — and delete the half-built machine — instead of waiting the boot
+/// out until the CLI's bounded stop aborts the whole pool and strands the VM
+/// (with its hypervisor and mounted layer image) on the host.
+#[tokio::test]
+async fn cancellation_during_runner_boot_deletes_the_half_built_machine() {
+    let fixture = Fixture::new("cancel-boot", true);
+    let name_prefix = fixture.config.name_prefix.clone();
+    let gate = Arc::new(Notify::new());
+    let provider = Arc::new(
+        RecordingVmProvider::with_machines(&[], vec![RunAction::Wait])
+            .with_start_gate(gate.clone()),
+    );
+    let pool = RunnerPool::new(provider.clone(), fixture.config.clone()).unwrap();
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let mut task = tokio::spawn(async move { pool.run(task_shutdown).await });
+
+    let slot_prefix = format!("{name_prefix}-0-");
+    provider
+        .wait_until(|state| {
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Start(name) if name.starts_with(&slot_prefix)))
+        })
+        .await;
+    let runner = first_slot_machine(&provider.snapshot().await.events, &name_prefix);
+
+    shutdown.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+        .await
+        .expect("a shutdown must stop the pool while a runner is booting");
+    result.unwrap().unwrap();
+
+    let snapshot = provider.snapshot().await;
+    assert!(
+        !snapshot.machines.contains_key(&runner),
+        "the teardown must delete the half-built machine: {:?}",
+        snapshot.events
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &runner))
+    );
+    gate.notify_waiters();
+}
+
+/// A shutdown that arrives while the golden fork base is being prepared must
+/// stop the pool and remove the half-prepared golden: nothing adopts a golden
+/// without its fingerprint record, so leaving the machine behind only leaks
+/// its VM and layer image.
+#[tokio::test]
+async fn cancellation_during_golden_prepare_removes_the_golden_machine() {
+    let fixture = Fixture::new("cancel-golden", true);
+    let mut config = fixture.config.clone();
+    config.use_fork = true;
+    config.control_socket = Some(fixture.root.join("engine.sock"));
+    let golden = format!("{}-golden", config.name_prefix);
+    let gate = Arc::new(Notify::new());
+    let provider = Arc::new(
+        RecordingVmProvider::with_machines(&[], vec![RunAction::Wait])
+            .with_start_gate(gate.clone()),
+    );
+    let pool = RunnerPool::new(provider.clone(), config.clone()).unwrap();
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
+    let mut task = tokio::spawn(async move { pool.run(task_shutdown).await });
+
+    provider
+        .wait_until(|state| {
+            state
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Start(name) if name == &golden))
+        })
+        .await;
+
+    shutdown.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+        .await
+        .expect("a shutdown must stop the pool while the golden is booting");
+    result.unwrap().unwrap();
+
+    let snapshot = provider.snapshot().await;
+    assert!(
+        !snapshot.machines.contains_key(&golden),
+        "the teardown must delete the half-prepared golden: {:?}",
+        snapshot.events
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Delete(name) if name == &golden))
+    );
+    gate.notify_waiters();
 }
 
 #[tokio::test]

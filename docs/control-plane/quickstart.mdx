@@ -1,0 +1,78 @@
+---
+title: Quickstart
+description: Install the Preloop CLI, configure the engine, and run a workflow from your working tree.
+---
+
+This page takes you from a clean machine to one workflow running locally. Local runs use your working tree, including uncommitted and untracked files.
+
+Before you start, confirm the host can run microVMs and has room for the default image. [Install](/control-plane/install) lists the requirements. The short version:
+
+- macOS, Linux on x86_64 or aarch64, or Windows through WSL2.
+- About 60 GB of free disk on the volume that holds Preloop's VM data. The default image downloads about 9.6 GB and can peak near 60 GB while it unpacks.
+
+## 1. Install the CLI
+
+Homebrew and npm install the same release binaries:
+
+```sh
+brew install preloopdev/tap/preloop
+# or
+npm install -g @preloop-dev/cli
+```
+
+The [installer script](/control-plane/install#installer-script) works too, and it also installs the Linux guest runner that microVM jobs need.
+
+## 2. Configure the engine
+
+```sh
+preloop init
+```
+
+Follow the wizard. It asks for a GitHub credential (App or fine-grained PAT), which golden image to use, and how to run the engine, then writes `~/.preloop/config.toml`. Most existing workflows need a credential so job tokens, private actions, and check runs keep working — choose App or PAT unless you know the workflow is fully offline.
+
+`init` also checks the host's disk, architecture, and hypervisor. If a check fails, it stops with exit code `3` and names what is short. To see that report without changing anything, run `preloop init --probe --json`.
+
+## 3. Start the engine
+
+```sh
+preloop serve
+```
+
+The engine listens on `127.0.0.1:9090`. Leave it running in this terminal and stop it with `Ctrl-C`.
+
+If you already told `init` to start the engine for you, you can skip this step. You can re-run `init` at any time to change the image or the credential.
+
+## 4. Run a workflow
+
+In a second terminal, change to a repository that has workflows and run one:
+
+```sh
+cd my-repo
+preloop run -f .github/workflows/ci.yml --event push
+```
+
+- `-f` selects the workflow. A bare file name resolves inside `.github/workflows/`. If the repository has exactly one workflow, you can omit `-f`.
+- `--event` simulates the trigger that starts the run. It defaults to `push`. For `pull_request` workflows, pass `--event pull_request`. The run then tests the merge with the base branch, which is fetched from `origin`.
+- The run snapshots your working tree, so you do not need to commit or push first.
+
+<video controls src="/demo/debug.mp4" alt="Screen recording of a local run failing, a fix applied in another terminal pane, and the workflow re-run without a push" aria-label="Screen recording of a local run failing, a fix applied in another terminal pane, and the workflow re-run without a push" />
+
+The first job downloads and prepares the official image, so it takes longer than later jobs. Follow the run with:
+
+```sh
+preloop status
+preloop logs -f --job <job-key>
+```
+
+<Note>
+`preloop run` does not start an engine: only `preloop serve` and `preloop init --mode foreground` do. If no engine answers at `PRELOOP_URL`, the command exits non-zero naming the endpoint it probed — start `preloop serve` in another terminal first.
+</Note>
+
+If a step fails in an interactive terminal, the job pauses instead of being torn down. Attach to it with `preloop debug`. The [debugging guide](/control-plane/guides/debugging) covers the verdicts you can issue.
+
+## Next steps
+
+- [Connect a GitHub App](/control-plane/github/app) so pushes and pull requests start runs and publish check runs.
+- [Configuration](/control-plane/configuration) covers the config file, secrets, and where state is stored.
+- [Install](/control-plane/install#run-as-a-background-service) runs the engine as a service that survives reboots.
+- [CLI reference](/control-plane/reference/cli) lists every command and flag.

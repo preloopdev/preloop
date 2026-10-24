@@ -36,10 +36,15 @@ pub const PROTOCOL_VERSION: &str = "2026-06-25.preloop.v1";
 /// GitHub-hosted parity: the official runner lays out
 /// `<work>/<repo>/<repo>` (`/home/runner/work/hugo/hugo`), and workflows
 /// observe it — hugo's codegen test panics unless the absolute checkout
-/// path contains `"hugo"`. Derive both segments from the `owner/repo`
-/// basename so every consumer (worker setup, local-run preseeding) agrees.
-/// Returns `None` when the slug is missing or not a plain repo name, in
-/// which case callers keep the historical `_work/default/default`.
+/// path contains `"hugo"`, and `$RUNNER_WORKSPACE` (the `<work>/<repo>`
+/// parent, exported by `inject_github_env`) is read by actions that look for
+/// a sibling checkout. The hosted work folder is `work`; `_work` is the
+/// official runner's *self-hosted* default and is what a preloop guest used
+/// to report, so a workflow branching on the path saw the wrong shape.
+/// Derive both segments from the `owner/repo` basename so every consumer
+/// (worker setup, local-run preseeding) agrees. Returns `None` when the slug
+/// is missing or not a plain repo name, in which case callers keep the
+/// historical `work/default/default` fallback.
 pub fn workspace_dir_for_repository(repository: Option<&str>) -> Option<std::path::PathBuf> {
     let repository = repository?.trim();
     let mut parts = repository.split('/');
@@ -60,7 +65,7 @@ pub fn workspace_dir_for_repository(repository: Option<&str>) -> Option<std::pat
     {
         return None;
     }
-    Some(std::path::PathBuf::from("_work").join(name).join(name))
+    Some(std::path::PathBuf::from("work").join(name).join(name))
 }
 
 /// Line a runner prints on stdout the moment it accepts a job.
@@ -203,6 +208,35 @@ pub struct PushRequest {
     pub dirty: bool,
 }
 
+/// A self-built pull-request test merge the engine must check out for a run.
+///
+/// GitHub computes a pull request's test merge asynchronously and this engine
+/// cannot wait for it, so the merge is built locally: `sha` is a two-parent
+/// merge commit (first parent the base tip, second the pull request head)
+/// that exists only in the engine's mirror. Jobs therefore fetch from the
+/// engine, never the forge. The engine validates that the mirror belongs to
+/// the named repository and that the commit has the claimed parents and tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrebuiltMerge {
+    /// The two-parent merge commit the run tests.
+    pub sha: String,
+    /// The merge commit's tree.
+    pub tree: String,
+    /// First parent: the base tip the merge was built against.
+    pub base_sha: String,
+    /// Second parent: the pull request's head commit.
+    pub head_sha: String,
+    /// Repository whose cache mirror contains this merge.
+    pub repository: String,
+    /// State-directory-relative path of the bare mirror holding the merge and
+    /// its parents (for example `checkout-cache/repositories/<key>.git`).
+    pub mirror_repository: String,
+    /// Pull request number, when known; labels `refs/pull/<n>/merge` in the
+    /// served repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request_number: Option<u64>,
+}
+
 /// Complete workflow request submitted to the control plane.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkflowSubmission {
@@ -254,6 +288,13 @@ pub struct WorkflowSubmission {
     /// Enable DAP debugger for the run's jobs.
     #[serde(default)]
     pub enable_debugger: bool,
+    /// Who re-requested the run when this submission re-runs an archived one.
+    ///
+    /// Internal-only: never serialized or deserialized (an external submitter
+    /// must not be able to forge attribution). `github.actor` stays the
+    /// original submitter; this stamp only feeds `github.triggering_actor`.
+    #[serde(default, skip)]
+    pub triggering_actor: Option<String>,
     /// Welcome message to show when debugger attaches.
     #[serde(default)]
     pub debugger_welcome_message: Option<String>,
@@ -317,6 +358,14 @@ pub struct WorkflowSubmission {
     /// Explicit base ref for the run (populates `github.base_ref`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    /// GitHub's `github.ref_protected`: whether branch protection rules or
+    /// rulesets apply to `git_ref`. Resolved by the forge adapter at intake;
+    /// `false` for tags, pull-request refs and anything unresolvable. Engine-
+    /// resolved only: the native submission handler clears whatever a request
+    /// body sends, because the value feeds `GITHUB_REF_PROTECTED` and the
+    /// signed OIDC `ref_protected` claim.
+    #[serde(default)]
+    pub ref_protected: bool,
     /// Keep the failed job VM alive after the job ends for `preloop shell`.
     #[serde(default)]
     pub preserve_on_failure: bool,
@@ -333,6 +382,23 @@ pub struct WorkflowSubmission {
     /// commit it did not test.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_tree: Option<String>,
+    /// Test the branch alone instead of the merge of the pull request's
+    /// current base tip into it. Only meaningful for `pull_request` events
+    /// (the CLI's `--no-merge`): the escape hatch when the base branch cannot
+    /// be fetched.
+    #[serde(default)]
+    pub no_merge: bool,
+    /// A self-built pull-request test merge the run must check out. Set when
+    /// the merge commit exists only in the engine (see [`PrebuiltMerge`]);
+    /// the engine serves it to the run's jobs regardless of checkout-cache
+    /// configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prebuilt_merge: Option<PrebuiltMerge>,
+    /// Identifier returned by the hosted bundle upload endpoint. The engine
+    /// consumes the bundle into an isolated checkout before queueing the run;
+    /// the identifier is not a filesystem path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_bundle_id: Option<String>,
 }
 
 impl WorkflowSubmission {
@@ -856,9 +922,9 @@ where
 
 fn mask_annotation_strings(value: serde_json::Value, secrets: &[&str]) -> serde_json::Value {
     match value {
-        serde_json::Value::String(text) => {
-            serde_json::Value::String(masking::mask_secrets(&text, secrets.iter().copied(), &[]))
-        }
+        serde_json::Value::String(text) => serde_json::Value::String(
+            masking::mask_secrets_transform_aware(&text, secrets.iter().copied(), &[]),
+        ),
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .into_iter()
@@ -1047,10 +1113,11 @@ mod tests {
 
     #[test]
     fn workspace_dir_derives_github_layout_from_repo_basename() {
-        // `<work>/<repo>/<repo>`, matching /home/runner/work/hugo/hugo.
+        // `<work>/<repo>/<repo>`, matching /home/runner/work/hugo/hugo: the
+        // hosted work folder is `work`, not the self-hosted `_work`.
         assert_eq!(
             workspace_dir_for_repository(Some("spf13/hugo")),
-            Some(std::path::PathBuf::from("_work/hugo/hugo"))
+            Some(std::path::PathBuf::from("work/hugo/hugo"))
         );
         assert_eq!(workspace_dir_for_repository(None), None);
         assert_eq!(workspace_dir_for_repository(Some("")), None);

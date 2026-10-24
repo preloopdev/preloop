@@ -79,22 +79,31 @@ test-ci: fmt-check clippy zizmor
 # cargo deny check all (licenses/bans/sources), and Node externals OSV/SBOM audit.
 # Local runs are on trusted code (report-only for Node externals). CI gate is
 # .github/workflows/supply-chain.yml (runs-on: ubuntu-latest; triggers: pull_request,
-# push to main, weekly schedule) — it drops any PR-shipped .cargo/config*, rejects
-# mixed policy PRs, runs the Node externals OSV+SBOM audit, and enforces upstream
-# pin parity.
+# push to main, weekly schedule) — it drops any PR-shipped .cargo/config*, runs the
+# dependency/policy isolation guard, runs the Node externals OSV+SBOM audit, and
+# enforces upstream pin parity.
 supply-chain:
     cargo vet
     cargo audit
     cargo deny check all
     ./scripts/audit-node-externals.sh --report-only
 
+# Dependency/policy isolation: a PR may carry the lockfile, the audit policy, the
+# vet state, and the manifests that declare a dependency, and nothing else. Code
+# that needs a new dependency lands in a follow-up PR after that one merges.
+# Same rule as the CI step "Guard policy files"; compares the merge base of
+# origin/main and HEAD against HEAD, so `git fetch origin main` first. See
+# supply-chain/README.md.
+supply-chain-guard:
+    supply-chain/guard-policy-files.sh origin/main HEAD
+
 #lint (ast-grep structural rules)
 
 sg-scan:
-    sg scan
+    ast-grep scan
 
 sg-scan-strict:
-    sg scan --error
+    ast-grep scan --error
 
 #dogfood (e2e against preloop with real runner) 
 
@@ -172,3 +181,49 @@ conform-runner-deep:
 # release workflow fails tags without a matching entry in CHANGELOG.md.
 changelog-release VERSION:
     python3 scripts/changelog-release.py "{{VERSION}}"
+
+# --- preloop-dev SmolVM: per-worktree dev VMs forked from a frozen golden ---
+# Agents: run `just dev-vm-check` first; if it fails, use the host toolchain.
+# Optional env: PRELOOP_DEV_GATEWAY_URL + PRELOOP_DEV_GATEWAY_TOKEN_FILE route the
+# VM's OMP through the host's auth gateway (credentials never enter the VM).
+# See scripts/dev-vm/common.sh.
+
+# Succeeds only if the preloop-dev golden exists on this host and can be forked.
+dev-vm-check:
+    scripts/dev-vm/check.sh
+
+# Fork the golden for this worktree (idempotent).
+dev-vm-up:
+    scripts/dev-vm/up.sh
+
+# Run a command in this worktree's dev VM, in /workspace.
+[positional-arguments]
+dev-vm-exec +CMD:
+    scripts/dev-vm/exec.sh "$@"
+
+# Interactive shell (or `just dev-vm-shell omp`) in this worktree's dev VM.
+[positional-arguments]
+dev-vm-shell *CMD:
+    scripts/dev-vm/shell.sh "$@"
+
+# Delete this worktree's dev VM; the worktree is untouched.
+dev-vm-down:
+    scripts/dev-vm/down.sh
+
+# List dev VMs forked from the golden.
+dev-vm-ls:
+    scripts/dev-vm/ls.sh
+
+# Publish guest ports (HOST:GUEST) to the host; restarts the VM. Servers in the
+# guest must bind 0.0.0.0. Prefer PRELOOP_DEV_PORTS="18080:8080" with dev-vm-up.
+[positional-arguments]
+dev-vm-publish +PORTS:
+    scripts/dev-vm/publish.sh "$@"
+
+# Re-sync the VM's OMP providers with the host gateway (after a new login/key).
+dev-vm-omp-sync:
+    scripts/dev-vm/omp-sync.sh
+
+# Render all published documentation diagrams from their Graphviz sources.
+docs-diagrams:
+    for dotfile in docs/diagrams/*.dot; do dot -Tsvg "$dotfile" -o "${dotfile%.dot}.svg"; done

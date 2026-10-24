@@ -4,30 +4,17 @@
 //! - ref = hook.Ref
 //! - sha = hook.After
 //! - status_check_sha = hook.After
-//! - skip if any commit message matches [skip ci] / [ci skip] / etc.
+//! - skip if any commit message matches [skip ci] / [ci skip] / etc. or
+//!   carries a `skip-checks: true` trailer
 //! - trust_tier = Trusted for default branch, Internal otherwise
 
+use super::has_skip_instruction;
 use crate::events::trust_tier::TrustTier;
 use crate::events::{EffectiveEvent, EventAdapter};
 use serde_json::Value;
 
 /// Event adapter.
 pub struct Adapter;
-
-/// [skip ci] labels that suppress CI runs.
-/// Source: Runner.Server/Controllers/MessageController.cs:6258-6259,6283-6285.
-const SKIP_CI_LABELS: &[&str] = &[
-    "[skip ci]",
-    "[ci skip]",
-    "[no ci]",
-    "[skip actions]",
-    "[actions skip]",
-    "***NO_CI***",
-];
-
-fn has_skip_label(message: &str) -> bool {
-    SKIP_CI_LABELS.iter().any(|label| message.contains(label))
-}
 
 /// Check whether any commit in the push batch carries a skip-CI label.
 ///
@@ -43,7 +30,7 @@ fn has_skip_ci(payload: &Value) -> bool {
             commit
                 .get("message")
                 .and_then(|m| m.as_str())
-                .is_some_and(has_skip_label)
+                .is_some_and(has_skip_instruction)
         });
     }
 
@@ -53,7 +40,7 @@ fn has_skip_ci(payload: &Value) -> bool {
         .get("head_commit")
         .and_then(|hc| hc.get("message"))
         .and_then(|m| m.as_str())
-        .is_some_and(has_skip_label)
+        .is_some_and(has_skip_instruction)
 }
 
 /// Determine whether this is a push to the default branch.
@@ -290,5 +277,86 @@ mod tests {
             events.is_empty(),
             "head_commit fallback must suppress when commits field is absent"
         );
+    }
+
+    fn push_with_message(message: &str) -> Vec<EffectiveEvent> {
+        Adapter.project(&serde_json::json!({
+            "ref": "refs/heads/main",
+            "after": "abc123",
+            "repository": { "default_branch": "main" },
+            "commits": [{"message": message}]
+        }))
+    }
+
+    #[test]
+    fn skip_checks_trailer_in_commit_message() {
+        assert!(push_with_message("chore: regenerate config\n\n\nskip-checks: true").is_empty());
+    }
+
+    #[test]
+    fn skip_checks_trailer_without_space_and_case_insensitive() {
+        assert!(push_with_message("chore: regenerate config\n\n\nSKIP-CHECKS:TRUE").is_empty());
+    }
+
+    #[test]
+    fn skip_checks_trailer_after_other_trailers() {
+        assert!(
+            push_with_message(
+                "chore: regenerate config\n\n\nSigned-off-by: A <a@example.com>\nskip-checks: true"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn skip_checks_trailer_must_be_last_trailer() {
+        assert_eq!(
+            push_with_message(
+                "chore: regenerate config\n\n\nskip-checks: true\nSigned-off-by: A <a@example.com>"
+            )
+            .len(),
+            1,
+            "a trailer after skip-checks means it is not the last trailer"
+        );
+    }
+
+    #[test]
+    fn skip_checks_trailer_requires_a_blank_line() {
+        assert_eq!(
+            push_with_message("chore: regenerate config\nskip-checks: true").len(),
+            1,
+            "a trailer section must be separated from the body"
+        );
+    }
+
+    #[test]
+    fn skip_checks_trailer_requires_two_empty_lines() {
+        assert_eq!(
+            push_with_message("chore: regenerate config\n\nskip-checks: true").len(),
+            1,
+            "GitHub requires two empty lines before the trailer section"
+        );
+    }
+
+    #[test]
+    fn skip_checks_trailer_with_false_value_does_not_skip() {
+        assert_eq!(
+            push_with_message("chore: regenerate config\n\n\nskip-checks: false").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn skip_checks_trailer_in_any_commit_skips() {
+        let payload = serde_json::json!({
+            "ref": "refs/heads/main",
+            "after": "abc123",
+            "repository": { "default_branch": "main" },
+            "commits": [
+                {"message": "first: clean"},
+                {"message": "second: config\n\n\nskip-checks: true"}
+            ]
+        });
+        assert!(Adapter.project(&payload).is_empty());
     }
 }

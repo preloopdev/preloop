@@ -8,7 +8,7 @@
 services:
   openobserve:
     # Digest-pinned: a floating tag is not an immutable input.
-    image: public.ecr.aws/zinclabs/openobserve@sha256:88fb692ac791d3eaff69653a4a4686f1c7eceb9e105491d58d29ac2739560b3b
+    image: public.ecr.aws/zinclabs/openobserve@sha256:d4a878fac1f6c56003764f7f2a1625668917388f167e222c8c810de3f54c56ba
     container_name: preloop-openobserve
     restart: unless-stopped
     # Loopback only. The OSS build has no SSO/RBAC — never put the UI on the

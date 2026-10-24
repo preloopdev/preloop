@@ -1,0 +1,45 @@
+digraph protocol_layer {
+  graph [rankdir=TB, bgcolor="white", splines=spline, nodesep=0.3, ranksep=0.48, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.12,0.07"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  subgraph cluster_runner {
+    label="Runner wire client"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    runner [label="preloop-runner listener\nrun defaults to broker\n--via azdo selects legacy poll", fillcolor="#fef3c7"];
+    surfaces [label="Protocol surfaces\n/runner/server/_apis/...\n/runner/server/session|message|acknowledge", fillcolor="#fef3c7"];
+  }
+
+  subgraph cluster_session {
+    label="Identity and session"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    oauth [label="OAuth token endpoint\n/_apis/v1/oauth2/token\nPS256 client_assertion", fillcolor="#bae6fd"];
+    session [label="Runner session\nConnectionData, AgentSession\nAES session key", fillcolor="#e0f2fe"];
+    crypto [label="Session crypto\nRSA-OAEP wraps AES key\nAES-256-CBC message payload", fillcolor="#e0f2fe"];
+  }
+
+  subgraph cluster_wire {
+    label="Versioned wire DTOs"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    msg [label="TaskAgentMessage\nmessages.rs + NDJSON events\nacknowledge after decrypt", fillcolor="#bae6fd"];
+    job [label="AgentJobRequestMessage\nazdo/job.rs: plan, steps, contexts\nwire-compatible job request", fillcolor="#bae6fd"];
+    shared [label="Shared invariants\nSecretString redacts Debug/Display/serde\nevent_to_ndjson() line framing", fillcolor="#e0f2fe"];
+    mask [label="Log masking\nmask_secrets_inner()\nlongest-first, DAP keyword exclusion", fillcolor="#e0f2fe"];
+  }
+
+  subgraph cluster_report {
+    label="Execution reports and outputs"; fontsize=13; fontcolor="#15803d"; style="rounded,dashed"; color="#22c55e"; margin=12;
+    report [label="Runner reporting\nTimelineRecord, TaskResult\nLogfiles, FinishJob, completejob", fillcolor="#dcfce7"];
+    twirp [label="Results protocol\n/twirp/... metadata\nsigned URL PUT for step logs", fillcolor="#dcfce7"];
+    stores [label="Cache and artifacts\n/_apis/artifactcache/cache\npreloop-cache + preloop-artifacts", fillcolor="#bbf7d0"];
+  }
+
+  runner -> surfaces [label="configure / run"];
+  surfaces -> oauth [label="client_assertion"];
+  oauth -> session [label="access token"];
+  session -> crypto [label="key exchange"];
+  crypto -> msg [label="encrypted poll response"];
+  msg -> job [label="decrypt + decode"];
+  shared -> msg [label="DTO framing", constraint=false];
+  job -> report [label="steps and completion"];
+  report -> mask [label="log lines"];
+  mask -> twirp [label="redacted output"];
+  report -> stores [label="cache / artifact calls"];
+}

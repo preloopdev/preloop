@@ -25,6 +25,9 @@ on:
         default: v0.29.5
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   reuse-previous-goldens:
     name: Reuse Previous Golden Artifacts
@@ -74,7 +77,7 @@ jobs:
       packages: read
     steps:
       - name: Check out repository
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -89,7 +92,7 @@ jobs:
           echo "BASE_IMAGE=$BASE_IMAGE" >> "$GITHUB_ENV"
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Build Preloop binaries
         run: |
@@ -232,6 +235,14 @@ jobs:
           # copy off the host filesystem.
           export PRELOOP_REQUIRE_BASE_DIGEST=1
           export PRELOOP_RUNNER_BASE_IMAGE="$BASE_IMAGE"
+          # The official base is a digest-pinned OCI reference, not the
+          # official-golden sentinel, so the bake cannot infer that this is
+          # the hosted runner image. Select its hosted policy explicitly:
+          # residue cleanup, cloud/snap/apt/systemd-sysctl masks, ping's
+          # capability, the resolved stub and GitHub's sysctls. Without this
+          # an official bake would silently preserve the base as a custom
+          # image.
+          export PRELOOP_GOLDEN_CLEAN_CLOUD_RESIDUE=1
           export PRELOOP_RUNNER_STORAGE_GB="$GOLDEN_GUEST_GIB"
           export PRELOOP_RUNNER_OVERLAY_GB="$GOLDEN_GUEST_GIB"
           # The runner-large base archive is ~17 GiB uncompressed, over
@@ -317,7 +328,7 @@ jobs:
             "dist/$GOLDEN_NAME"
 
       - name: Attest golden (GitHub provenance)
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}
@@ -326,7 +337,7 @@ jobs:
             dist/preloop-ubuntu-24.04-${{ env.GOLDEN_ARCH }}.provenance.json
 
       - name: Retain Golden Artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: golden-${{ env.GOLDEN_ARCH }}
           path: |

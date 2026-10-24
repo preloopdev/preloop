@@ -1,0 +1,9 @@
+# Pinned tools for this repo. Run `mise install`, then `mise exec -- just <recipe>`.
+# zig and cargo-zigbuild match release-runner.yml. cargo-audit and cargo-vet are not pinned here.
+
+[tools]
+zig = "0.14.1"
+"cargo:cargo-zigbuild" = "0.23.0"
+ast-grep = "0.45.3"
+just = "1.52.0"
+cargo-deny = "0.20.2"

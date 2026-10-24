@@ -28,6 +28,19 @@ pub struct PushState {
     pub effective_sha: Option<String>,
 }
 
+/// A concluded run whose push-back published a commit. The publish's webhook
+/// echo is judged against what that run tested, so the record says how the run
+/// was submitted and whether it checked out a self-built pull-request merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedRun {
+    pub run_id: RunId,
+    /// The GitHub event the run was submitted as (`push`, `pull_request`, ...).
+    pub event: String,
+    /// Whether the run checked out a self-built pull-request merge. A run that
+    /// tested the branch alone did not.
+    pub tested_merge: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct DapPortRegistration {
     pub port: u16,
@@ -653,6 +666,13 @@ pub struct WebhookDeliveryRecord {
     /// renew or finalize a lease that another worker has reclaimed.
     #[serde(default)]
     pub lease_token: Option<String>,
+    /// App id of the webhook signer whose HMAC verified this delivery.
+    ///
+    /// `None` for the legacy shared secret and for rows written before this
+    /// column existed. Processing pins credential selection to this App, so a
+    /// delivery signed by App B cannot run with App A's installation.
+    #[serde(default)]
+    pub signer_app_id: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -763,6 +783,18 @@ pub struct WebhookRedeliveryRecord {
     pub resolved_at_us: Option<i64>,
     pub last_error: Option<String>,
 }
+fn new_pending_cache_upload_lock() -> Arc<tokio::sync::Mutex<()>> {
+    Arc::new(tokio::sync::Mutex::new(()))
+}
+
+fn new_pending_cache_upload_quota() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(0))
+}
+
+fn new_pending_cache_upload_invalidated() -> Arc<std::sync::atomic::AtomicBool> {
+    Arc::new(std::sync::atomic::AtomicBool::new(false))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingCache {
     pub key: String,
@@ -771,7 +803,36 @@ pub struct PendingCache {
     pub namespace: String,
     #[serde(default)]
     pub job_backend_id: String,
-    pub bytes: Vec<u8>,
+    /// Absolute path of the on-disk staging file receiving the upload
+    /// chunks. Chunks are appended here as they arrive so a large upload
+    /// never sits in server RAM; `cache_commit` hands the file to
+    /// `CacheStore::commit_file_scoped`, which moves it into the entry
+    /// directory. The TTL sweeper deletes the staging file of abandoned
+    /// reservations.
+    #[serde(default)]
+    pub staging_path: PathBuf,
+    /// Bytes staged so far; the running total the upload caps are enforced
+    /// against.
+    #[serde(default)]
+    pub staging_len: u64,
+    /// Serializes body streams, commits, and TTL reaping for this reservation
+    /// without holding `InnerState` during file I/O. The lock is node-local
+    /// and is recreated after any deserialization.
+    #[serde(skip, default = "new_pending_cache_upload_lock")]
+    pub upload_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Remaining per-upload byte permits. Committed bytes are forgotten from
+    /// this semaphore; failed/cancelled requests drop their permits.
+    #[serde(skip, default = "new_pending_cache_upload_quota")]
+    pub upload_quota: Arc<tokio::sync::Semaphore>,
+    /// Shared pending-byte permits for this job's reservations. `None` is used
+    /// for system-token reservations, which intentionally bypass job quotas.
+    #[serde(skip)]
+    pub job_quota: Option<Arc<tokio::sync::Semaphore>>,
+    /// Set synchronously when a cancelled request may have left an uncertain
+    /// file prefix. Commit/retry paths fail closed until the reservation is
+    /// reaped.
+    #[serde(skip, default = "new_pending_cache_upload_invalidated")]
+    pub invalidated: Arc<std::sync::atomic::AtomicBool>,
     /// Unix seconds the reservation was made. The TTL sweeper frees
     /// abandoned reservations; only `cache_commit` removed them before, so a
     /// job that never commits leaked the in-memory bytes forever.
@@ -826,7 +887,10 @@ pub struct ArtifactV2Pending {
 /// The diag blob token is minted per call and handed to the runner, which
 /// PUTs to `/twirp-blob/diag/{token}` bearerless (Azure SDK compat). The
 /// registry binds the token to the owning job so the blob gate can reject
-/// writes from any other job. In-memory only: diag uploads happen
+/// writes from any other job. Eviction invalidates: the gate rejects PUTs
+/// for tokens no longer in the map (evicted by the per-job cap, TTL-swept,
+/// or never registered), so a re-mint loop cannot accumulate unbounded
+/// staging directories. In-memory only: diag uploads happen
 /// immediately after minting, and the TTL sweeper bounds the map.
 #[derive(Debug, Clone)]
 pub struct DiagUploadToken {

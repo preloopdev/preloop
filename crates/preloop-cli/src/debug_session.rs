@@ -37,14 +37,48 @@ use preloop_gha_protocol::debug_session::{
 /// touch the guest, or the watcher will suspend the sandbox out from under
 /// the session and, worse, a suspension it performed is only ever undone by
 /// seeing this marker.
+/// Retry `probe` up to `attempts` times, 200 ms apart.
+async fn wait_until<F, Fut>(attempts: usize, mut probe: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..attempts {
+        if probe().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// Run `true` in the guest; a resumed machine answers, a suspended one does
+/// not (or fails while the watcher is still resuming it).
+async fn guest_answers(machine: &str) -> bool {
+    let Ok(mut command) = crate::guest_exec_command(machine) else {
+        return false;
+    };
+    command
+        .arg("true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    tokio::task::spawn_blocking(move || command.status().is_ok_and(|status| status.success()))
+        .await
+        .unwrap_or(false)
+}
+
 pub(crate) struct DebugAttach {
     marker: PathBuf,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DebugAttach {
-    /// Write ACTIVE, start the heartbeat, and resume a suspended guest.
-    /// `None` when the session has no machine to guard.
+    /// Write ACTIVE, start the heartbeat, and wait (bounded) for the guest to
+    /// answer. The engine watcher resumes a suspended guest after seeing the
+    /// marker; callers (`--export`, the REPL) may exec immediately, so `claim`
+    /// must not return before the guest is usable. `None` when the session
+    /// has no machine to guard.
     pub(crate) async fn claim(machine: Option<&str>) -> Result<Option<Self>> {
         let Some(machine) = machine else {
             return Ok(None);
@@ -56,15 +90,12 @@ impl DebugAttach {
         if let Some(parent) = marker.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Resume before claiming: the ACTIVE marker tells the engine's watcher
-        // to resume a suspended sandbox, and `resume_guest_if_needed` is the
-        // fallback for an engine that is not watching (restart, different
-        // host). Either way a failed resume must not leave a heartbeat
-        // rewriting ACTIVE for a controller that never attached: the guard
-        // below is never constructed on error, and a dropped JoinHandle
-        // detaches rather than cancels.
-        crate::resume_guest_if_needed(machine)?;
+        // A dropped JoinHandle below detaches rather than cancels, so the
+        // heartbeat only starts once the marker is written.
         std::fs::write(&marker, preloop_orchestrator::DEBUG_MARKER_ACTIVE)?;
+        // The watcher polls the marker; wait for the resumed guest rather
+        // than racing the first exec.
+        Self::wait_until_guest_answers(machine).await?;
         let heartbeat_marker = marker.clone();
         let heartbeat = tokio::spawn(async move {
             loop {
@@ -80,6 +111,18 @@ impl DebugAttach {
             marker,
             heartbeat: Some(heartbeat),
         }))
+    }
+
+    /// Poll until the guest answers, bounded so a stuck machine fails loudly.
+    async fn wait_until_guest_answers(machine: &str) -> Result<()> {
+        let answered = wait_until(75, || guest_answers(machine)).await;
+        if !answered {
+            anyhow::bail!(
+                "guest `{machine}` did not become ready after debug claim; the machine may still \
+                 be resuming"
+            );
+        }
+        Ok(())
     }
 
     /// Stop the heartbeat and demote the marker to IDLE.
@@ -567,10 +610,21 @@ async fn finish_with_verdict(
 }
 
 impl Api {
+    /// A request against the engine's debug-session API.
+    ///
+    /// Every method below is one-shot: a listing, a lookup, a lease or an
+    /// operation, all answered in milliseconds in memory by the engine. The
+    /// total deadline is therefore [`crate::ENGINE_CONTROL_TIMEOUT`], not the
+    /// client's 600-second idle read — a wedged engine must fail the command,
+    /// and a paused-session lookup inside a stalled `preloop run` must not sit
+    /// there for ten minutes.
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let builder = self
-            .client
-            .request(method, format!("{}{path}", self.base_url));
+        let builder = crate::engine_request(
+            &self.client,
+            method,
+            format!("{}{path}", self.base_url),
+            crate::ENGINE_CONTROL_TIMEOUT,
+        );
         match &self.token {
             Some(token) => builder.bearer_auth(token),
             None => builder,
@@ -934,7 +988,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
         if std::io::stdin().read_line(&mut line)? == 0 {
             // Ctrl-D. Leaving must never destroy the session.
             println!();
-            println!("Detached — the job stays paused; AgentENV may suspend the VM.");
+            println!("Detached — the job stays paused; the backend may suspend the VM.");
             print_reattach(&session);
             return Ok(ReplOutcome::Detached);
         }
@@ -1074,7 +1128,7 @@ async fn repl(ctx: &Api, mut session: DebugSession) -> Result<ReplOutcome> {
                 Err(error) => println!("  sync failed: {error:#}"),
             },
             "detach" => {
-                println!("Detached — the job stays paused; AgentENV may suspend the VM.");
+                println!("Detached — the job stays paused; the backend may suspend the VM.");
                 print_reattach(&session);
                 return Ok(ReplOutcome::Detached);
             }
@@ -1398,7 +1452,7 @@ fn export_from_guest(session: &DebugSession, apply: bool) -> Result<()> {
     // Use a temporary index so `git add -N` can expose untracked files in the
     // patch without changing the guest workspace's real index.
     let output = crate::guest_exec_command(machine)?
-        .args(["sh", "-lc"])
+        .args(["sh", "-c"])
         .arg(format!(
             "cd {} && \
              index=$(mktemp /var/tmp/preloop-export-index.XXXXXX) && \
@@ -1423,7 +1477,7 @@ fn export_from_guest(session: &DebugSession, apply: bool) -> Result<()> {
         return Ok(());
     }
 
-    let destination = std::env::current_dir()?.join("preloop-vm-changes.patch");
+    let destination = std::env::current_dir()?.join("preloop-changes.patch");
     std::fs::write(&destination, patch.as_bytes())
         .with_context(|| format!("writing {}", destination.display()))?;
     let files = patch.lines().filter(|l| l.starts_with("+++ b/")).count();
@@ -1465,7 +1519,7 @@ fn guest_modified(
 ) -> Result<Vec<String>> {
     let quoted: Vec<String> = candidates.iter().map(|p| shell_quote(p)).collect();
     let output = crate::guest_exec_command(machine)?
-        .args(["sh", "-lc"])
+        .args(["sh", "-c"])
         .arg(format!(
             "cd {} && git --literal-pathspecs status --porcelain -- {} 2>/dev/null || true",
             shell_quote(guest_workspace),
@@ -1548,7 +1602,7 @@ fn host_changes(host: &std::path::Path) -> Result<(Vec<String>, Vec<String>)> {
     Ok((modified, deleted))
 }
 
-/// Single-quote a value for `sh -lc`.
+/// Single-quote a value for `sh -c`.
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
@@ -1606,7 +1660,7 @@ fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result
     }
 
     let seen = crate::guest_exec_command(machine)?
-        .args(["sh", "-lc"])
+        .args(["sh", "-c"])
         .arg(format!("wc -c < {} 2>/dev/null", shell_quote(remote)))
         .output()
         .context("measuring the copied file inside the machine")?;
@@ -1626,7 +1680,7 @@ fn push_to_guest(machine: &str, local: &std::path::Path, remote: &str) -> Result
 /// Run a command in the guest, failing loudly on a non-zero exit.
 fn guest_check(machine: &str, command: &str) -> Result<()> {
     let output = crate::guest_exec_command(machine)?
-        .args(["sh", "-lc", command])
+        .args(["sh", "-c", command])
         .output()
         .context("running smolvm machine exec")?;
     if !output.status.success() {
@@ -1638,7 +1692,7 @@ fn guest_check(machine: &str, command: &str) -> Result<()> {
     Ok(())
 }
 
-/// The `sh -lc` script for a command typed at the attach prompt.
+/// The `sh -c` script for a command typed at the attach prompt.
 ///
 /// `workspace` is reported by the worker and travels through the control
 /// plane, so it is quoted like every other guest path. Unquoted, a job could
@@ -1663,7 +1717,7 @@ fn run_in_guest(session: &DebugSession, command: &str) {
         }
     };
     let status = guest
-        .args(["sh", "-lc", &script])
+        .args(["sh", "-c", &script])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
@@ -1686,6 +1740,21 @@ mod tests {
         AttemptRecord, Diagnostic, FailedStep, SessionState, StepSummary,
     };
     use preloop_gha_protocol::{JobId, RunId};
+
+    #[tokio::test]
+    async fn wait_until_is_bounded_and_retries() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let answered = wait_until(5, || {
+            let current = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { current >= 2 }
+        })
+        .await;
+        assert!(answered);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let never = wait_until(2, || async { false }).await;
+        assert!(!never, "a silent guest must exhaust the attempts");
+    }
 
     fn session() -> DebugSession {
         DebugSession {
@@ -2094,13 +2163,90 @@ mod tests {
 
     #[test]
     fn shell_quoting_neutralizes_embedded_quotes() {
-        // Paths reach `sh -lc` as arguments. An unescaped apostrophe would
+        // Paths reach `sh -c` as arguments. An unescaped apostrophe would
         // close the string and execute whatever followed it.
         assert_eq!(shell_quote("/work/a b"), "'/work/a b'");
         // Every apostrophe becomes the standard `'\''` close-escape-reopen
         // sequence, so the payload stays a single literal argument.
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote("'; rm -rf /; '"), r"''\''; rm -rf /; '\'''");
+    }
+
+    /// Execute the real guest shell through the provider boundary with a
+    /// login profile that sources a missing file. A login shell must fail
+    /// before the command; the debug helper must keep the provider's PATH and
+    /// run the command without reading that unrelated profile.
+    #[cfg(unix)]
+    #[test]
+    fn guest_command_ignores_broken_login_profile_without_losing_path() {
+        crate::with_fake_smolvm_path(|executable| {
+            use std::os::unix::fs::PermissionsExt;
+
+            let fixture = tempfile::tempdir().unwrap();
+            let home = fixture.path().join("home");
+            let workspace = fixture.path().join("workspace");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&workspace).unwrap();
+            // dash aborts on the failed `.` itself; POSIX-mode bash (macOS
+            // /bin/sh) reports it and continues, so the explicit `exit`
+            // keeps the fixture fatal under both shells — matching the
+            // reporter's observation that bash masks the bug.
+            std::fs::write(
+                home.join(".profile"),
+                "PATH=/profile-only\n. \"$HOME/missing-cargo-env\" || exit 2\n",
+            )
+            .unwrap();
+
+            let expected_path = "/job/toolchain/bin:/usr/bin:/bin";
+            let login_marker = fixture.path().join("login-marker");
+            let login = std::process::Command::new("/bin/sh")
+                .args([
+                    "-lc",
+                    &format!(
+                        "printf login > {}",
+                        shell_quote(&login_marker.display().to_string())
+                    ),
+                ])
+                .env("HOME", &home)
+                .env("PATH", expected_path)
+                .output()
+                .unwrap();
+            assert!(
+                !login.status.success(),
+                "the fixture must make a login shell fail: {}",
+                String::from_utf8_lossy(&login.stderr)
+            );
+            assert!(!login_marker.exists());
+
+            let wrapper = format!(
+                "#!/bin/sh\nexport HOME={}\nexport PATH={}\n\
+                 while [ \"$#\" -gt 0 ] && [ \"$1\" != \"--\" ]; do shift; done\n\
+                 [ \"$#\" -gt 0 ] && shift\n\
+                 exec \"$@\"\n",
+                shell_quote(&home.display().to_string()),
+                shell_quote(expected_path),
+            );
+            std::fs::write(executable, wrapper).unwrap();
+            let mut permissions = std::fs::metadata(executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(executable, permissions).unwrap();
+
+            let marker = fixture.path().join("command-marker");
+            let mut paused = session();
+            paused.workspace = Some(workspace.display().to_string());
+            run_in_guest(
+                &paused,
+                &format!(
+                    "printf '%s' \"$PATH\" > {}",
+                    shell_quote(&marker.display().to_string())
+                ),
+            );
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), expected_path);
+
+            // The helper paths share the same provider boundary — a broken
+            // profile must not abort them either.
+            guest_check("probe", "true").unwrap();
+        });
     }
 
     #[test]

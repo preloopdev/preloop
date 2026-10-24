@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::expand::coerce_value;
-use crate::trigger::glob_match;
+use crate::trigger::{glob_match, matches_filter};
 use preloop_gha_protocol::JobId;
 
 #[test]
@@ -30,7 +30,7 @@ fn glob_match_double_star_requires_a_real_separator_before_a_literal_slash() {
         "`**/*.md` must not match a root-level file"
     );
     assert!(
-        glob_match("**/*.md", "docs/cli_reference.md"),
+        glob_match("**/*.md", "docs/roadmap.md"),
         "`**/*.md` matches inside a directory"
     );
     assert!(
@@ -44,7 +44,7 @@ fn glob_match_double_star_requires_a_real_separator_before_a_literal_slash() {
         "`**.md` must match a root-level file"
     );
     assert!(
-        glob_match("**.md", "docs/cli_reference.md"),
+        glob_match("**.md", "docs/roadmap.md"),
         "`**.md` must match a nested file"
     );
 
@@ -57,10 +57,184 @@ fn glob_match_double_star_requires_a_real_separator_before_a_literal_slash() {
 #[test]
 fn glob_match_single_star_does_not_cross_separators() {
     assert!(glob_match("*.md", "README.md"));
-    assert!(!glob_match("*.md", "docs/cli_reference.md"));
-    assert!(glob_match("docs/*.md", "docs/cli_reference.md"));
+    assert!(!glob_match("*.md", "docs/roadmap.md"));
+    assert!(glob_match("docs/*.md", "docs/roadmap.md"));
     assert!(!glob_match("docs/*.md", "docs/adr/0001-title.md"));
     assert!(glob_match("docs/**", "docs/adr/0001-title.md"));
+}
+
+/// Matching does not recurse per character, so a pattern of this length runs on a
+/// 2 MiB stack.
+#[test]
+fn glob_match_handles_very_long_patterns_on_a_small_stack() {
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let literal = "a".repeat(30_000);
+            assert!(glob_match(&literal, &literal));
+            assert!(!glob_match(&literal, &literal[1..]));
+            assert!(!glob_match(&literal, &format!("{literal}b")));
+            assert!(glob_match(&format!("{literal}*"), &format!("{literal}bc")));
+            assert!(glob_match(&"?".repeat(30_000), &"é".repeat(30_000)));
+            assert!(!glob_match(&"?".repeat(30_000), &"x".repeat(29_999)));
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("glob_match panicked on a long pattern");
+}
+
+/// `**` may absorb any run, so a backtracking matcher would try exponentially many
+/// splits here before ruling out the missing `z`.
+#[test]
+fn glob_match_rejects_repeated_double_stars_without_exponential_search() {
+    assert!(glob_match(&"**a".repeat(32), &"a".repeat(64)));
+    assert!(!glob_match(
+        &format!("{}z", "**a".repeat(32)),
+        &"a".repeat(64)
+    ));
+}
+
+/// Wildcard-heavy patterns over long values stay polynomial.
+#[test]
+fn glob_match_wildcard_heavy_patterns_stay_polynomial() {
+    assert!(glob_match(&"*a".repeat(100), &"a".repeat(1_000)));
+    assert!(!glob_match(
+        &"*a".repeat(100),
+        &format!("{}b", "a".repeat(1_000))
+    ));
+}
+
+/// A `*` that cannot cross `/` must not make the matcher give up on an earlier
+/// `**` that can absorb the separator.
+#[test]
+fn glob_match_keeps_double_star_when_a_later_star_cannot_cross_slashes() {
+    assert!(glob_match("**/*c", "a/b/c"));
+    assert!(glob_match("**/*x", "a/b/c/x"));
+    assert!(glob_match("**/*/x", "a/b/c/x"));
+    assert!(glob_match("*/**/x", "a/b/x"));
+    assert!(!glob_match("*/**/x", "a/x"));
+    assert!(!glob_match("**/*c", "c"));
+    assert!(!glob_match("**/*c", "a/b/cd"));
+}
+
+/// Zero-length runs satisfy `*` and `**`, while `?` always consumes one character.
+#[test]
+fn glob_match_zero_width_wildcards() {
+    assert!(glob_match("", ""));
+    assert!(!glob_match("", "a"));
+    assert!(glob_match("*", ""));
+    assert!(glob_match("**", ""));
+    assert!(glob_match("a*b", "ab"));
+    assert!(glob_match("a**b", "ab"));
+    assert!(glob_match("a**", "a"));
+    assert!(glob_match("*a", "a"));
+    assert!(!glob_match("?", ""));
+    assert!(!glob_match("a?b", "ab"));
+}
+
+/// `?` stops at a separator the way `*` does, while `**` spans it.
+#[test]
+fn glob_match_question_mark_does_not_cross_separators() {
+    assert!(glob_match("a?b", "axb"));
+    assert!(!glob_match("a?b", "a/b"));
+    assert!(glob_match("a**b", "a/x/b"));
+}
+
+/// Matching compares Unicode scalar values, not bytes: `é` is one character to
+/// both `?` and a literal, and a literal `e` does not match it.
+#[test]
+fn glob_match_compares_unicode_scalar_values() {
+    assert!(glob_match("caf?", "café"));
+    assert!(!glob_match("caf??", "café"));
+    assert!(glob_match("?", "🙂"));
+    assert!(glob_match("*é", "cafeé"));
+    assert!(!glob_match("cafe*", "café"));
+    assert!(glob_match("ü/*", "ü/x"));
+}
+
+/// Include and `!` exclude patterns apply in order; the last pattern that matches
+/// decides.
+#[test]
+fn ordered_negation_lets_the_last_matching_pattern_decide() {
+    let filter = json!(["feature/**", "!feature/wip/**", "feature/wip/ready"]);
+    assert!(matches_filter(&filter, "feature/auth"));
+    assert!(!matches_filter(&filter, "feature/wip/draft"));
+    assert!(matches_filter(&filter, "feature/wip/ready"));
+
+    let filter = json!(["**", "!docs/**"]);
+    assert!(!matches_filter(&filter, "docs/readme.md"));
+    assert!(matches_filter(&filter, "src/lib.rs"));
+
+    let reordered = json!(["!docs/**", "**"]);
+    assert!(matches_filter(&reordered, "docs/readme.md"));
+}
+
+/// The recursive matcher that `glob_match` replaced, kept as a test oracle. It is
+/// exponential in the number of stars, so only tiny inputs go through it.
+fn glob_match_reference(pattern: &str, value: &str) -> bool {
+    fn matches(pattern: &[char], value: &[char], pi: usize, vi: usize) -> bool {
+        if pi == pattern.len() {
+            return vi == value.len();
+        }
+        if pattern[pi] == '*' {
+            let double_star = pattern.get(pi + 1) == Some(&'*');
+            let next_pi = if double_star { pi + 2 } else { pi + 1 };
+            if matches(pattern, value, next_pi, vi) {
+                return true;
+            }
+            let mut next_vi = vi;
+            while next_vi < value.len() {
+                if !double_star && value[next_vi] == '/' {
+                    break;
+                }
+                next_vi += 1;
+                if matches(pattern, value, next_pi, next_vi) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if pattern[pi] == '?' {
+            return vi < value.len() && value[vi] != '/' && matches(pattern, value, pi + 1, vi + 1);
+        }
+        vi < value.len() && pattern[pi] == value[vi] && matches(pattern, value, pi + 1, vi + 1)
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    matches(&pattern, &value, 0, 0)
+}
+
+/// Every pattern of up to five characters from `*`, `?`, `/` and `a`, against every
+/// value of up to five characters from `a`, `/` and `é`.
+#[test]
+fn glob_match_agrees_with_the_recursive_reference_on_small_inputs() {
+    fn strings_up_to(alphabet: &[char], max_len: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut layer = vec![String::new()];
+        for _ in 0..max_len {
+            let mut longer = Vec::with_capacity(layer.len() * alphabet.len());
+            for prefix in &layer {
+                for &c in alphabet {
+                    longer.push(format!("{prefix}{c}"));
+                }
+            }
+            all.extend_from_slice(&longer);
+            layer = longer;
+        }
+        all
+    }
+
+    let patterns = strings_up_to(&['*', '?', '/', 'a'], 5);
+    let values = strings_up_to(&['a', '/', 'é'], 5);
+    for pattern in &patterns {
+        for value in &values {
+            assert_eq!(
+                glob_match(pattern, value),
+                glob_match_reference(pattern, value),
+                "pattern {pattern:?} against value {value:?}"
+            );
+        }
+    }
 }
 
 /// `match_event` is the single source of truth; `matches_with_context` is its
@@ -4132,4 +4306,203 @@ jobs:
         reads.names,
         std::collections::BTreeSet::from(["REAL".to_owned()])
     );
+}
+
+#[test]
+fn same_repository_refs_are_recognized_by_their_prefix() {
+    assert!(is_local_workflow_ref("./.github/workflows/build.yml"));
+    assert!(is_local_workflow_ref("$/.github/workflows/build.yml"));
+    assert!(!is_local_workflow_ref(
+        "owner/repo/.github/workflows/build.yml@v1"
+    ));
+    assert!(!is_local_workflow_ref("$"));
+    assert!(!is_local_workflow_ref("$build.yml"));
+}
+
+#[test]
+fn same_repository_calls_name_no_workflow_repository() {
+    let called = r#"
+on:
+  workflow_call:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: $/.github/actions/setup
+"#;
+    for uses in [
+        "./.github/workflows/build.yml",
+        "$/.github/workflows/build.yml",
+    ] {
+        let caller =
+            parse_workflow(&format!("on: push\njobs:\n  call:\n    uses: {uses}\n")).unwrap();
+        let reusable =
+            BTreeMap::from([(".github/workflows/build.yml".to_owned(), called.to_owned())]);
+
+        let expanded = expand_jobs_with_reusables(&caller, &reusable).unwrap();
+        assert_eq!(expanded.jobs[0].workflow_repository, None, "{uses}");
+        assert_eq!(
+            expanded.reusable_calls["call"].workflow_repository, None,
+            "{uses}"
+        );
+
+        // Materializing the callee keeps the identity: its jobs run in the
+        // submitted repository, not in a repository named `./.github` or `$/.github`.
+        let materialized = expand_reusable_call(
+            &parse_workflow(called).unwrap(),
+            &expanded.jobs[0],
+            &reusable,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(materialized.jobs[0].id.0, "call/build");
+        assert_eq!(materialized.jobs[0].workflow_repository, None, "{uses}");
+    }
+}
+
+#[test]
+fn same_repository_call_in_a_remote_callee_resolves_in_its_repository() {
+    let remote = "octo/shared/.github/workflows/outer.yml@v1";
+    let pinned = "0123456789abcdef0123456789abcdef01234567";
+    let nested_key = format!("octo/shared/.github/workflows/inner.yml@{pinned}");
+    let outer = r#"
+on:
+  workflow_call:
+jobs:
+  nested:
+    uses: $/.github/workflows/inner.yml
+"#;
+    let inner = r#"
+on:
+  workflow_call:
+jobs:
+  leaf:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo inner
+"#;
+    let caller =
+        parse_workflow(&format!("on: push\njobs:\n  call:\n    uses: {remote}\n")).unwrap();
+    let shas = BTreeMap::from([
+        (remote.to_owned(), pinned.to_owned()),
+        (nested_key.clone(), pinned.to_owned()),
+    ]);
+    // The submitted tree has its own `inner.yml`; the remote callee must never
+    // select it for its `$/` call.
+    let mut reusable = BTreeMap::from([
+        (remote.to_owned(), outer.to_owned()),
+        (
+            ".github/workflows/inner.yml".to_owned(),
+            inner.replace("echo inner", "echo caller"),
+        ),
+        (nested_key.clone(), inner.to_owned()),
+    ]);
+
+    let expanded = expand_jobs_with_reusables_and_shas(&caller, &reusable, &shas).unwrap();
+    let outer_workflow = parse_workflow(outer).unwrap();
+    let callee =
+        expand_reusable_call(&outer_workflow, &expanded.jobs[0], &reusable, &shas).unwrap();
+    let nested = callee
+        .jobs
+        .iter()
+        .find(|job| job.id.0 == "call/nested")
+        .expect("nested call placeholder");
+    let call = nested.reusable_call.as_ref().expect("reusable call");
+    assert_eq!(call.uses, nested_key);
+    assert_eq!(call.workflow_repository.as_deref(), Some("octo/shared"));
+    assert_eq!(call.workflow_sha.as_deref(), Some(pinned));
+
+    // Without the callee's own copy the nested call is missing; it is not
+    // satisfied by the submitted tree's file.
+    reusable.remove(&nested_key);
+    match expand_reusable_call(&outer_workflow, &expanded.jobs[0], &reusable, &shas) {
+        Err(ParserError::MissingReusableWorkflow { path }) => assert_eq!(path, nested_key),
+        other => panic!("expected MissingReusableWorkflow, got {other:?}"),
+    }
+}
+
+#[test]
+fn same_repository_refs_stay_inside_the_callee_repository() {
+    let origin = "octo/shared/.github/workflows/outer.yml@v1";
+    assert_eq!(
+        scope_same_repository_ref("$/.github/workflows/inner.yml", origin, "abc123").as_deref(),
+        Some("octo/shared/.github/workflows/inner.yml@abc123")
+    );
+    assert_eq!(
+        scope_same_repository_ref("./.github/workflows/inner.yml", origin, "abc123").as_deref(),
+        Some("octo/shared/.github/workflows/inner.yml@abc123")
+    );
+    assert_eq!(
+        scope_same_repository_ref("$/.github/workflows/../../secrets.yml", origin, "abc123"),
+        None
+    );
+    assert_eq!(
+        scope_same_repository_ref("octo/other/.github/workflows/x.yml@v1", origin, "abc123"),
+        None
+    );
+    assert_eq!(
+        scope_same_repository_ref("$/.github/workflows/inner.yml", "not-a-remote-key", "abc"),
+        None
+    );
+}
+
+#[test]
+fn plain_paths_refuse_every_spelling_a_url_parser_could_reinterpret() {
+    for path in [
+        "build.yml",
+        ".github/workflows/build.yml",
+        "v1.2.3",
+        "release/2026-10",
+        "my.workflow-1_x.yml",
+    ] {
+        assert!(is_plain_path(path), "`{path}` is plain");
+    }
+    for path in [
+        "", "/abs", "a//b", "a/", "..", "a/../b", "./a", "a/./b", "a\\b", "a%2e%2e", "a?b", "a#b",
+        "a b", "a\tb", "a\nb", "a+b",
+    ] {
+        assert!(!is_plain_path(path), "{path:?} must be refused");
+    }
+    assert!(is_plain_segment("octo-org"));
+    assert!(!is_plain_segment("a/b"));
+    assert!(!is_plain_segment(".."));
+}
+
+#[test]
+fn same_repository_paths_must_be_reusable_workflow_paths() {
+    assert_eq!(
+        same_repository_path("$/.github/workflows/build.yml"),
+        Some(".github/workflows/build.yml")
+    );
+    assert_eq!(
+        same_repository_path("./.github/workflows/build.yml"),
+        Some(".github/workflows/build.yml")
+    );
+    for uses in [
+        "$/../../../../repos/other/private/contents/.github/workflows/x.yml",
+        "$/.github/workflows/../../x.yml",
+        "$//.github/workflows/x.yml",
+        "$/.github/workflows/x.yml/",
+        "$/x.yml",
+        "$/.github/workflows/a b.yml",
+        "$/",
+        "octo/demo/.github/workflows/build.yml@v1",
+    ] {
+        assert_eq!(same_repository_path(uses), None, "`{uses}`");
+    }
+}
+
+#[test]
+fn same_repository_refs_must_name_a_workflow_file_under_github_workflows() {
+    assert_eq!(
+        same_repository_path("$/.github/workflows/ci.yml"),
+        Some(".github/workflows/ci.yml")
+    );
+    for uses in [
+        "$/../../../repos/other/private/contents/.github/workflows/x.yml",
+        "./../x.yml",
+        "$/src/x.yml",
+    ] {
+        assert_eq!(same_repository_path(uses), None, "`{uses}` must be refused");
+    }
 }

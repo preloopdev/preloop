@@ -1202,19 +1202,294 @@ mod official_semantics {
         ));
     }
 
-    #[test]
-    fn deeply_nested_binary_chains_error_instead_of_overflowing() {
-        for operator in ["||", "&&", "=="] {
-            let mut expr = "true".to_owned();
-            for _ in 0..1_000 {
-                expr.push_str(operator);
-                expr.push_str("true");
-            }
-            assert!(
-                matches!(validate_expression(&expr), Err(ExpressionError::TooDeep(_))),
-                "operator chain should be depth-limited: {operator}"
-            );
+    /// Depth of a parsed tree, measured by walking it. This cross-checks the
+    /// depth the parser tracks while it builds each node.
+    fn ast_depth(expr: &crate::ast::Expr) -> usize {
+        use crate::ast::Expr;
+        match expr {
+            Expr::Literal(_) | Expr::Path(_) => 1,
+            Expr::UnaryNot(inner) | Expr::MemberAccess { expr: inner, .. } => 1 + ast_depth(inner),
+            Expr::Binary { left, right, .. } => 1 + ast_depth(left).max(ast_depth(right)),
+            Expr::Index { base, key } => 1 + ast_depth(base).max(ast_depth(key)),
+            Expr::Call { args, .. } => 1 + args.iter().map(ast_depth).max().unwrap_or(0),
         }
+    }
+
+    /// Parses `input`, checks that the tree it builds stays within the
+    /// ceiling, and returns that tree's depth.
+    fn accepted_depth(input: &str) -> usize {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        if let Err(error) = validate_expression(input) {
+            panic!("{input:?} should parse: {error}");
+        }
+        let depth = ast_depth(&crate::parse_cached(input).unwrap());
+        assert!(
+            depth <= MAX_EXPRESSION_DEPTH,
+            "{input:?} built a tree of depth {depth}"
+        );
+        depth
+    }
+
+    /// Asserts that `input` is refused while parsing with `TooDeep`.
+    fn assert_too_deep(input: &str) {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        assert_eq!(
+            validate_expression(input),
+            Err(ExpressionError::TooDeep(MAX_EXPRESSION_DEPTH)),
+            "{input:?} should be refused while parsing"
+        );
+    }
+
+    #[test]
+    fn binary_chain_depth_is_exact_at_the_ceiling() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // `true` is one leaf and every operator adds one level, whichever
+        // operator it is.
+        for operator in ["||", "&&", "=="] {
+            let link = format!("{operator}true");
+            let within = format!("true{}", link.repeat(MAX_EXPRESSION_DEPTH - 1));
+            assert_eq!(accepted_depth(&within), MAX_EXPRESSION_DEPTH);
+            let over = format!("true{}", link.repeat(MAX_EXPRESSION_DEPTH));
+            assert_too_deep(&over);
+        }
+    }
+
+    #[test]
+    fn computed_index_chain_depth_is_exact_at_the_ceiling() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // `github` is one leaf and each `[('x')]` wraps the chain in one Index.
+        let within = format!("github{}", "[('x')]".repeat(MAX_EXPRESSION_DEPTH - 1));
+        assert_eq!(accepted_depth(&within), MAX_EXPRESSION_DEPTH);
+        assert!(eval_expression(&within, &Context::default()).is_ok());
+
+        let over = format!("github{}", "[('x')]".repeat(MAX_EXPRESSION_DEPTH));
+        assert_too_deep(&over);
+
+        // The original crash input: 500 bracket pairs must error, not overflow.
+        assert_too_deep(&format!("github{}", "[('x')]".repeat(500)));
+    }
+
+    #[test]
+    fn call_suffix_chain_depth_is_exact_at_the_ceiling() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // A call is one level over its literal argument, and each folded key
+        // adds one more on top of the call.
+        let within = format!(
+            "toJSON('{{}}'){}",
+            "[('x')]".repeat(MAX_EXPRESSION_DEPTH - 2)
+        );
+        assert_eq!(accepted_depth(&within), MAX_EXPRESSION_DEPTH);
+
+        let over = format!(
+            "toJSON('{{}}'){}",
+            "[('x')]".repeat(MAX_EXPRESSION_DEPTH - 1)
+        );
+        assert_too_deep(&over);
+    }
+
+    #[test]
+    fn nested_call_wrapped_chains_count_the_whole_tree() {
+        // Each round wraps the tree so far in a call and folds 80 keys onto
+        // it, so the tree would be 82 levels deep after one round and 163
+        // after two. Recursion stays shallow throughout, so only the tree's
+        // own depth refuses it.
+        let mut expr = "github".to_owned();
+        for _ in 0..3 {
+            expr = format!("format('x', {expr}){}", "[('x')]".repeat(80));
+        }
+        assert_too_deep(&expr);
+    }
+
+    #[test]
+    fn chain_in_a_computed_key_carries_its_depth_outward() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // The key is 101 levels deep, so indexing with it reaches 102, and
+        // every later fold adds one more.
+        let key = format!("github{}", "[('x')]".repeat(100));
+        let within = format!(
+            "github[{key}]{}",
+            "[('x')]".repeat(MAX_EXPRESSION_DEPTH - 102)
+        );
+        assert_eq!(accepted_depth(&within), MAX_EXPRESSION_DEPTH);
+
+        let over = format!(
+            "github[{key}]{}",
+            "[('x')]".repeat(MAX_EXPRESSION_DEPTH - 101)
+        );
+        assert_too_deep(&over);
+    }
+
+    #[test]
+    fn operator_chain_after_a_deep_group_counts_the_whole_tree() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // The parenthesized group is 101 levels deep; each `|| true` after it
+        // adds one level above the chain built so far.
+        let group = format!("(github{})", "[('x')]".repeat(100));
+        let within = format!("{group}{}", " || true".repeat(MAX_EXPRESSION_DEPTH - 101));
+        assert_eq!(accepted_depth(&within), MAX_EXPRESSION_DEPTH);
+
+        let over = format!("{group}{}", " || true".repeat(MAX_EXPRESSION_DEPTH - 100));
+        assert_too_deep(&over);
+    }
+
+    #[test]
+    fn mixed_call_index_and_operator_branches_share_one_ceiling() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // The argument is 102 levels deep (a 101-level group under `||`), so
+        // the call is 103 and each fold after it adds one more.
+        let argument = format!("(github{}) || true", "[('x')]".repeat(100));
+        let within = format!(
+            "format('x', {argument}){}",
+            "[('x')]".repeat(MAX_EXPRESSION_DEPTH - 103)
+        );
+        assert_eq!(accepted_depth(&within), MAX_EXPRESSION_DEPTH);
+
+        let over = format!(
+            "format('x', {argument}){}",
+            "[('x')]".repeat(MAX_EXPRESSION_DEPTH - 102)
+        );
+        assert_too_deep(&over);
+    }
+
+    #[test]
+    fn flat_path_reads_stay_accepted() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // Literal segments on an open path extend one flat Path, however long.
+        let dots = format!("github{}", ".ref".repeat(MAX_EXPRESSION_DEPTH * 4));
+        assert_eq!(accepted_depth(&dots), 1);
+        let keys = format!("github{}", "['ref']".repeat(MAX_EXPRESSION_DEPTH * 4));
+        assert_eq!(accepted_depth(&keys), 1);
+
+        // A call wraps once; the segments after it extend that wrapper flatly.
+        let after_call = format!("toJSON('{{}}'){}", ".ref".repeat(MAX_EXPRESSION_DEPTH * 4));
+        assert_eq!(accepted_depth(&after_call), 3);
+    }
+
+    #[test]
+    fn suffix_depth_violation_is_fatal_not_backed_off() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // A malformed key backs off, but a key past the ceiling must surface
+        // as TooDeep rather than leave a silently truncated expression.
+        let deep_key = format!(
+            "toJSON('{{}}')[{}x{}]",
+            "(".repeat(MAX_EXPRESSION_DEPTH),
+            ")".repeat(MAX_EXPRESSION_DEPTH)
+        );
+        assert_too_deep(&deep_key);
+    }
+
+    #[test]
+    fn sibling_branches_do_not_add_depth() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // Each argument sits one level below the call, however many there are.
+        let args = std::iter::repeat_n("github.ref", MAX_EXPRESSION_DEPTH)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut context = Context::default();
+        context.insert("github", json!({"ref": "refs/heads/main"}));
+        assert_eq!(
+            eval_expression(&format!("format('{{0}}', {args})"), &context).unwrap(),
+            Value::String("refs/heads/main".to_owned())
+        );
+
+        // Three branches 101 levels deep make a call 102 deep, and the same
+        // holds when each branch is an operator over a computed-key chain:
+        // siblings do not add their depths together.
+        let branch = format!("github{}", "[('x')]".repeat(100));
+        let siblings = format!("format('{{0}}', {branch}, {branch}, {branch})");
+        assert_eq!(accepted_depth(&siblings), 102);
+        let mixed = format!("(github{}) || true", "[('x')]".repeat(100));
+        let mixed_siblings = format!("format('{{0}}', {mixed}, {mixed}, {mixed})");
+        assert_eq!(accepted_depth(&mixed_siblings), 103);
+    }
+
+    /// The evaluator's own recursion ceiling: a programmatically built tree
+    /// deeper than the parser allows must still fail as `TooDeep` instead
+    /// of overflowing the stack.
+    #[test]
+    fn evaluator_rejects_programmatically_deep_trees() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+        use crate::ast::Expr;
+        use crate::evaluator::{EvalBudget, eval};
+
+        // Each `Index` level costs one `eval` entry, plus one for the leaf:
+        // 127 levels fit exactly under the ceiling, 128 do not.
+        let build = |levels: usize| {
+            let mut expr = Expr::Literal(serde_json::Value::Null);
+            for _ in 0..levels {
+                expr = Expr::Index {
+                    base: Box::new(expr),
+                    key: Box::new(Expr::Literal(json!("k"))),
+                };
+            }
+            expr
+        };
+
+        let within = build(MAX_EXPRESSION_DEPTH - 1);
+        let mut budget = EvalBudget::default();
+        assert!(
+            eval(&within, &Context::default(), &mut budget).is_ok(),
+            "a tree at the ceiling must still evaluate"
+        );
+
+        let over = build(MAX_EXPRESSION_DEPTH);
+        let mut budget = EvalBudget::default();
+        assert!(
+            matches!(
+                eval(&over, &Context::default(), &mut budget),
+                Err(ExpressionError::TooDeep(_))
+            ),
+            "a tree past the ceiling must fail, not overflow"
+        );
+    }
+
+    /// Member chains nested inside *computed* bracket keys
+    /// (`a[b[c[('k')…]]]`) are bounded by recursion: each level costs its
+    /// key's expression plus the parenthesized group around it, and a sibling
+    /// argument starts again from the call's own depth.
+    #[test]
+    fn nested_computed_keys_hit_the_recursion_ceiling() {
+        use super::expr_parser::MAX_EXPRESSION_DEPTH;
+
+        // Each `[('…')]` layer costs two recursion levels (the key and its
+        // parenthesized group), so nesting past half the ceiling must be
+        // rejected, not crash.
+        let mut expr = "x".to_owned();
+        for _ in 0..(MAX_EXPRESSION_DEPTH / 2 + 2) {
+            expr = format!("a[({expr})]");
+        }
+        assert!(
+            matches!(validate_expression(&expr), Err(ExpressionError::TooDeep(_))),
+            "nested computed-key chains must be rejected, not crash"
+        );
+
+        // Nested keys recurse one parse level each even when every key is a
+        // literal (`a[b]` is a Path only at the innermost level; `a[a[…]]`
+        // folds Index nodes), so a deep literal-key nest is also bounded.
+        let mut literal = "x".to_owned();
+        for _ in 0..(MAX_EXPRESSION_DEPTH + 2) {
+            literal = format!("a[{literal}]");
+        }
+        assert!(matches!(
+            validate_expression(&literal),
+            Err(ExpressionError::TooDeep(_))
+        ));
+
+        // A single computed key one level deep stays well within budget.
+        assert!(validate_expression("a[b['k']]").is_ok());
+        assert!(validate_expression("a[b[c['k']]]").is_ok());
+        assert!(validate_expression("a[('k')]").is_ok());
     }
 
     #[test]

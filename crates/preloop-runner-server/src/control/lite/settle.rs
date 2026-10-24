@@ -553,12 +553,13 @@ pub(super) fn cancel_holder(
 
 /// `cancel_run_inner`: cancel every non-terminal job of a run, queue
 /// cancellations for the in-flight ones, retire expandable node requests,
-/// release the run's concurrency, and clear its dispatch intent.
+/// release the run's concurrency, and clear its dispatch intent. Returns
+/// cancellations queued and whether this transaction cancelled a live run.
 pub(super) fn cancel_run_inner(
     tx: &Transaction<'_>,
     backend: &LiteBackend,
     run_id: RunId,
-) -> Result<usize, ControlError> {
+) -> Result<(usize, bool), ControlError> {
     let run = codec::run_key(run_id);
     let exists: bool = tx
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1)")
@@ -566,7 +567,7 @@ pub(super) fn cancel_run_inner(
         .query_row([&run], |row| row.get(0))
         .map_err(db)?;
     if !exists {
-        return Ok(0);
+        return Ok((0, false));
     }
     // In-flight attempts get a cancellation message; the rest simply turn
     // terminal (their runners hold nothing).
@@ -650,7 +651,7 @@ pub(super) fn cancel_run_inner(
             serde_json::json!({"status": "cancelled"}),
         )?;
     }
-    Ok(cancellations)
+    Ok((cancellations, finalized > 0))
 }
 
 /// `cancel_job_inner`: cancel one job and its subtree, queueing a

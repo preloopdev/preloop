@@ -166,7 +166,7 @@ pub async fn webhook_health(
         }
     };
     let watchdog = shared.state.webhook_status.watchdog();
-    let breaker = shared.state.github_breaker.snapshot();
+    let breaker = shared.state.github_breakers.snapshot();
     let (app_config, app_config_checked_at_us) = shared.state.webhook_status.app_config_snapshot();
     let apps: Vec<Value> = app_config
         .into_iter()
@@ -179,6 +179,7 @@ pub async fn webhook_health(
                 "missing_events": app.missing_events,
                 "missing_permissions": app.missing_permissions,
                 "healthy": app.healthy(),
+                "checked_at": app.checked_at_us.and_then(rfc3339),
                 "error": app.error,
             })
         })
@@ -198,14 +199,21 @@ pub async fn webhook_health(
             "open_repairs": watchdog.open_repairs,
             "last_error": watchdog.last_error,
         },
-        "github_breaker": {
-            "open": breaker.open,
-            "retry_in_seconds": breaker.retry_in_seconds,
-            "consecutive_failures": breaker.consecutive_failures,
-            "trips": breaker.trips,
-            "rate_limited": breaker.rate_limited,
-            "last_error": breaker.last_error,
-        },
+        "github_breaker": breaker
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "bucket": row.bucket,
+                    "open": row.breaker.open,
+                    "retry_in_seconds": row.breaker.retry_in_seconds,
+                    "consecutive_failures": row.breaker.consecutive_failures,
+                    "trips": row.breaker.trips,
+                    "rate_limited": row.breaker.rate_limited,
+                    "last_error": row.breaker.last_error,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "github_consumption": shared.state.github_consumption.snapshot(),
         "apps": apps,
         "app_config_checked_at": app_config_checked_at_us.and_then(rfc3339),
     })))
@@ -243,6 +251,7 @@ mod tests {
                 attempts: 0,
                 lease_until_us: None,
                 lease_token: None,
+                signer_app_id: None,
                 last_error: None,
             })
             .await
@@ -390,7 +399,9 @@ mod tests {
         assert_eq!(health.0["queue"]["received"], 1);
         assert!(health.0["queue"]["oldest_pending_age_seconds"].is_number());
         assert_eq!(health.0["watchdog"]["enabled"], false);
-        assert_eq!(health.0["github_breaker"]["open"], false);
+        // Breaker state is per credential bucket now: untouched buckets have
+        // no row yet.
+        assert_eq!(health.0["github_breaker"], serde_json::json!([]));
         assert!(health.0["apps"].is_array());
     }
 }

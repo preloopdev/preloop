@@ -1,0 +1,53 @@
+---
+title: Workflow engine
+description: How Preloop parses workflow YAML, expands jobs, builds the needs graph, and evaluates expressions.
+---
+
+Preloop separates workflow interpretation from runner execution. The control plane turns YAML into a durable job graph and runner messages; the runner evaluates step conditions and executes the resulting steps.
+
+![Workflow parser pipeline](/diagrams/parser-pipeline.svg)
+
+![Expression engine](/diagrams/expression-engine.svg)
+
+## Parser pipeline
+
+1. **Normalize and parse YAML.** Workflow keys are deserialized into typed models. YAML's boolean spelling of `on` is normalized to the trigger key, empty workflows are rejected, event names are validated, and expression syntax and function calls are checked before a run is admitted.
+2. **Project the event.** Trigger matching considers the event name, activity `types`, branch or tag filters, path filters, workflow-dispatch inputs, and upstream workflow names for `workflow_run`. A mismatch reports the rejected axis rather than silently creating an empty run.
+3. **Resolve reusable workflows.** Local and remote reusable workflow files are loaded into the call tree. The expansion guard allows at most 10 connected workflow levels (the top-level caller plus nine nested levels) and 50 unique reusable workflow references in one run tree.
+4. **Expand jobs and matrices.** Jobs become `JobPlan` records. Matrix axes produce stable cells; `include` can add or augment cells and `exclude` removes matching cells. A matrix is capped at 256 combinations. `fail-fast` and `max-parallel` remain part of the plan for control-plane scheduling.
+5. **Build and validate the DAG.** `needs:` references must name an existing job, and cycles are rejected. A dependency closure can be selected for a single job. Jobs whose matrix or reusable-workflow inputs depend on `needs` are stored as deferred expansion nodes and expanded when their dependencies settle.
+6. **Build runner messages.** The job builder converts each plan into the encrypted runner message: steps, environment, contexts, token permissions, action metadata, timeout, timeline references, and the job's dependency outputs.
+
+Use `preloop plan` to inspect the expanded job DAG without executing it.
+
+## What is evaluated where
+
+| Phase | Examples |
+| --- | --- |
+| Submission and admission | Trigger filters, workflow name, workflow-level concurrency, root-job `if`, static `runs-on`, matrix values, reusable-workflow inputs, and server-owned `env`/`with`/`run` strings. |
+| Promotion or job build | `needs.*` outputs, deferred matrices, deferred reusable callers, dependency-aware job conditions, and labels or names that cannot be resolved before dependencies finish. |
+| Runner execution | Step `if` conditions, step status functions, `github.workspace`, and values that depend on files or step outputs created inside the job. |
+
+The server leaves raw step `if` conditions in the runner message because the runner has the completed step context. Expressions that mention `needs` or `github.workspace` are deliberately deferred instead of being resolved to an empty string. The runner supplies runtime contexts such as `runner`, `steps`, and the final workspace while preserving the server-provided `github`, `matrix`, `strategy`, `job`, `inputs`, `env`, `vars`, and `secrets` roots.
+
+## Expression language
+
+Expressions use `${{ ... }}` delimiters. The evaluator supports:
+
+- `null`, booleans, numbers, and single-quoted strings;
+- dotted paths such as `github.ref` and bracket access such as `matrix['target']`;
+- wildcard member access (`*`) over arrays and objects;
+- unary `!`, logical `&&` and `||`, and comparisons `==`, `!=`, `<`, `<=`, `>`, and `>=`; and
+- the built-ins `always()`, `success()`, `failure()`, `cancelled()`, `contains()`, `startsWith()`, `endsWith()`, `format()`, `fromJSON()`, `toJSON()`, `join()`, `hashFiles()`, and `case()`.
+
+When a condition does not contain an explicit status-check function, Preloop applies the implicit `success()` gate used by Actions. `success()` and `failure()` can take dependency names in job conditions; step-level validation narrows them to the runner's zero-argument form.
+
+`hashFiles()` is evaluated relative to the workspace and is bounded by file-count, traversal, and input-size limits. `format()` and expression evaluation also have output and temporary-value budgets. Expressions deeper than 128 AST levels are rejected before evaluation.
+
+Unknown functions, invalid arity, malformed JSON passed to `fromJSON()`, disallowed `hashFiles()` paths, and invalid syntax fail validation or evaluation rather than being silently treated as a false condition.
+
+## Contexts and secrets
+
+The engine builds contexts for `github`, `env`, `vars`, `secrets`, `needs`, `steps`, `matrix`, `strategy`, `job`, `runner`, and `inputs`. Secret references are collected from the workflow tree so the control plane can inject only the names needed by the job. Values come from Preloop's local secret store; the engine does not read GitHub's write-only secret store. Engine-provided values such as `GITHUB_TOKEN`, runtime URLs/tokens, cache URLs, and Results URLs are minted at the job boundary and are not reported as missing user secrets.
+
+A workflow can use deferred matrix values from `fromJSON(needs.<job>.outputs.<name>)`; those cells are expanded only after the producing job's outputs are recorded. This keeps the durable graph and runner message aligned with the data that actually exists at promotion time.

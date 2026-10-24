@@ -50,6 +50,7 @@ refinery.workspace = true
 postgres_rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
+webpki-root-certs.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 libc = { workspace = true }
@@ -74,6 +75,10 @@ keyring.workspace = true
 toml = { workspace = true }
 parking_lot.workspace = true
 prost = "0.14.3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["user"] }
+
 [[bin]]
 name = "preloop-server"
 path = "src/main.rs"
@@ -93,6 +98,11 @@ test-support = []
 [[test]]
 name = "recovery"
 path = "tests/recovery.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "mutation_targets"
+path = "tests/mutation_targets.rs"
 required-features = ["test-support"]
 
 [[test]]
@@ -126,8 +136,28 @@ path = "tests/webhooks.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "merge"
+path = "tests/merge.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "concurrency"
 path = "tests/concurrency.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "blob_url_binding"
+path = "tests/blob_url_binding.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "blob_refresh"
+path = "tests/blob_refresh.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "diag_reaping"
+path = "tests/diag_reaping.rs"
 required-features = ["test-support"]
 
 [[test]]
@@ -138,6 +168,11 @@ required-features = ["test-support"]
 [[test]]
 name = "runner_deprecations"
 path = "tests/runner_deprecations.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "sarif"
+path = "tests/sarif.rs"
 required-features = ["test-support"]
 
 [[test]]

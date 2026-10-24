@@ -19,6 +19,11 @@ use crate::control::ControlError;
 /// the live-console recovery buffer (read only by a restart to refill this
 /// map) and is bounded to the SAME budget in `store_log_chunk` — keeping
 /// more on disk is pointless since a restart trims it back to this cap.
+///
+/// It is also the body limit of the log-append and console routes in
+/// `routes.rs`. A single append larger than this window would be head-truncated
+/// by both the in-memory buffer and the on-disk live segments, so the route
+/// refuses it with 413 rather than accept bytes it cannot keep.
 pub const MAX_LOG_BYTES_PER_KEY: usize = 16 * 1024 * 1024;
 
 /// slack above `MAX_LOG_BYTES_PER_KEY` before the in-memory retained
@@ -41,6 +46,10 @@ pub const MAX_LOGS_PER_PLAN: usize = 512;
 /// global retained byte budget across all plans. Prevents a runner
 /// from fabricating unlimited `plan_id` values to bypass the per-plan cap.
 pub const MAX_LOG_BYTES_GLOBAL: usize = 256 * 1024 * 1024;
+/// Maximum size of one signed replay-result upload (step/job log or summary).
+/// The upload handler receives the complete body for masking before it is
+/// atomically persisted, so the route must keep this request bounded.
+pub const MAX_REPLAY_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Global retained log entry cap.
 pub const MAX_LOGS_GLOBAL: usize = 4096;
@@ -95,19 +104,21 @@ pub const MAX_TOP_RECORDS: usize = 500;
 pub const MAX_PENDING_PER_JOB: usize = 32;
 
 /// Cap on a single in-flight legacy cache upload
-/// (`PendingCache::bytes`). `cache_upload` appends every PATCH body with no
-/// running total; without this cap a job could grow server RAM without bound
-/// by PATCHing chunks forever (~500 requests/GiB at the 2 MiB default body
-/// limit). Matches the 512 MiB body limit on the Twirp blob upload route.
+/// (`PendingCache::staging_len`). `cache_upload` streams each PATCH body
+/// frame to its staging file and reserves the frame's bytes before writing;
+/// it never collects the request into one `Bytes` allocation. The route's
+/// manual cap is this same budget, with `DefaultBodyLimit` retained only as
+/// defense-in-depth for a future buffered extractor. Matches the 512 MiB
+/// body budget on the Twirp blob upload route.
 pub const MAX_CACHE_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Per-job aggregate cap on in-flight legacy cache upload bytes.
 /// `MAX_CACHE_UPLOAD_BYTES` bounds one reservation; without an aggregate
 /// budget a job could still hold `MAX_PENDING_PER_JOB` × 512 MiB (~16 GiB)
 /// in `pending_caches`. 1 GiB leaves headroom for two full-size uploads
-/// while keeping a hostile job's worst case bounded. Enforced under the
-/// `inner` lock in `cache_upload`, so concurrent chunks cannot race past
-/// it; bytes are released when the reservation commits or is swept.
+/// while keeping a hostile job's worst case bounded. Per-frame semaphore
+/// permits enforce this without holding `inner` across file I/O; permits are
+/// released when a frame fails, a reservation commits, or it is swept.
 pub const MAX_PENDING_CACHE_BYTES_PER_JOB: u64 = 1024 * 1024 * 1024;
 
 /// Global cap on minted cache download tokens; the oldest are evicted.
@@ -139,6 +150,14 @@ pub const MAX_TERMINAL_RUNS_WITH_RUNTIME_STATE: usize = 16;
 /// finalized/consumed before the reaper sweeps it. Jobs that never finish
 /// their upload leave an entry behind; without a TTL those would accumulate.
 pub const PENDING_UPLOAD_TTL: Duration = Duration::from_secs(3600);
+
+/// Lifetime of the signed `/twirp-blob` upload/download URLs themselves
+/// (the JWT `exp`). Round-3 finding 3: the old 60-minute window let a
+/// finalized artifact's *download* URL keep authorizing PUTs that overwrote
+/// the blob. 20 minutes covers the runner's immediate PUT-after-mint and
+/// GET-after-mint flows (including large multipart uploads) while bounding
+/// replay; the pending-reservation maps still sweep on `PENDING_UPLOAD_TTL`.
+pub const SIGNED_BLOB_URL_TTL: Duration = Duration::from_secs(20 * 60);
 
 /// Unix seconds for pending-upload timestamps.
 pub fn now_unix() -> i64 {
@@ -245,6 +264,13 @@ pub fn trim_plan_logs(inner: &mut InnerState, plan_id: &str) -> Vec<String> {
     if inner.log_order.len() > inner.logs.len() + 1024 {
         let live: std::collections::HashSet<String> = inner.logs.keys().cloned().collect();
         inner.log_order.retain(|k| live.contains(k));
+    }
+    // Drop streaming maskers for evicted logs: their withheld tails can no
+    // longer be flushed into the (evicted) preview. At most the bounded
+    // overlap tail is lost from the lossy preview; published segments keep
+    // whatever was already emitted.
+    for key in &evicted {
+        inner.log_stream_maskers.remove(key);
     }
     evicted
 }
@@ -694,11 +720,17 @@ pub(crate) fn remove_run_everywhere(
 
     // Plan-keyed secret maskers are derived from the run's own secrets; the
     // run's plans are gone, so the cached arcs would only be reclaimed by a
-    // later masker-cache eviction. Drop them with the run.
+    // later masker-cache eviction. Drop them with the run. Runtime registrations
+    // (a minted OIDC `id_token`, see `register_runtime_mask_value`) are keyed by
+    // the plan *and* the run id — run-keyed log URIs resolve through the run
+    // scope — so the run's own entry goes too: leaving it would hold every JWT
+    // the run ever minted for the life of the process.
     for plan_id in &keys.plan_ids {
         inner.plan_secret_masker.remove(plan_id);
         inner.plan_secret_masker_pending.remove(plan_id);
+        inner.plan_runtime_masks.remove(plan_id);
     }
+    inner.plan_runtime_masks.remove(&run_id.to_string());
 
     RunRemoval {
         log_keys,
@@ -723,6 +755,7 @@ pub(crate) fn drop_run_runtime_state(inner: &mut InnerState, run_id: RunId, keys
         inner.live_log_lines.remove(&key);
         inner.live_log_tx.remove(&key);
         inner.live_log_closed.remove(&key);
+        inner.live_log_close_epochs.remove(&key);
     }
     inner.timeline_events.remove(&run_id);
     inner.timeline_events_order.retain(|id| *id != run_id);
@@ -809,7 +842,14 @@ pub fn trim_artifact_registry(inner: &mut InnerState) {
 /// artifactcache reservations (`pending_caches`) are in-memory only and were
 /// never swept — an abandoned reservation held its bytes forever — so they
 /// are covered by the same TTL.
-pub fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) {
+///
+/// Returns the on-disk staging files of swept legacy reservations; the
+/// caller deletes them after releasing the state lock (this function is
+/// synchronous and must not do I/O).
+pub fn sweep_pending_uploads(
+    inner: &mut InnerState,
+    now_unix_secs: i64,
+) -> Vec<std::path::PathBuf> {
     let cutoff = now_unix_secs.saturating_sub(PENDING_UPLOAD_TTL.as_secs() as i64);
     let stale_cache: Vec<String> = inner
         .cache_v2_pending
@@ -829,16 +869,28 @@ pub fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) {
     for token in stale_artifact {
         inner.artifact_v2_pending.remove(&token);
     }
-    // Legacy reservations are freed too; only `cache_commit` removed
-    // them before, so abandoned uploads accumulated RAM without bound.
-    let stale_legacy: Vec<i64> = inner
+    // Legacy reservations are freed too. Never wait for an active upload
+    // while holding `InnerState`: an in-flight request owns its reservation
+    // mutex and will release it after its file write or rollback completes.
+    // A later sweep retries entries skipped by `try_lock`.
+    let stale_legacy: Vec<(i64, Arc<tokio::sync::Mutex<()>>)> = inner
         .pending_caches
         .iter()
         .filter(|(_, pending)| pending.created_unix > 0 && pending.created_unix < cutoff)
-        .map(|(cache_id, _)| *cache_id)
+        .map(|(cache_id, pending)| (*cache_id, pending.upload_lock.clone()))
         .collect();
-    for cache_id in stale_legacy {
-        inner.pending_caches.remove(&cache_id);
+    let mut staged_files: Vec<std::path::PathBuf> = Vec::new();
+    for (cache_id, upload_lock) in stale_legacy {
+        let Ok(_upload_guard) = upload_lock.try_lock() else {
+            continue;
+        };
+        let Some(pending) = inner.pending_caches.remove(&cache_id) else {
+            continue;
+        };
+        if let Some(job_quota) = &pending.job_quota {
+            job_quota.add_permits(pending.staging_len as usize);
+        }
+        staged_files.push(pending.staging_path);
     }
     let stale_dl: Vec<String> = inner
         .cache_v2_dl_tokens_created
@@ -868,6 +920,7 @@ pub fn sweep_pending_uploads(inner: &mut InnerState, now_unix_secs: i64) {
             inner.cache_v2_dl_tokens.keys().cloned().collect();
         inner.cache_v2_dl_tokens_order.retain(|k| live.contains(k));
     }
+    staged_files
 }
 
 #[cfg(test)]
@@ -1445,6 +1498,14 @@ mod tests {
         inner
             .plan_secret_masker
             .insert(plan_id.clone(), Arc::new(vec!["s3cret".to_owned()]));
+        // A run that minted OIDC tokens owns a runtime entry under its plan
+        // scope and under the run scope (run-keyed log URIs resolve through it).
+        inner
+            .plan_runtime_masks
+            .insert(plan_id.clone(), vec!["minted-jwt".to_owned()]);
+        inner
+            .plan_runtime_masks
+            .insert(run_id.to_string(), vec!["minted-jwt".to_owned()]);
         inner.diag_upload_tokens.insert(
             "diag-token".to_owned(),
             DiagUploadToken {
@@ -1485,6 +1546,11 @@ mod tests {
         assert!(inner.timeline_events_order.is_empty());
         assert!(inner.dap_ports.is_empty());
         assert!(inner.plan_secret_masker.is_empty());
+        assert!(
+            inner.plan_runtime_masks.is_empty(),
+            "run-scoped runtime masks retained: {:?}",
+            inner.plan_runtime_masks
+        );
         assert!(inner.diag_upload_tokens.is_empty());
     }
 }

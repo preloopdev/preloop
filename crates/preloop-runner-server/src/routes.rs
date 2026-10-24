@@ -1,4 +1,6 @@
 use super::*;
+use std::pin::Pin;
+use std::task::Poll;
 use utoipa::OpenApi;
 
 // The worker-facing debug surface is fail-closed in two places: the route
@@ -9,6 +11,206 @@ pub const DEBUG_WORKER_TOKEN_PATH: &str = "/api/v1/debug/worker-token";
 pub const DEBUG_SESSIONS_PATH: &str = "/api/v1/debug/sessions";
 pub const DEBUG_SESSION_VERDICT_SUFFIX: &str = "/verdict";
 pub const DEBUG_SESSION_CLOSE_SUFFIX: &str = "/close";
+
+/// How many webhook bodies may be buffered at once.
+///
+/// The body extractor reads the whole payload (up to the 32 MiB route limit)
+/// before the handler verifies the HMAC, so without a cap an unauthenticated
+/// caller turns the ingress into a memory amplifier: `N` concurrent uploads
+/// each hold a full body while the signature is still unchecked. Eight slots
+/// bound the transient cost at ~256 MiB; a request that finds them all taken
+/// waits `WEBHOOK_ADMISSION_WAIT` for one and is then shed with 503, because
+/// an unbounded queue would only move the same pressure behind a slower wait
+/// list. Shedding is the last-resort bound: GitHub does not retry a non-2xx
+/// on its own, and a shed request never reaches the store, so there is no
+/// local payload copy to replay — the delivery exists only at GitHub and is
+/// recovered from GitHub's redelivery log.
+const MAX_CONCURRENT_WEBHOOK_UPLOADS: usize = 8;
+
+/// How long an admitted webhook request may spend uploading its body.
+///
+/// The slot cap alone would let eight stalled uploads — headers received, body
+/// never finished — pin every permit and answer legitimate deliveries 503, a
+/// self-DoS behind the gate. This budget releases the slot instead: a body
+/// still arriving when it fires is cut off with 408. It covers the upload
+/// only. The handler's acknowledgement budget (`WEBHOOK_ACK_BUDGET` in
+/// `github.rs`) starts once the body is in, so a slow but valid upload cannot
+/// spend the budget the durable write needs: a delivery that takes 4 s to
+/// arrive still gets the store its full 8 s, where a deadline over the whole
+/// request would have cancelled it mid-write and lost it. A 408 therefore
+/// means the body never arrived and nothing was recorded — like a shed
+/// request, that delivery must be redelivered from GitHub.
+const WEBHOOK_INGEST_BUDGET: Duration = Duration::from_secs(10);
+
+/// How long an admitted upload may go without delivering a byte of body.
+///
+/// A slot is only worth having if it tracks an upload in progress. A body that
+/// is admitted and then sends nothing holds a permit for the whole ingest
+/// budget while buffering nothing at all — the cheapest way for an
+/// unauthenticated client to occupy every slot, replace each one as it is cut
+/// off, and shed legitimate deliveries indefinitely. Cutting a silent body
+/// here makes holding the gate cost data rather than just connections, and an
+/// idle peer gives its slot back in seconds. A real delivery streams
+/// continuously, so a gap this long is a stalled transfer that has to be
+/// redelivered anyway.
+const WEBHOOK_BODY_IDLE_BUDGET: Duration = Duration::from_secs(3);
+
+/// How long a request waits for an upload slot before it is shed.
+///
+/// Shedding is still the bound — an unbounded wait would only move the memory
+/// pressure behind a slower queue — but a delivery that arrives while every
+/// slot is held should not fail outright. When a permit comes free the
+/// semaphore hands it to the oldest waiter, so a delivery that is already
+/// inside the server takes it ahead of a client that has to reconnect first.
+const WEBHOOK_ADMISSION_WAIT: Duration = Duration::from_millis(1000);
+
+/// Admission cap and upload budgets for the webhook ingress.
+///
+/// One value because `limit_webhook_uploads` enforces all of it: `slots`
+/// bounds how many bodies are buffered at once, `ingest_budget` how long any
+/// one of them may spend arriving, `idle_budget` how long it may sit without
+/// sending a byte, and `admission_wait` how long a request may queue for a
+/// slot. Tests build a gate with the production values and change only the
+/// budget they are about.
+struct WebhookUploadGate {
+    slots: Arc<tokio::sync::Semaphore>,
+    ingest_budget: Duration,
+    idle_budget: Duration,
+    admission_wait: Duration,
+}
+
+impl WebhookUploadGate {
+    fn new(slots: usize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(slots)),
+            ingest_budget: WEBHOOK_INGEST_BUDGET,
+            idle_budget: WEBHOOK_BODY_IDLE_BUDGET,
+            admission_wait: WEBHOOK_ADMISSION_WAIT,
+        }
+    }
+}
+
+/// Wait for a webhook upload slot, or shed the request.
+///
+/// Load-shedding is deliberate: an unbounded queue only moves the memory
+/// pressure to a slower moment. The bounded wait is what keeps availability
+/// under a client that recycles dormant uploads: the delivery is already
+/// queued on the semaphore when a permit frees, while the recycling client has
+/// to reconnect and admit again. A shed delivery is recoverable rather than
+/// lost — it never reached the store, so it is redelivered from GitHub's
+/// delivery log, because GitHub does not retry an arbitrary non-2xx itself.
+async fn admit_webhook_upload(
+    gate: &WebhookUploadGate,
+) -> Result<tokio::sync::OwnedSemaphorePermit, StatusCode> {
+    match tokio::time::timeout(gate.admission_wait, gate.slots.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        // `Err` is a closed semaphore, which this gate never closes; the
+        // timeout is the load-shedding path. Both are "no slot for you".
+        Ok(Err(_)) | Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// Wrap `body` so the middleware can watch the upload it is gating.
+///
+/// The handler's extractor is what reads the body, so the only way to tell a
+/// progressing upload from a dormant one is to observe the frames it yields:
+/// `progress` for every data frame and `complete` once at the body's end or
+/// error. The two signals are separate on purpose.
+///
+/// Progress is coalesced (`try_send` on a one-slot channel): the middleware
+/// only needs to know that the body moved, not how often, so a chunked or
+/// HTTP/2 upload made of arbitrarily many small frames cannot queue one
+/// allocation per frame.
+///
+/// `complete` is a lossless oneshot because it must never be lost behind a
+/// queued `Progress`: a tiny body emits both before the middleware drains
+/// them, and a dropped `Complete` turns a successful upload into a spurious
+/// 408. It also covers the dropped-request path — the body owns the sender, so
+/// a request dropped before it is read (a payload rejected as oversized)
+/// resolves the oneshot with an error, which the middleware treats as
+/// complete, and such a request is never timed out on its way out. Only data
+/// frames pass through; a webhook delivery carries no trailers, and the
+/// `Bytes` extractor ignores them in any case.
+fn report_upload_events(
+    body: Body,
+    progress: tokio::sync::mpsc::Sender<()>,
+    complete: tokio::sync::oneshot::Sender<()>,
+) -> Body {
+    use futures::Stream as _;
+
+    let mut body = body.into_data_stream();
+    let mut signals = Some((progress, complete));
+    Body::from_stream(stream::poll_fn(move |cx| {
+        let next = Pin::new(&mut body).poll_next(cx);
+        match &next {
+            Poll::Ready(Some(Ok(_))) => {
+                if let Some((progress, _)) = &signals {
+                    let _ = progress.try_send(());
+                }
+            }
+            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
+                if let Some((_, complete)) = signals.take() {
+                    let _ = complete.send(());
+                }
+            }
+            Poll::Pending => {}
+        }
+        next
+    }))
+}
+
+/// Gate webhook uploads.
+///
+/// The permit is held until the response is produced — as long as the buffered
+/// body, and the record built from it, are alive — and while the upload is
+/// still arriving two budgets bound it: it must finish within
+/// `WEBHOOK_INGEST_BUDGET`, and it must keep moving within
+/// `WEBHOOK_BODY_IDLE_BUDGET` of silence. Both end with the body: once it is
+/// in, the handler runs to its own budgets, because a delivery that has
+/// finished arriving must not be cancelled while it is still inside the
+/// acknowledgement budget it is allowed (`WEBHOOK_ACK_BUDGET`).
+async fn limit_webhook_uploads(
+    State(gate): State<Arc<WebhookUploadGate>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let _permit = admit_webhook_upload(&gate).await?;
+    let (parts, body) = request.into_parts();
+    let (progress_tx, mut progress) = tokio::sync::mpsc::channel(1);
+    let (complete_tx, mut complete) = tokio::sync::oneshot::channel();
+    let handler = next.run(Request::from_parts(
+        parts,
+        report_upload_events(body, progress_tx, complete_tx),
+    ));
+    tokio::pin!(handler);
+
+    let ingest = tokio::time::sleep(gate.ingest_budget);
+    tokio::pin!(ingest);
+
+    // Poll the handler until the body is in, then hand it the clock: the
+    // loops below are the only place upload time is charged.
+    let mut ingested = false;
+    while !ingested {
+        tokio::select! {
+            response = &mut handler => return Ok(response),
+            () = &mut ingest => return Err(StatusCode::REQUEST_TIMEOUT),
+            // Re-created each round, so a `Progress` restarts it.
+            () = tokio::time::sleep(gate.idle_budget) => {
+                return Err(StatusCode::REQUEST_TIMEOUT);
+            }
+            // Lossless: the body ended, failed, or was dropped (`Err`).
+            _ = &mut complete => ingested = true,
+            // Coalesced: one slot says the body moved; a closed channel means
+            // the body was dropped before it finished.
+            event = progress.recv() => {
+                if event.is_none() {
+                    ingested = true;
+                }
+            }
+        }
+    }
+    Ok(handler.await)
+}
 
 /// Build the production server router without simulation endpoints.
 pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
@@ -27,10 +229,52 @@ pub fn app_with_test_api(
     build_app(state, shutdown, Some(token.into()))
 }
 
+/// Build the in-process test router with webhook upload budgets sized for a
+/// test instead of for a network transfer.
+///
+/// The gate charges elapsed wall time from admission, and a client that hands
+/// this router a body already in memory never uploads anything: the only thing
+/// the budgets can measure here is how long a loaded machine took to schedule
+/// the handler. A delivery the suite expects to be accepted can spend the
+/// production ten-second ingest budget before the handler is polled once, so
+/// the tests that deliver webhooks in process pass budgets they can wait out.
+/// The gate's own tests below build their router and keep the production
+/// values.
+#[cfg(test)]
+pub(crate) fn app_with_test_api_and_upload_budgets(
+    state: AppState,
+    shutdown: CancellationToken,
+    token: impl Into<String>,
+    ingest_budget: Duration,
+    idle_budget: Duration,
+) -> Router {
+    let gate = WebhookUploadGate {
+        slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WEBHOOK_UPLOADS)),
+        ingest_budget,
+        idle_budget,
+        admission_wait: WEBHOOK_ADMISSION_WAIT,
+    };
+    build_app_with_upload_gate(state, shutdown, Some(token.into()), Arc::new(gate))
+}
+
 pub fn build_app(
     state: AppState,
     shutdown: CancellationToken,
     test_api_token: Option<String>,
+) -> Router {
+    build_app_with_upload_gate(
+        state,
+        shutdown,
+        test_api_token,
+        Arc::new(WebhookUploadGate::new(MAX_CONCURRENT_WEBHOOK_UPLOADS)),
+    )
+}
+
+fn build_app_with_upload_gate(
+    state: AppState,
+    shutdown: CancellationToken,
+    test_api_token: Option<String>,
+    webhook_upload_gate: Arc<WebhookUploadGate>,
 ) -> Router {
     let shared = Arc::new(SharedState {
         state: state.clone(),
@@ -39,18 +283,24 @@ pub fn build_app(
     let protected_protocol_apis = Router::new()
         .route("/_apis/artifactcache/cache", post(cache_reserve))
         .route("/_apis/artifactcache/cache", get(cache_lookup))
-        .route("/_apis/artifactcache/cache/:cache_id", patch(cache_upload))
-        .route("/_apis/artifactcache/cache/:cache_id", post(cache_commit))
         .route(
-            "/_apis/pipelines/workflows/:run_id/artifacts",
+            "/_apis/artifactcache/cache/{cache_id}",
+            // `cache_upload` streams `Body` and enforces this cap while reading.
+            // Keep the named route layer as defense-in-depth if its extractor
+            // ever changes back to a buffered type.
+            patch(cache_upload).layer(DefaultBodyLimit::max(MAX_CACHE_UPLOAD_BYTES as usize)),
+        )
+        .route("/_apis/artifactcache/cache/{cache_id}", post(cache_commit))
+        .route(
+            "/_apis/pipelines/workflows/{run_id}/artifacts",
             post(artifact_create),
         )
         .route(
-            "/_apis/pipelines/workflows/:run_id/artifacts",
+            "/_apis/pipelines/workflows/{run_id}/artifacts",
             get(artifact_list),
         )
         .route(
-            "/_apis/pipelines/workflows/:run_id/artifacts/:artifact_id",
+            "/_apis/pipelines/workflows/{run_id}/artifacts/{artifact_id}",
             get(artifact_get_compat),
         )
         .route(
@@ -58,21 +308,21 @@ pub fn build_app(
             get(runner_pools),
         )
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/sessions",
             post(create_session_disttask).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/_apis/distributedtask/pools/:pool_id/sessions",
+            "/_apis/distributedtask/pools/{pool_id}/sessions",
             post(create_session_disttask).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/messages",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/messages",
             get(next_message_disttask).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
@@ -83,118 +333,130 @@ pub fn build_app(
         // runner traffic, so it stays under the protocol guard — the
         // system-only router below is for runner/session/agent administration.
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/messages/:message_id",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/messages/{message_id}",
             delete(delete_pool_message).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/:run_id/jobs/:job_id",
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{run_id}/jobs/{job_id}",
             patch(complete_job_compat_authenticated),
         )
-        .route("/ws/live-logs/:job_id", get(ws_live_logs))
-        .route("/broker/:runner_id/acquirejob", post(broker_acquire_job))
-        .route("/broker/:runner_id/renewjob", post(broker_renew_job))
-        .route("/broker/:runner_id/completejob", post(broker_complete_job))
+        .route("/ws/live-logs/{job_id}", get(ws_live_logs))
+        .route("/broker/{runner_id}/acquirejob", post(broker_acquire_job))
+        .route("/broker/{runner_id}/renewjob", post(broker_renew_job))
+        .route("/broker/{runner_id}/completejob", post(broker_complete_job))
         .route(
-            "/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            "/_apis/v1/Timeline/{scope}/{hub}/{plan_id}/{timeline_id}",
             patch(patch_timeline_records_authenticated).get(get_timeline_records_authenticated),
         )
         .route(
-            "/_apis/v1/Logfiles/:scope/:hub/:plan_id",
+            "/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}",
             post(create_log_authenticated),
         )
         .route(
-            "/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
-            post(append_log_authenticated),
+            "/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}/{log_id}",
+            // Log and console appends extract the whole body as `Bytes`. Every
+            // log-append and console mount is capped at the per-log retained
+            // window, `MAX_LOG_BYTES_PER_KEY` (memory_caps.rs).
+            post(append_log_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
-            "/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
-            post(console_log_authenticated),
+            "/_apis/v1/TimeLineWebConsoleLog/{scope}/{hub}/{plan_id}/{timeline_id}/{record_id}",
+            post(console_log_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
-            "/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            "/_apis/v1/FinishJob/{scope}/{hub}/{plan_id}",
             post(finish_job_authenticated),
         )
         .route(
-            "/runner/server/_apis/distributedtask/hubs/actions/plans/:plan_id/jobs/:job_id/oidctoken",
+            "/runner/server/_apis/distributedtask/hubs/actions/plans/{plan_id}/jobs/{job_id}/oidctoken",
             get(oidc_token),
         )
         .route(
-            "/:orchestration_id//idtoken/:plan_id/:job_id",
+            "/{orchestration_id}//idtoken/{plan_id}/{job_id}",
             get(oidc_token_run_service),
         )
         .route(
-            "/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
-            post(action_download_info),
+            "/_apis/v1/ActionDownloadInfo/{scope}/{hub}/{plan_id}",
+            post(action_download_info).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_results_protocol_bearer,
+            )),
         )
         .route(
-            "/actions/build/:orchestration_id/jobs/:job_id/runnerresolve/actions",
-            post(runnerresolve_actions),
+            "/actions/build/{orchestration_id}/jobs/{job_id}/runnerresolve/actions",
+            post(runnerresolve_actions).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_results_protocol_bearer,
+            )),
         )
         .route(
-            "/runner/server/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            "/runner/server/_apis/v1/Timeline/{scope}/{hub}/{plan_id}/{timeline_id}",
             patch(patch_timeline_records_authenticated).get(get_timeline_records_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id",
+            "/runner/server/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}",
             post(create_log_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
-            post(append_log_authenticated),
+            "/runner/server/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}/{log_id}",
+            post(append_log_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
-            "/runner/server/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
-            post(console_log_authenticated),
+            "/runner/server/_apis/v1/TimeLineWebConsoleLog/{scope}/{hub}/{plan_id}/{timeline_id}/{record_id}",
+            post(console_log_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
-            "/runner/server/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            "/runner/server/_apis/v1/FinishJob/{scope}/{hub}/{plan_id}",
             post(finish_job_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
-            post(action_download_info),
+            "/runner/server/_apis/v1/ActionDownloadInfo/{scope}/{hub}/{plan_id}",
+            post(action_download_info).route_layer(middleware::from_fn_with_state(
+                shared.clone(),
+                require_results_protocol_bearer,
+            )),
         )
         .route(
-            "/api/v1/runs/:run_id/jobs/:job_id/logs/live",
+            "/api/v1/runs/{run_id}/jobs/{job_id}/logs/live",
             get(live_logs_sse),
         )
         // standard AzDO API URL pattern used by the preloop-runner AzDO client.
         // These alias the scope/hub-prefixed handlers above so both URL forms work.
         .route(
-            "/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
+            "/_apis/v1/plans/{plan_id}/timelines/{timeline_id}/records",
             patch(patch_timeline_records_plan_authenticated).get(get_timeline_records_plan_authenticated),
         )
         .route(
-            "/_apis/v1/plans/:plan_id/logs",
+            "/_apis/v1/plans/{plan_id}/logs",
             post(create_log_plan_authenticated),
         )
         .route(
-            "/_apis/v1/plans/:plan_id/logs/:log_id",
-            put(append_log_plan_authenticated),
+            "/_apis/v1/plans/{plan_id}/logs/{log_id}",
+            put(append_log_plan_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
-            "/_apis/v1/plans/:plan_id/events",
+            "/_apis/v1/plans/{plan_id}/events",
             post(finish_job_plan_authenticated),
         )
         // /runner/server/ aliases — runner uses the SystemVssConnection URL
         // which is http://…/runner/server so all plan-level AzDO calls land here.
         .route(
-            "/runner/server/_apis/v1/plans/:plan_id/timelines/:timeline_id/records",
+            "/runner/server/_apis/v1/plans/{plan_id}/timelines/{timeline_id}/records",
             patch(patch_timeline_records_plan_authenticated).get(get_timeline_records_plan_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/plans/:plan_id/logs",
+            "/runner/server/_apis/v1/plans/{plan_id}/logs",
             post(create_log_plan_authenticated),
         )
         .route(
-            "/runner/server/_apis/v1/plans/:plan_id/logs/:log_id",
-            put(append_log_plan_authenticated),
+            "/runner/server/_apis/v1/plans/{plan_id}/logs/{log_id}",
+            put(append_log_plan_authenticated).layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
-            "/runner/server/_apis/v1/plans/:plan_id/events",
+            "/runner/server/_apis/v1/plans/{plan_id}/events",
             post(finish_job_plan_authenticated),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -206,7 +468,7 @@ pub fn build_app(
     // bearer, or a trusted system/RunnerManage credential.
     let distributedtask_registration = Router::new()
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/agents",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/agents",
             get(agent_lookup).post(register_runner_compat_pool_only),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -228,11 +490,11 @@ pub fn build_app(
     // own sessions through the per-session routes below.
     let protected_system_apis = Router::new()
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/sessions",
             delete(delete_sessions_for_pool),
         )
         .route(
-            "/_apis/distributedtask/pools/:pool_id/sessions",
+            "/_apis/distributedtask/pools/{pool_id}/sessions",
             delete(delete_sessions_for_pool),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -242,31 +504,31 @@ pub fn build_app(
 
     let protected_admin_apis = Router::new()
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/agents/{agent_id}",
             delete(delete_agent).put(update_agent),
         )
         .route(
-            "/_apis/distributedtask/pools/:pool_id/agents/:agent_id",
+            "/_apis/distributedtask/pools/{pool_id}/agents/{agent_id}",
             delete(delete_agent).put(update_agent),
         )
         .route(
-            "/runner/server/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
+            "/runner/server/_apis/distributedtask/pools/{pool_id}/sessions/{session_id}",
             delete(delete_session),
         )
         .route(
-            "/_apis/distributedtask/pools/:pool_id/sessions/:session_id",
+            "/_apis/distributedtask/pools/{pool_id}/sessions/{session_id}",
             delete(delete_session),
         )
         .route(
-            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/{org}/_apis/v1/AgentSession/{pool_id}/{session_id}",
             delete(delete_session_org),
         )
         .route(
-            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/runner/server/_apis/v1/AgentSession/{pool_id}/{session_id}",
             delete(delete_session),
         )
         .route(
-            "/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/_apis/v1/AgentSession/{pool_id}/{session_id}",
             delete(delete_session),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -300,20 +562,36 @@ pub fn build_app(
     // single place instead of repeating it on every route.
     let dispatch_api = Router::new()
         .route(
-            "/repos/:owner/:repo/actions/workflows/:workflow_id/dispatches",
+            "/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches",
             post(crate::dispatch::workflow_dispatch),
         )
         .route(
-            "/repos/:owner/:repo/dispatches",
+            "/repos/{owner}/{repo}/dispatches",
             post(crate::dispatch::repository_dispatch),
         )
         .route(
-            "/repos/:owner/:repo/actions/workflows",
+            "/repos/{owner}/{repo}/actions/workflows",
             get(crate::dispatch::list_workflows),
         )
         .route(
-            "/repos/:owner/:repo/actions/runs",
+            "/repos/{owner}/{repo}/actions/runs",
             get(crate::dispatch::list_actions_runs),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/runs/{run_id}/rerun",
+            post(crate::dispatch::rerun_actions_run),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs",
+            post(crate::dispatch::rerun_actions_run_failed),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/runs/{run_id}/cancel",
+            post(crate::dispatch::cancel_actions_run),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/jobs/{job_id}/rerun",
+            post(crate::dispatch::rerun_actions_job),
         )
         .route_layer(middleware::from_fn_with_state(
             shared.clone(),
@@ -340,7 +618,7 @@ pub fn build_app(
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .merge(observability_routes)
-        .route("/runs/:run_id", get(get_public_run))
+        .route("/runs/{run_id}", get(get_public_run))
         .route(
             "/openapi.json",
             get(|| async { axum::Json(crate::openapi::ApiDoc::openapi()) }),
@@ -355,12 +633,12 @@ pub fn build_app(
         .route("/oidc/.well-known/jwks", get(oidc_jwks))
         .route("/oidc/.well-known/jwks.json", get(oidc_jwks))
         // GHES-style org-prefixed routes
-        .route("/:org/_apis/connectionData", get(connection_data))
-        .route("/:org/_apis/v1/oauth2/token", post(oauth2_token))
-        .route("/:org/_apis/v1/AgentPools", get(runner_pools))
-        .route("/:org/_apis/v1/settings/runner", get(runner_settings))
+        .route("/{org}/_apis/connectionData", get(connection_data))
+        .route("/{org}/_apis/v1/oauth2/token", post(oauth2_token))
+        .route("/{org}/_apis/v1/AgentPools", get(runner_pools))
+        .route("/{org}/_apis/v1/settings/runner", get(runner_settings))
         .route(
-            "/:org/_apis/v1/Agent/:pool_id/:agent_id",
+            "/{org}/_apis/v1/Agent/{pool_id}/{agent_id}",
             get(agent_lookup_by_id_org)
                 .post(register_runner_compat_org_2)
                 .put(replace_runner_compat_org_2)
@@ -370,7 +648,7 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/:org/_apis/v1/Agent/:pool_id",
+            "/{org}/_apis/v1/Agent/{pool_id}",
             get(agent_lookup_org)
                 .post(register_runner_compat_org)
                 .route_layer(middleware::from_fn_with_state(
@@ -379,35 +657,35 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/:org/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/{org}/_apis/v1/AgentSession/{pool_id}/{session_id}",
             post(create_session_compat_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/AgentSession/:pool_id",
+            "/{org}/_apis/v1/AgentSession/{pool_id}",
             post(create_session_compat_org_pool_only).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/Message/:pool_id",
+            "/{org}/_apis/v1/Message/{pool_id}",
             get(next_message_compat_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/Message/:pool_id/:message_id",
+            "/{org}/_apis/v1/Message/{pool_id}/{message_id}",
             delete(delete_pool_message_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/AgentRequest/:pool_id/:request_id",
+            "/{org}/_apis/v1/AgentRequest/{pool_id}/{request_id}",
             get(agent_request_get_org)
                 .post(agent_request_ack_org)
                 .patch(agent_request_patch_org)
@@ -417,7 +695,7 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/:org/_apis/v1/Timeline/:scope/:hub/:plan_id/:timeline_id",
+            "/{org}/_apis/v1/Timeline/{scope}/{hub}/{plan_id}/{timeline_id}",
             patch(patch_timeline_records_org)
                 .get(get_timeline_records_org)
                 .route_layer(middleware::from_fn_with_state(
@@ -426,38 +704,42 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id",
+            "/{org}/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}",
             post(create_log_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_protocol_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/Logfiles/:scope/:hub/:plan_id/:log_id",
-            post(append_log_org).route_layer(middleware::from_fn_with_state(
-                shared.clone(),
-                require_protocol_bearer,
-            )),
+            "/{org}/_apis/v1/Logfiles/{scope}/{hub}/{plan_id}/{log_id}",
+            post(append_log_org)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_protocol_bearer,
+                ))
+                .layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
-            "/:org/_apis/v1/TimeLineWebConsoleLog/:scope/:hub/:plan_id/:timeline_id/:record_id",
-            post(console_log_org).route_layer(middleware::from_fn_with_state(
-                shared.clone(),
-                require_protocol_bearer,
-            )),
+            "/{org}/_apis/v1/TimeLineWebConsoleLog/{scope}/{hub}/{plan_id}/{timeline_id}/{record_id}",
+            post(console_log_org)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_protocol_bearer,
+                ))
+                .layer(DefaultBodyLimit::max(MAX_LOG_BYTES_PER_KEY)),
         )
         .route(
-            "/:org/_apis/v1/FinishJob/:scope/:hub/:plan_id",
+            "/{org}/_apis/v1/FinishJob/{scope}/{hub}/{plan_id}",
             post(finish_job_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_protocol_bearer,
             )),
         )
         .route(
-            "/:org/_apis/v1/ActionDownloadInfo/:scope/:hub/:plan_id",
+            "/{org}/_apis/v1/ActionDownloadInfo/{scope}/{hub}/{plan_id}",
             post(action_download_info_org).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
-                require_protocol_bearer,
+                require_results_protocol_bearer,
             )),
         )
         .route("/_apis/v1/oauth2/token", post(oauth2_token))
@@ -466,11 +748,11 @@ pub fn build_app(
             post(github_registration_token),
         )
         .route(
-            "/api/v3/orgs/:org/actions/runners/registration-token",
+            "/api/v3/orgs/{org}/actions/runners/registration-token",
             post(github_registration_token),
         )
         .route(
-            "/api/v3/repos/:owner/:repo/actions/runners/registration-token",
+            "/api/v3/repos/{owner}/{repo}/actions/runners/registration-token",
             post(github_registration_token),
         )
         // Runner version end-of-life schedule (GitHub's September 2026
@@ -480,15 +762,15 @@ pub fn build_app(
         // is global. Credential posture matches the neighbors: no
         // routing-layer middleware, the handler requires the system token.
         .route(
-            "/api/v3/actions/runners/deprecations/:version",
+            "/api/v3/actions/runners/deprecations/{version}",
             get(runner_deprecation_lookup),
         )
         .route(
-            "/api/v3/orgs/:org/actions/runners/deprecations/:version",
+            "/api/v3/orgs/{org}/actions/runners/deprecations/{version}",
             get(runner_deprecation_lookup_org),
         )
         .route(
-            "/api/v3/repos/:owner/:repo/actions/runners/deprecations/:version",
+            "/api/v3/repos/{owner}/{repo}/actions/runners/deprecations/{version}",
             get(runner_deprecation_lookup_repo),
         )
         // GitHub-compatible dispatch API (surface 2): merged sub-router with
@@ -498,7 +780,7 @@ pub fn build_app(
         .route("/runner/server/_apis/v1/oauth2/token", post(oauth2_token))
         .route("/runner/server/_apis/v1/AgentPools", get(runner_pools))
         .route(
-            "/runner/server/_apis/v1/Agent/:pool_id/:agent_id",
+            "/runner/server/_apis/v1/Agent/{pool_id}/{agent_id}",
             get(agent_lookup_by_id)
                 .post(register_runner_compat)
                 .put(replace_runner_compat)
@@ -508,7 +790,7 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/runner/server/_apis/v1/Agent/:pool_id",
+            "/runner/server/_apis/v1/Agent/{pool_id}",
             get(agent_lookup)
                 .post(register_runner_compat_pool_only)
                 .route_layer(middleware::from_fn_with_state(
@@ -517,35 +799,35 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/runner/server/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/runner/server/_apis/v1/AgentSession/{pool_id}/{session_id}",
             post(create_session_compat).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/v1/AgentSession/:pool_id",
+            "/runner/server/_apis/v1/AgentSession/{pool_id}",
             post(create_session_compat_pool_only).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/v1/Message/:pool_id",
+            "/runner/server/_apis/v1/Message/{pool_id}",
             get(next_message_compat).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/v1/Message/:pool_id/:message_id",
+            "/runner/server/_apis/v1/Message/{pool_id}/{message_id}",
             delete(delete_pool_message).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/runner/server/_apis/v1/AgentRequest/:pool_id/:request_id",
+            "/runner/server/_apis/v1/AgentRequest/{pool_id}/{request_id}",
             get(agent_request_get)
                 .post(agent_request_ack)
                 .patch(agent_request_patch)
@@ -569,6 +851,15 @@ pub fn build_app(
                 .layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route(
+            "/api/v1/bundles",
+            post(crate::bundles::upload_bundle)
+                .route_layer(middleware::from_fn_with_state(
+                    shared.clone(),
+                    require_native_bearer,
+                ))
+                .layer(DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
             "/api/v1/secrets",
             get(list_secrets).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
@@ -576,7 +867,7 @@ pub fn build_app(
             )),
         )
         .route(
-            "/api/v1/secrets/:name",
+            "/api/v1/secrets/{name}",
             put(set_secret)
                 .delete(delete_secret)
                 .route_layer(middleware::from_fn_with_state(
@@ -614,7 +905,7 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/api/v1/execution-protection/rules/:id",
+            "/api/v1/execution-protection/rules/{id}",
             get(get_execution_protection_rule)
                 .put(update_execution_protection_rule)
                 .delete(delete_execution_protection_rule)
@@ -633,10 +924,50 @@ pub fn build_app(
                 // blindly. Set the limit above GitHub's ceiling so real
                 // deliveries pass and oversized input gets a deterministic
                 // 413 instead of a severed connection.
-                .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+                // …and bound how many of those bodies are buffered at once
+                // before the HMAC check, so the unauthenticated ingress
+                // cannot be used as a memory amplifier. A request that finds
+                // every slot taken waits `WEBHOOK_ADMISSION_WAIT` and is then
+                // shed with 503 — redelivered from GitHub, not retried on its
+                // own — and an admitted upload is cut off with 408 if it is
+                // still arriving after `WEBHOOK_INGEST_BUDGET` or has sent
+                // nothing for `WEBHOOK_BODY_IDLE_BUDGET`, so holding the gate
+                // costs data rather than just connections. Both budgets cover
+                // the upload alone: the handler keeps its own acknowledgement
+                // budget once the body is in.
+                .layer(middleware::from_fn_with_state(
+                    webhook_upload_gate.clone(),
+                    limit_webhook_uploads,
+                )),
         )
         .route("/api/v1/github/register", get(github::github_register))
         .route("/api/v1/github/callback", get(github::github_callback))
+        // Engine-hosted GitHub App setup (`preloop setup github --via app`
+        // with a public URL). The API pair is administrator-only; the two
+        // browser routes answer 404 unless a setup session awaits them, and
+        // each carries its own refusal budget, so a burst of guesses against
+        // one cannot gate the other.
+        .route(
+            "/api/v1/github/setup-sessions",
+            post(crate::github_app_setup::session::open_session).route_layer(
+                middleware::from_fn_with_state(shared.clone(), require_system_bearer),
+            ),
+        )
+        .route(
+            "/api/v1/github/setup-sessions/{session_id}",
+            get(crate::github_app_setup::session::poll_session).route_layer(
+                middleware::from_fn_with_state(shared.clone(), require_system_bearer),
+            ),
+        )
+        .route(
+            "/setup/github",
+            get(crate::github_app_setup::session::setup_form),
+        )
+        .route(
+            "/setup/github/callback",
+            get(crate::github_app_setup::session::setup_callback),
+        )
         // Operator surface over the durable queue: inspect it, replay from
         // the retained local payload (which outlives GitHub's three-day
         // redelivery window), and read one repair-health document.
@@ -647,7 +978,7 @@ pub fn build_app(
             ),
         )
         .route(
-            "/api/v1/webhooks/deliveries/:delivery_id/replay",
+            "/api/v1/webhooks/deliveries/{delivery_id}/replay",
             post(crate::webhook_api::replay_webhook_delivery).route_layer(
                 middleware::from_fn_with_state(shared.clone(), require_native_bearer),
             ),
@@ -660,77 +991,77 @@ pub fn build_app(
             )),
         )
         .route(
-            "/api/v1/runs/:run_id",
+            "/api/v1/runs/{run_id}",
             get(get_run).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/logs",
+            "/api/v1/runs/{run_id}/logs",
             get(get_run_logs).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/logs/live",
+            "/api/v1/runs/{run_id}/logs/live",
             get(crate::live_logs::live_run_logs_sse).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/cancel",
+            "/api/v1/runs/{run_id}/cancel",
             post(cancel_run).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/jobs/:job_id/approve",
+            "/api/v1/runs/{run_id}/jobs/{job_id}/approve",
             post(approve_job).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/rerun",
+            "/api/v1/runs/{run_id}/rerun",
             post(rerun_run).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/approve-fork",
+            "/api/v1/runs/{run_id}/approve-fork",
             post(approve_fork).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/push",
+            "/api/v1/runs/{run_id}/push",
             post(crate::github_push::push_run).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/events.ndjson",
+            "/api/v1/runs/{run_id}/events.ndjson",
             get(run_events).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/debug",
+            "/api/v1/runs/{run_id}/debug",
             get(ws_dap_debug).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            "/api/v1/runs/:run_id/debug",
+            "/api/v1/runs/{run_id}/debug",
             post(register_dap_port).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_runner_bearer,
@@ -757,14 +1088,14 @@ pub fn build_app(
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_VERDICT_SUFFIX}"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}{DEBUG_SESSION_VERDICT_SUFFIX}"),
             get(crate::debug_sessions::poll_verdict).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id{DEBUG_SESSION_CLOSE_SUFFIX}"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}{DEBUG_SESSION_CLOSE_SUFFIX}"),
             post(crate::debug_sessions::close_session).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_worker_bearer,
@@ -778,7 +1109,7 @@ pub fn build_app(
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}"),
             get(crate::debug_sessions::get_session).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
@@ -788,7 +1119,7 @@ pub fn build_app(
         // DAP) drives a paused session through the same lease-gated,
         // idempotent, version-checked operations.
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/lease"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}/lease"),
             post(crate::debug_sessions::acquire_lease)
                 .delete(crate::debug_sessions::release_lease)
                 .route_layer(middleware::from_fn_with_state(
@@ -797,20 +1128,20 @@ pub fn build_app(
                 )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/events"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}/events"),
             get(crate::debug_sessions::session_events).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
             )),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/operations"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}/operations"),
             post(crate::debug_sessions::session_operation).route_layer(
                 middleware::from_fn_with_state(shared.clone(), require_native_bearer),
             ),
         )
         .route(
-            &format!("{DEBUG_SESSIONS_PATH}/:session_id/audit"),
+            &format!("{DEBUG_SESSIONS_PATH}/{{session_id}}/audit"),
             get(crate::debug_sessions::session_audit).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
@@ -818,12 +1149,12 @@ pub fn build_app(
         )
         // Archive tickets are bearerless in the official runner protocol.
         .route(
-            "/api/v1/actions/download/:owner/:repo/*git_ref",
+            "/api/v1/actions/download/{owner}/{repo}/{*git_ref}",
             get(download_action_tarball),
         )
         // Read-only Git smart HTTP for immutable local-workspace snapshots.
         .route(
-            "/snapshots/:run_id/*path",
+            "/snapshots/{run_id}/{*path}",
             get(snapshot_git_http).post(snapshot_git_http),
         )
         // Anonymous forge relay for checkouts the snapshot cannot serve
@@ -831,20 +1162,91 @@ pub fn build_app(
         // `/api/v3/repos/{o}/{r}` lookup checkout issues for the default
         // branch. Handlers authenticate the pinned job runtime token.
         .route(
-            "/:org/:repo/info/refs",
+            "/{org}/{repo}/info/refs",
             get(crate::snapshots::forge_git_http),
         )
         .route(
-            "/:org/:repo/git-upload-pack",
+            "/{org}/{repo}/git-upload-pack",
             post(crate::snapshots::forge_git_http),
         )
         .route(
-            "/:org/:repo/info/lfs/objects/batch",
+            "/{org}/{repo}/info/lfs/objects/batch",
             post(crate::snapshots::forge_git_http),
         )
         .route(
-            "/api/v3/repos/:owner/:repo",
+            "/api/v3/repos/{owner}/{repo}",
             get(crate::snapshots::forge_api_repo),
+        )
+        // The archive half of the same surface: `actions/checkout` without a
+        // `git` binary (minimal container images) downloads
+        // `/repos/{o}/{r}/tarball/{ref}` from its `{server}/api/v3` base, for
+        // the run's snapshot and for relayed forge repositories alike.
+        .route(
+            "/api/v3/repos/{owner}/{repo}/tarball/{*git_ref}",
+            get(crate::snapshots::forge_api_repo_tarball),
+        )
+        // GitHub code-scanning SARIF shim: the legacy `POST …/sarifs` upload,
+        // the `PUT …/analysis` endpoint current `github/codeql-action`
+        // releases use, and the status/analyses reads the action follows.
+        // Both the GHES-style `/api/v3` base and the unprefixed
+        // `{server}/api` base are served; handlers authenticate the job
+        // runtime token and bind it to the path's repository.
+        .route(
+            "/api/v3/repos/{owner}/{repo}/code-scanning/sarifs",
+            post(crate::sarif::github_upload_sarif),
+        )
+        .route(
+            "/repos/{owner}/{repo}/code-scanning/sarifs",
+            post(crate::sarif::github_upload_sarif),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/code-scanning/sarifs/{sarif_id}",
+            get(crate::sarif::github_sarif_status),
+        )
+        .route(
+            "/repos/{owner}/{repo}/code-scanning/sarifs/{sarif_id}",
+            get(crate::sarif::github_sarif_status),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/code-scanning/analysis",
+            put(crate::sarif::github_create_analysis),
+        )
+        .route(
+            "/repos/{owner}/{repo}/code-scanning/analysis",
+            put(crate::sarif::github_create_analysis),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/code-scanning/analyses",
+            get(crate::sarif::github_list_analyses),
+        )
+        // `github/codeql-action` reads its Actions run while deriving an
+        // analysis key; the handler answers the credential's run so the
+        // upload step does not fail on a 404 before it reaches the shim.
+        .route(
+            "/api/v3/repos/{owner}/{repo}/actions/runs/{run_ref}",
+            get(crate::sarif::github_actions_run),
+        )
+        .route(
+            "/repos/{owner}/{repo}/actions/runs/{run_ref}",
+            get(crate::sarif::github_actions_run),
+        )
+        .route(
+            "/repos/{owner}/{repo}/code-scanning/analyses",
+            get(crate::sarif::github_list_analyses),
+        )
+        // Native SARIF ingestion: a job token bound to the run (or the system
+        // token) may upload, list, and read analyses.
+        .route(
+            "/api/v1/runs/{run_id}/sarif",
+            post(crate::sarif::upload_run_sarif).get(crate::sarif::list_run_sarif),
+        )
+        .route(
+            "/api/v1/sarif/{analysis_id}",
+            get(crate::sarif::get_sarif_analysis),
+        )
+        .route(
+            "/api/v1/sarif/{analysis_id}/raw",
+            get(crate::sarif::get_sarif_raw),
         )
         .route(
             "/api/v1/runners",
@@ -867,7 +1269,7 @@ pub fn build_app(
             post(broker_session_root).delete(broker_delete_session_root),
         )
         .route(
-            "/runner/session/:session_id",
+            "/runner/session/{session_id}",
             delete(broker_delete_session_by_path),
         )
         .route(
@@ -883,7 +1285,7 @@ pub fn build_app(
             post(broker_session_root).delete(broker_delete_session_root),
         )
         .route(
-            "/runner/server/runner/session/:session_id",
+            "/runner/server/runner/session/{session_id}",
             delete(broker_delete_session_by_path),
         )
         .route(
@@ -902,7 +1304,7 @@ pub fn build_app(
             post(broker_session_root).delete(broker_delete_session_root),
         )
         .route(
-            "/session/:session_id",
+            "/session/{session_id}",
             delete(broker_delete_session_by_path),
         )
         .route(
@@ -918,7 +1320,7 @@ pub fn build_app(
             post(broker_session_root).delete(broker_delete_session_root),
         )
         .route(
-            "/runner/server/session/:session_id",
+            "/runner/server/session/{session_id}",
             delete(broker_delete_session_by_path),
         )
         .route(
@@ -946,7 +1348,7 @@ pub fn build_app(
             )),
         )
         .route(
-            "/api/v1/artifacts/:artifact_id",
+            "/api/v1/artifacts/{artifact_id}",
             get(artifact_get).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_native_bearer,
@@ -957,7 +1359,7 @@ pub fn build_app(
         // session/message traffic requires a registered runner credential.
         .route("/_apis/v1/AgentPools", get(runner_pools))
         .route(
-            "/_apis/v1/Agent/:pool_id/:agent_id",
+            "/_apis/v1/Agent/{pool_id}/{agent_id}",
             get(agent_lookup_by_id)
                 .post(register_runner_compat)
                 .put(replace_runner_compat)
@@ -967,7 +1369,7 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/_apis/v1/Agent/:pool_id",
+            "/_apis/v1/Agent/{pool_id}",
             get(agent_lookup)
                 .post(register_runner_compat_pool_only)
                 .route_layer(middleware::from_fn_with_state(
@@ -976,35 +1378,35 @@ pub fn build_app(
                 )),
         )
         .route(
-            "/_apis/v1/AgentSession/:pool_id/:session_id",
+            "/_apis/v1/AgentSession/{pool_id}/{session_id}",
             post(create_session_compat).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/_apis/v1/AgentSession/:pool_id",
+            "/_apis/v1/AgentSession/{pool_id}",
             post(create_session_compat_pool_only).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/_apis/v1/Message/:pool_id",
+            "/_apis/v1/Message/{pool_id}",
             get(next_message_compat).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/_apis/v1/Message/:pool_id/:message_id",
+            "/_apis/v1/Message/{pool_id}/{message_id}",
             delete(delete_pool_message).route_layer(middleware::from_fn_with_state(
                 shared.clone(),
                 require_legacy_runner_bearer,
             )),
         )
         .route(
-            "/_apis/v1/AgentRequest/:pool_id/:request_id",
+            "/_apis/v1/AgentRequest/{pool_id}/{request_id}",
             get(agent_request_get)
                 .post(agent_request_ack)
                 .patch(agent_request_patch)
@@ -1015,7 +1417,12 @@ pub fn build_app(
         )
         // Accept blob uploads at the signed-URL paths minted by the Twirp handlers.
         // The runner PUTs logs/summaries here; we store them in the state directory.
-        .route("/replay/results/*path", put(replay_results_put))
+        .route(
+            "/replay/results/{*path}",
+            // Bytes extraction otherwise inherits Axum's 2 MiB default. Keep this
+            // runner-facing upload bounded while allowing real step logs through.
+            put(replay_results_put).layer(DefaultBodyLimit::max(MAX_REPLAY_RESULT_BYTES)),
+        )
         // Twirp APIs accept only the system token or a locally signed Actions.Results job token.
         .route(
             "/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate",
@@ -1072,11 +1479,20 @@ pub fn build_app(
             "/twirp/github.actions.results.api.v1.ArtifactService/DeleteArtifact",
             post(twirp_artifact_v2_delete),
         )
+        // Refresh an expired blob upload URL: the runner POSTs the old
+        // (expired) upload JWT with its live job bearer and gets a fresh
+        // upload JWT for the same pending staging dir. The job must be live;
+        // a settled job's refresh is refused so uploads never extend past
+        // job death.
+        .route(
+            "/twirp/github.actions.results.api.v1.BlobService/RefreshUploadURL",
+            post(twirp_refresh_blob_upload_url),
+        )
         // Azure Block Blob compat blob store — upload (PUT) and download (GET).
         // Cache: /twirp-blob/cache/{token}
         // Artifact: /twirp-blob/artifact/{token} (download URL appends.zip for content-type detection)
         .route(
-            "/twirp-blob/:kind/:token",
+            "/twirp-blob/{kind}/{token}",
             put(blob_put)
                 .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
                 .get(blob_get),
@@ -1101,6 +1517,7 @@ pub fn build_app(
             crate::http_metrics::http_metrics_middleware,
         ))
         .layer(middleware::from_fn(errors::protocol_error_envelope))
+        .layer(middleware::from_fn(errors::github_error_envelope))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             record_flows_middleware,
@@ -1110,11 +1527,11 @@ pub fn build_app(
         Some(token) => router.merge(
             Router::new()
                 .route(
-                    "/internal/test/runners/sessions/:session_id/messages",
+                    "/internal/test/runners/sessions/{session_id}/messages",
                     get(next_message),
                 )
                 .route(
-                    "/internal/test/runners/sessions/:session_id/messages/:message_id",
+                    "/internal/test/runners/sessions/{session_id}/messages/{message_id}",
                     delete(delete_session_message),
                 )
                 .route("/internal/test/runners/sessions", post(create_session))
@@ -1126,5 +1543,364 @@ pub fn build_app(
                 .with_state(shared),
         ),
         None => router,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// axum 0.8 panics while registering a legacy `:param` or `*wildcard`
+    /// segment, so constructing the production router is the regression
+    /// check: any route still written in the 0.7 syntax fails right here.
+    #[tokio::test]
+    async fn production_router_builds_and_serves_healthz() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let router = app(state, CancellationToken::new());
+        let response = router
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The production gate, with only the budget a test is about changed, so
+    /// no test waits out (or races) the real ten seconds.
+    fn gate_with(configure: impl FnOnce(&mut WebhookUploadGate)) -> Arc<WebhookUploadGate> {
+        let mut gate = WebhookUploadGate::new(MAX_CONCURRENT_WEBHOOK_UPLOADS);
+        configure(&mut gate);
+        Arc::new(gate)
+    }
+
+    /// Progress is coalesced through a one-slot channel, so arbitrarily many
+    /// small frames cannot queue one allocation each, while `Complete` is
+    /// delivered through its own lossless signal: a body that emits both
+    /// before the middleware drains anything must still report the end of the
+    /// upload.
+    #[tokio::test]
+    async fn upload_events_coalesce_progress_without_losing_complete() {
+        use futures::StreamExt as _;
+
+        let frames = 1024;
+        let body = Body::from_stream(futures::stream::iter(
+            (0..frames).map(|_| Ok::<_, std::io::Error>(Bytes::new())),
+        ));
+        let (progress_tx, mut progress) = tokio::sync::mpsc::channel(1);
+        let (complete_tx, complete) = tokio::sync::oneshot::channel();
+        let gated = report_upload_events(body, progress_tx, complete_tx);
+
+        let drained: Vec<_> = gated.into_data_stream().collect().await;
+        assert_eq!(drained.len(), frames);
+        assert!(drained.iter().all(Result::is_ok));
+        assert_eq!(
+            progress.len(),
+            1,
+            "a one-slot channel must coalesce per-frame progress"
+        );
+        assert!(
+            complete.await.is_ok(),
+            "Complete must not be lost behind queued progress"
+        );
+        assert!(progress.recv().await.is_some());
+        assert!(
+            progress.recv().await.is_none(),
+            "the body drops its senders when it ends"
+        );
+    }
+
+    /// The upload gate over a stub handler that reads its body, so admission
+    /// and the upload budgets are driven without the webhook handler's
+    /// signature check or store.
+    fn gate_router(gate: Arc<WebhookUploadGate>) -> Router {
+        Router::new()
+            .route("/webhooks", post(|_body: Bytes| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(gate, limit_webhook_uploads))
+    }
+
+    /// One request through `router`; its status.
+    async fn send(router: &Router, body: Body) -> StatusCode {
+        router
+            .clone()
+            .oneshot(Request::post("/webhooks").body(body).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// A body that signals when the extractor first polls it and then never
+    /// yields a byte: the shape of an upload that holds a slot without
+    /// uploading anything.
+    fn silent_body() -> (tokio::sync::oneshot::Receiver<()>, Body) {
+        let (began_tx, began_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut began_tx = Some(began_tx);
+        let body = Body::from_stream(stream::poll_fn(
+            move |_cx| -> Poll<Option<Result<Bytes, std::io::Error>>> {
+                if let Some(began_tx) = began_tx.take() {
+                    let _ = began_tx.send(());
+                }
+                Poll::Pending
+            },
+        ));
+        (began_rx, body)
+    }
+
+    /// Uploads past the slot cap are shed (503) rather than queued: the body
+    /// is buffered before the HMAC is checked, so an unbounded admission is
+    /// the memory amplifier this gate exists to prevent. The test holds the
+    /// permits itself, so passing does not depend on how long a staged upload
+    /// takes to be cut off — the timing the earlier version of this test
+    /// shared with the ingest deadline.
+    #[tokio::test]
+    async fn webhook_uploads_are_shed_past_the_slot_cap() {
+        let gate = gate_with(|gate| gate.admission_wait = Duration::from_millis(50));
+        let held: Vec<_> = (0..MAX_CONCURRENT_WEBHOOK_UPLOADS)
+            .map(|_| gate.slots.clone().try_acquire_owned().expect("slot"))
+            .collect();
+        let router = gate_router(gate.clone());
+
+        assert_eq!(
+            send(&router, Body::empty()).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        drop(held);
+        assert_eq!(send(&router, Body::empty()).await, StatusCode::OK);
+    }
+
+    /// A body still arriving when the ingest budget is spent is cut off with
+    /// 408 and gives its slot back, so a stalled peer cannot pin the ingress
+    /// for the whole budget.
+    #[tokio::test]
+    async fn a_stalled_upload_is_cut_off_at_the_ingest_budget() {
+        let gate = gate_with(|gate| {
+            gate.ingest_budget = Duration::from_millis(50);
+            // Longer than the ingest budget, so the total budget is what fires.
+            gate.idle_budget = Duration::from_secs(5);
+        });
+        let router = gate_router(gate.clone());
+
+        let stalled = Body::from_stream(stream::pending::<Result<Bytes, std::io::Error>>());
+        assert_eq!(send(&router, stalled).await, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            gate.slots.available_permits(),
+            MAX_CONCURRENT_WEBHOOK_UPLOADS,
+            "the cut-off upload must release its slot"
+        );
+    }
+
+    /// A body that stops sending is cut at the idle budget instead of holding
+    /// its slot for the whole ingest budget, and it must actually send the
+    /// first byte to keep the slot: a request that opens and then goes quiet
+    /// gives the slot back in seconds.
+    #[tokio::test]
+    async fn a_silent_upload_gives_its_slot_back_at_the_idle_budget() {
+        let gate = gate_with(|gate| {
+            gate.idle_budget = Duration::from_millis(50);
+            gate.ingest_budget = Duration::from_secs(5);
+        });
+        let router = gate_router(gate.clone());
+
+        let (began, body) = silent_body();
+        let stalled = tokio::spawn({
+            let router = router.clone();
+            async move { send(&router, body).await }
+        });
+
+        began.await.expect("the extractor must start the upload");
+        assert_eq!(stalled.await.unwrap(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            gate.slots.available_permits(),
+            MAX_CONCURRENT_WEBHOOK_UPLOADS,
+            "the idle upload must release its slot"
+        );
+    }
+
+    /// A tiny-frame upload that finishes must be admitted, not cut off at the
+    /// idle budget: the completion has to reach the middleware even though
+    /// thousands of `Progress` reports raced it.
+    #[tokio::test]
+    async fn a_tiny_frame_upload_finishes_without_waiting_out_the_idle_budget() {
+        let gate = gate_with(|gate| {
+            gate.idle_budget = Duration::from_millis(50);
+            gate.ingest_budget = Duration::from_secs(5);
+        });
+        let router = gate_router(gate.clone());
+
+        let body = Body::from_stream(stream::iter(
+            (0..50_000).map(|_| Ok::<_, std::io::Error>(Bytes::from_static(b"x"))),
+        ));
+        assert_eq!(send(&router, body).await, StatusCode::OK);
+        assert_eq!(
+            gate.slots.available_permits(),
+            MAX_CONCURRENT_WEBHOOK_UPLOADS,
+            "the admitted upload must give its slot back"
+        );
+    }
+
+    /// The hold-and-replace pattern the gate has to survive: every slot taken
+    /// by an upload that sends nothing, replaced as each is cut off. Holding a
+    /// slot now costs bytes and only lasts the idle budget, and a delivery
+    /// that arrives meanwhile is already queued when a permit frees — ahead of
+    /// the client that has to reconnect — so recycling silent uploads does not
+    /// shed it.
+    #[tokio::test]
+    async fn a_replaced_silent_upload_does_not_beat_a_waiting_delivery() {
+        let gate = gate_with(|gate| {
+            gate.idle_budget = Duration::from_millis(100);
+            gate.admission_wait = Duration::from_secs(2);
+        });
+        let router = gate_router(gate.clone());
+
+        // First wave: every slot held by a body that never sends a byte.
+        let mut holders = Vec::new();
+        let mut began = Vec::new();
+        for _ in 0..MAX_CONCURRENT_WEBHOOK_UPLOADS {
+            let (started, body) = silent_body();
+            began.push(started);
+            holders.push(tokio::spawn({
+                let router = router.clone();
+                async move { send(&router, body).await }
+            }));
+        }
+        for started in began {
+            started
+                .await
+                .expect("every silent upload must reach its body");
+        }
+
+        // The delivery that arrives now waits for a slot instead of being shed.
+        let delivery = tokio::spawn({
+            let router = router.clone();
+            async move { send(&router, Body::from("payload")).await }
+        });
+
+        // The attacker reconnects as the silent uploads are cut off.
+        let mut replacements = Vec::new();
+        for _ in 0..MAX_CONCURRENT_WEBHOOK_UPLOADS {
+            replacements.push(tokio::spawn({
+                let router = router.clone();
+                async move {
+                    let mut statuses = Vec::new();
+                    for _ in 0..2 {
+                        let (_, body) = silent_body();
+                        statuses.push(send(&router, body).await);
+                    }
+                    statuses
+                }
+            }));
+        }
+
+        assert_eq!(
+            delivery.await.unwrap(),
+            StatusCode::OK,
+            "a delivery that waits out the silent uploads must still be served"
+        );
+        for holder in holders {
+            assert_eq!(holder.await.unwrap(), StatusCode::REQUEST_TIMEOUT);
+        }
+        for replacement in replacements {
+            for status in replacement.await.unwrap() {
+                assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+            }
+        }
+        assert_eq!(
+            gate.slots.available_permits(),
+            MAX_CONCURRENT_WEBHOOK_UPLOADS,
+            "every slot must be back once the silent uploads are gone"
+        );
+    }
+
+    /// The ingest budget covers the upload, not the handler: a body that
+    /// arrives inside the budget leaves the handler to finish its own work,
+    /// even when that work outlasts the budget. The deadline this replaced
+    /// wrapped the whole request, so it cancelled stores that were still
+    /// inside `WEBHOOK_ACK_BUDGET` — and a delivery cancelled mid-write is
+    /// unrecorded and has to be redelivered from GitHub.
+    #[tokio::test]
+    async fn handler_work_outliving_the_ingest_budget_completes() {
+        let gate = gate_with(|gate| gate.ingest_budget = Duration::from_millis(50));
+        let router = Router::new()
+            .route(
+                "/webhooks",
+                post(|_body: Bytes| async {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn_with_state(gate, limit_webhook_uploads));
+
+        // The body is itself slow — arriving just inside the budget — so the
+        // slow upload the budget exists for is covered alongside the handler's
+        // longer-running work.
+        let body = Body::from_stream(stream::once(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok::<_, std::io::Error>(Bytes::from_static(b"payload"))
+        }));
+        let response = router
+            .oneshot(Request::post("/webhooks").body(body).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The gate is wired onto the real webhook route: with a free slot the
+    /// request reaches the handler instead of being shed, and the unsigned
+    /// body is rejected there with 401.
+    #[tokio::test]
+    async fn webhook_route_reaches_the_handler_through_the_upload_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let router = app(state, CancellationToken::new());
+
+        let response = router
+            .oneshot(
+                Request::post("/api/v1/github/webhooks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `--record-flows` must not buffer the webhook body ahead of the route's
+    /// own admission: the recorder reads whole bodies before any route layer
+    /// runs, so recording this path would undo the upload gate. Other routes
+    /// stay recorded.
+    #[tokio::test]
+    async fn flow_recording_skips_webhook_uploads() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        let flows_path = temp.path().join("flows.jsonl");
+        state.inner.lock().await.flows_file = Some(std::fs::File::create(&flows_path).unwrap());
+
+        // `build_app` applies the recorder as its outermost layer; this router
+        // reproduces that wiring over stub handlers.
+        let router = Router::new()
+            .route("/api/v1/github/webhooks", post(|| async { "ignored" }))
+            .route("/healthz", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                record_flows_middleware,
+            ));
+
+        let webhook = Request::post("/api/v1/github/webhooks")
+            .body(Body::empty())
+            .unwrap();
+        let healthz = Request::get("/healthz").body(Body::empty()).unwrap();
+        for request in [webhook, healthz] {
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let recorded = std::fs::read_to_string(&flows_path).unwrap();
+        assert_eq!(recorded.lines().count(), 1, "recorded: {recorded}");
+        assert!(recorded.contains("\"/healthz\""), "recorded: {recorded}");
     }
 }

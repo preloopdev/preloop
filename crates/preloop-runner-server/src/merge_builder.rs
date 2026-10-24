@@ -1,0 +1,1509 @@
+//! Self-built pull-request test merges.
+//!
+//! GitHub computes a pull request's test merge asynchronously, so a webhook
+//! payload's `merge_commit_sha` is often the *previous* head's merge (or
+//! null), and a run created from it tests a tree the pull request no longer
+//! has. This engine therefore builds the merge itself: fetch the current base
+//! tip and the head into the engine's mirror, `git merge-tree --write-tree`
+//! them, and commit the result with two parents. The merge commit exists only
+//! in the engine, so any run on it is served to its jobs from the engine
+//! ([`attach_merge`] / [`attach_prebuilt_merge`]), never from the forge.
+//!
+//! Local `pull_request` runs and webhook deliveries build merges here. A
+//! prebuilt merge record is validated before its engine-only commit is served.
+//!
+//! Merge inputs are validated, never trusted: a prebuilt merge must exist in
+//! the named mirror with exactly the claimed parents and tree.
+
+use super::*;
+use crate::snapshots::{GIT_CONTROL_TIMEOUT, GIT_PROGRAM, GIT_TRANSFER_TIMEOUT, GIT_WORK_TIMEOUT};
+use std::path::{Component, Path, PathBuf};
+use tokio::process::Command;
+
+/// Fixed identity for self-built merge commits. A fixed name and date keep
+/// the merge sha deterministic for the same parents, so replays and
+/// concurrent deliveries agree on one commit.
+pub const MERGE_IDENTITY_NAME: &str = "preloop";
+pub const MERGE_IDENTITY_EMAIL: &str = "merge.local";
+const MERGE_IDENTITY_DATE: &str = "1970-01-01T00:00:00Z";
+
+/// Where a pull request's head comes from.
+#[derive(Debug, Clone)]
+pub enum MergeHead {
+    /// A commit that must already be present in the mirror, or (when a fetch
+    /// URL is configured) is fetched by sha.
+    Commit(String),
+    /// A branch of the same repository: `refs/heads/<name>`.
+    Branch(String),
+    /// GitHub's pull ref: `refs/pull/<n>/head`. Exists for fork and
+    /// same-repo pull requests alike, which makes it the reliable head
+    /// source for webhook deliveries.
+    PullRef(u64),
+}
+
+/// One pull-request test merge to build.
+#[derive(Debug, Clone)]
+pub struct MergeRequest {
+    /// `owner/repo`, for fetch URLs and log context.
+    pub repository: String,
+    /// Pull request number when known; labels `refs/pull/<n>/merge` in the
+    /// served repository.
+    pub pull_request_number: Option<u64>,
+    /// Base branch name (`main`); the current tip is fetched as
+    /// `refs/heads/<base>` and becomes the merge's first parent.
+    pub base_branch: String,
+    /// The head side (merge's second parent).
+    pub head: MergeHead,
+}
+
+/// A local workspace `pull_request` run's merge inputs.
+///
+/// The head is implicit: the workspace `HEAD` when its tree is clean, the
+/// synthetic snapshot commit when it is dirty — only snapshot creation can
+/// tell which, and merging the dirty synthetic commit is what makes the
+/// uncommitted edits part of the tested tree. The base branch is fetched from
+/// the workspace's `origin` into the snapshot's shared object cache.
+#[derive(Debug, Clone)]
+pub struct LocalPullRequestMerge {
+    /// `owner/repo`, for fetch URLs and log context.
+    pub repository: String,
+    /// Pull request number when known; labels `refs/pull/<n>/merge`.
+    pub pull_request_number: Option<u64>,
+    /// Base branch name (`main`).
+    pub base_branch: String,
+}
+
+/// The engine mirror a merge is fetched into and built from.
+#[derive(Debug, Clone)]
+pub struct MergeSource {
+    /// Bare repository holding (and receiving) the objects.
+    pub mirror: PathBuf,
+    /// Remote to fetch base/head from. `None` means the objects must already
+    /// exist in the mirror (tests, local heads).
+    pub fetch_url: Option<String>,
+    /// Engine GitHub credential. Attached only when `fetch_url` is an
+    /// `https://` remote whose host is `github.com` or the configured forge
+    /// host ([`Self::forge_host`]), so it never leaks to another host.
+    pub token: Option<String>,
+    /// Host of the configured forge (`github.com`, or a GHES hostname); the
+    /// credential above may also ride to this host.
+    pub forge_host: Option<String>,
+}
+
+impl Default for MergeSource {
+    fn default() -> Self {
+        Self {
+            mirror: PathBuf::new(),
+            fetch_url: None,
+            token: None,
+            forge_host: None,
+        }
+    }
+}
+
+/// Resolved parents of a merge.
+#[derive(Debug, Clone)]
+pub struct MergeParents {
+    pub repository: String,
+    pub base_sha: String,
+    pub head_sha: String,
+}
+
+/// A built merge commit.
+#[derive(Debug, Clone)]
+pub struct MergedMerge {
+    /// Repository whose cache mirror contains this merge and its parents.
+    pub repository: String,
+    /// The two-parent merge commit; exists in the served repository.
+    pub sha: String,
+    /// Its tree.
+    pub tree: String,
+    /// First parent: the base tip that was merged into.
+    pub base_sha: String,
+    /// Second parent: the head that was merged.
+    pub head_sha: String,
+}
+
+/// Outcome of building a merge.
+#[derive(Debug)]
+pub enum MergeOutcome {
+    Merged(MergedMerge),
+    /// The head does not merge cleanly into the base tip. GitHub does not run
+    /// `pull_request` workflows for a conflicted pull request either.
+    Conflict {
+        base_sha: String,
+        head_sha: String,
+        /// Conflicted paths, as reported by `git merge-tree --name-only`.
+        paths: Vec<String>,
+    },
+}
+
+/// Merge build failures.
+#[derive(Debug)]
+pub enum MergeError {
+    /// A fetch failed: upstream unreachable, refused, or no matching ref.
+    /// Transient by nature — a redelivery or retry may succeed.
+    Fetch {
+        refspec: String,
+        url: String,
+        message: String,
+    },
+    /// The base branch does not exist at the remote.
+    BaseBranchMissing { branch: String, url: String },
+    /// An input commit is not present where it must be.
+    MissingCommit { sha: String, repository: String },
+    /// A `prebuilt_merge` submission named a mirror or commit that failed
+    /// validation (bad path, wrong parents, wrong tree).
+    InvalidPrebuilt(String),
+    /// `git` itself failed.
+    Git { operation: String, message: String },
+    /// Filesystem failure while preparing a served repository.
+    Io { path: String, message: String },
+}
+
+impl std::fmt::Display for MergeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fetch {
+                refspec,
+                url,
+                message,
+            } => write!(formatter, "could not fetch {refspec} from {url}: {message}"),
+            Self::BaseBranchMissing { branch, url } => {
+                write!(formatter, "base branch `{branch}` was not found at {url}")
+            }
+            Self::MissingCommit { sha, repository } => {
+                write!(formatter, "commit {sha} is not present in {repository}")
+            }
+            Self::InvalidPrebuilt(message) => {
+                write!(formatter, "prebuilt merge is not valid: {message}")
+            }
+            Self::Git { operation, message } => {
+                write!(formatter, "git {operation} failed: {message}")
+            }
+            Self::Io { path, message } => write!(formatter, "{path}: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for MergeError {}
+
+impl MergeError {
+    /// Whether a retry (delivery redelivery, user re-run) may succeed.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Fetch { .. })
+    }
+
+    /// Map a submit-time merge failure to the HTTP error a submission gets.
+    pub fn into_api_error(self) -> ApiError {
+        match self {
+            Self::Fetch { .. } | Self::BaseBranchMissing { .. } | Self::MissingCommit { .. } => {
+                ApiError::bad_request(format!(
+                    "could not build the pull-request test merge: {self}. Re-run with \
+                     --no-merge to test the branch alone."
+                ))
+            }
+            Self::InvalidPrebuilt(_) => ApiError::bad_request(format!(
+                "could not build the pull-request test merge: {self}"
+            )),
+            Self::Git { .. } | Self::Io { .. } => ApiError::internal(format!(
+                "could not build the pull-request test merge: {self}"
+            )),
+        }
+    }
+}
+
+/// Whether `sha` is a full lowercase-or-uppercase hex object id.
+fn is_object_id(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A Git command with the engine's child policy applied.
+///
+/// The policy ([`crate::snapshots::git_command_for`]) resets Git's credential
+/// helper list on the command line and disables every interactive credential
+/// path in the environment, so an osxkeychain or GCM helper cannot block a
+/// merge build on a keychain dialog. Merge fetches authenticate with an
+/// `http.<url>.extraheader` token ([`auth_header_for_remote`]) or URL userinfo,
+/// neither of which involves a helper.
+fn git_command() -> Command {
+    crate::snapshots::git_command_for(GIT_PROGRAM)
+}
+
+/// Run `command` under `deadline` and return its output whatever the exit
+/// status was, through the engine-wide bounded runner
+/// ([`preloop_observability::deadline::run_command`]): the child is killed and
+/// reaped when the deadline expires, and it cannot look hung merely because it
+/// filled a pipe.
+///
+/// `command` must come from [`git_command`]; the policy is applied there, not
+/// here, so a call site that staged `GIT_CONFIG_*` after building it keeps what
+/// it staged.
+async fn git_output_within(
+    command: Command,
+    operation: &str,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, MergeError> {
+    // Boxed so the spawn/drain/timeout machinery is not inlined into every
+    // handler future that can reach a merge build.
+    Box::pin(preloop_observability::deadline::run_command(
+        command, deadline, operation,
+    ))
+    .await
+    .map_err(|error| MergeError::Git {
+        operation: operation.to_owned(),
+        message: error.to_string(),
+    })
+}
+
+/// [`git_output_within`] plus the usual "a non-zero exit is an error" check.
+async fn run_git_within(
+    command: Command,
+    operation: &str,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, MergeError> {
+    let output = git_output_within(command, operation, deadline).await?;
+    if !output.status.success() {
+        return Err(MergeError::Git {
+            operation: operation.to_owned(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    Ok(output)
+}
+
+/// Whether `repository` holds `sha` as a commit.
+async fn commit_present(repository: &Path, sha: &str) -> bool {
+    if !is_object_id(sha) {
+        return false;
+    }
+    let mut command = git_command();
+    command
+        .arg("--git-dir")
+        .arg(repository)
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")]);
+    // Any failure — a non-zero exit, a spawn error, or the deadline — means
+    // "not present"; callers answer by fetching, which is the safe direction.
+    git_output_within(command, "check commit presence", GIT_CONTROL_TIMEOUT)
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+/// `git rev-parse <rev>` in `repository`.
+async fn rev_parse(repository: &Path, rev: &str) -> Result<String, MergeError> {
+    let mut command = git_command();
+    command
+        .arg("--git-dir")
+        .arg(repository)
+        .args(["rev-parse", rev]);
+    let output = run_git_within(command, &format!("rev-parse {rev}"), GIT_CONTROL_TIMEOUT).await?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Resolve a ref or revision to a commit id, or `None` when it does not
+/// resolve (a missing branch is not an error here).
+async fn resolve_commit(repository: &Path, rev: &str) -> Option<String> {
+    rev_parse(repository, &format!("{rev}^{{commit}}"))
+        .await
+        .ok()
+        .filter(|sha| is_object_id(sha))
+}
+
+/// Scrub a remote URL out of a git error message. Git echoes the URL it
+/// failed on, and a URL can embed credentials in its userinfo.
+fn sanitized_fetch_error(url: &str, message: String) -> String {
+    let sanitized = crate::snapshots::sanitize_remote_url(url);
+    message.replace(url, &sanitized)
+}
+
+/// Origin-scoped auth config for a fetch: the credential rides only to the
+/// upstream's own origin over https, and only when that host is `github.com`
+/// or the operator's configured forge. A command-wide `http.extraHeader`
+/// would also be sent on redirects to hosts the operator never vouched for.
+fn auth_header_for_remote(
+    url: &str,
+    token: &str,
+    forge_host: Option<&str>,
+) -> Option<(String, String)> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme != "https" {
+        return None;
+    }
+    // Strip userinfo before extracting the authority. Keep an explicit port
+    // in the credential key so Git cannot send the token to another service
+    // on the same host.
+    let authority = rest.rsplit('@').next().unwrap_or(rest);
+    let authority = authority.split('/').next().unwrap_or("");
+    let host = authority.split(':').next().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    let port = authority.split_once(':').map(|(_, port)| port);
+    let github = host == "github.com" && port.is_none_or(|port| port == "443");
+    let configured = forge_host.is_some_and(|configured| {
+        (configured.eq_ignore_ascii_case(host) && port.is_none())
+            || configured.eq_ignore_ascii_case(authority)
+    });
+    if !github && !configured {
+        return None;
+    }
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode(format!("x-access-token:{token}").as_bytes());
+    Some((
+        format!("http.{scheme}://{authority}/.extraheader"),
+        format!("AUTHORIZATION: basic {encoded}"),
+    ))
+}
+
+/// Create `mirror` as a bare repository when it does not exist yet.
+///
+/// Idempotent and tolerant of concurrent deliveries: `git init --bare` on an
+/// existing repository re-initializes it harmlessly, and a racing init that
+/// loses is retried by the existence check below. Auto-GC is disabled because
+/// served per-run repositories alternate to this mirror's objects, so nothing
+/// may prune them while a run can still fetch.
+async fn ensure_mirror(mirror: &Path) -> Result<(), MergeError> {
+    if mirror.join("HEAD").is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = mirror.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| MergeError::Io {
+                path: parent.display().to_string(),
+                message: error.to_string(),
+            })?;
+    }
+    let output = {
+        let mut init = git_command();
+        init.args(["init", "--bare", "--quiet", "--template="])
+            .arg(mirror);
+        match git_output_within(init, "initialize merge mirror", GIT_CONTROL_TIMEOUT).await {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(MergeError::Io {
+                    path: mirror.display().to_string(),
+                    message: error.to_string(),
+                });
+            }
+        }
+    };
+    if !output.status.success() && !mirror.join("HEAD").is_file() {
+        return Err(MergeError::Io {
+            path: mirror.display().to_string(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let mut disable_gc = git_command();
+    disable_gc
+        .arg("--git-dir")
+        .arg(mirror)
+        .args(["config", "gc.auto", "0"]);
+    run_git_within(disable_gc, "config gc.auto", GIT_CONTROL_TIMEOUT).await?;
+    Ok(())
+}
+
+/// Fetch one refspec into `source.mirror` and resolve `resolve_ref` to a sha.
+///
+/// `resolve_ref` must be stable across concurrent fetches. Every fetch into
+/// the mirror rewrites `FETCH_HEAD`, so it cannot identify a request's result.
+async fn fetch_into_mirror(
+    source: &MergeSource,
+    url: &str,
+    refspec: &str,
+    resolve_ref: &str,
+) -> Result<String, MergeError> {
+    fetch_into_mirror_within(
+        GIT_PROGRAM,
+        GIT_TRANSFER_TIMEOUT,
+        source,
+        url,
+        refspec,
+        resolve_ref,
+    )
+    .await
+}
+
+/// [`fetch_into_mirror`] with an explicit program and deadline.
+///
+/// Before this deadline a forge that accepted the connection and then stalled
+/// never returned: the webhook delivery building the pull-request merge hung
+/// forever, and every later delivery for that repository queued behind the
+/// same stuck task. The deadline bounds the whole fetch and expiry kills the
+/// child, so nothing keeps writing into the mirror after the caller moves on.
+///
+/// No engine-level lock is held across this fetch: a mirror has no lock file
+/// and the surrounding code relies only on Git's own per-ref locking, so a
+/// stalled fetch delays exactly the task that issued it — the deadline, not a
+/// lock, is the guarantee. See [`GIT_TRANSFER_TIMEOUT`] for why thirty
+/// minutes cannot cut a legitimate fetch short.
+///
+/// Expiry kills the child, which cannot unlink a lock file it held at the
+/// time, so dead locks are swept before each fetch. Without an engine lock the
+/// age rule is the only safe one: concurrent deliveries legitimately hold
+/// per-ref locks here, and only a lock that has outlived the longest possible
+/// fetch ([`GIT_TRANSFER_TIMEOUT`], every engine fetch into a mirror) is
+/// provably not a live child's.
+async fn fetch_into_mirror_within(
+    program: impl AsRef<std::ffi::OsStr>,
+    deadline: std::time::Duration,
+    source: &MergeSource,
+    url: &str,
+    refspec: &str,
+    resolve_ref: &str,
+) -> Result<String, MergeError> {
+    crate::snapshots::remove_stale_git_locks(
+        &source.mirror,
+        GIT_TRANSFER_TIMEOUT + std::time::Duration::from_secs(60),
+    );
+    let mut command = crate::snapshots::git_command_for(program);
+    if let Some((key, value)) = source
+        .token
+        .as_deref()
+        .and_then(|token| auth_header_for_remote(url, token, source.forge_host.as_deref()))
+    {
+        // Staged in the environment: the value is a live token, and command
+        // lines are world-readable through process listings.
+        crate::snapshots::stage_git_auth_header(&mut command, &key, &value);
+    }
+    command
+        .arg("--git-dir")
+        .arg(&source.mirror)
+        .args(["fetch", "--quiet", "--no-tags"])
+        .arg(url)
+        .arg(refspec);
+    // `what` names the fetch and the deadline, the message an operator sees
+    // for a stalled forge: "git fetch timed out after 1800s: killed the hung
+    // git process".
+    let output = Box::pin(preloop_observability::deadline::run_command(
+        command,
+        deadline,
+        "git fetch",
+    ))
+    .await
+    .map_err(|error| MergeError::Fetch {
+        refspec: refspec.to_owned(),
+        url: crate::snapshots::sanitize_remote_url(url),
+        message: error.to_string(),
+    })?;
+    if !output.status.success() {
+        let message = sanitized_fetch_error(
+            url,
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        );
+        return Err(MergeError::Fetch {
+            refspec: refspec.to_owned(),
+            url: crate::snapshots::sanitize_remote_url(url),
+            message,
+        });
+    }
+    rev_parse(&source.mirror, resolve_ref).await
+}
+
+/// Fetch the current base tip (and the head, when it lives on the remote)
+/// into `source.mirror`, resolving both parents.
+///
+/// The base is always the *current* tip of `refs/heads/<base_branch>` — never
+/// a payload's `base.sha`, which is the tip at webhook time and can already be
+/// stale.
+pub async fn fetch_inputs(
+    source: &MergeSource,
+    request: &MergeRequest,
+) -> Result<MergeParents, MergeError> {
+    ensure_mirror(&source.mirror).await?;
+    let base_source_ref = format!("refs/heads/{}", request.base_branch);
+    let base_local_ref = format!("refs/preloop/merge/base/{}", request.base_branch);
+    let base_sha = match &source.fetch_url {
+        Some(url) => {
+            fetch_into_mirror(
+                source,
+                url,
+                &format!("+{base_source_ref}:{base_local_ref}"),
+                &base_local_ref,
+            )
+            .await
+            .map_err(|error| match error {
+                // "couldn't find remote ref" is a missing branch, not a
+                // transient fetch failure: re-running cannot create it.
+                MergeError::Fetch {
+                    message,
+                    url: sanitized,
+                    ..
+                } if message.contains("couldn't find remote ref") => {
+                    MergeError::BaseBranchMissing {
+                        branch: request.base_branch.clone(),
+                        url: sanitized,
+                    }
+                }
+                other => other,
+            })?
+        }
+        None => {
+            // Local-only source: the mirror's own branch first, then the
+            // namespaced ref a previous fetch left behind.
+            let mut resolved = None;
+            for candidate in [base_source_ref.as_str(), base_local_ref.as_str()] {
+                if let Some(sha) = resolve_commit(&source.mirror, candidate).await {
+                    resolved = Some(sha);
+                    break;
+                }
+            }
+            resolved.ok_or_else(|| MergeError::BaseBranchMissing {
+                branch: request.base_branch.clone(),
+                url: source.mirror.display().to_string(),
+            })?
+        }
+    };
+
+    let head_sha = match &request.head {
+        MergeHead::Commit(sha) => {
+            if !is_object_id(sha) {
+                return Err(MergeError::MissingCommit {
+                    sha: sha.clone(),
+                    repository: source.mirror.display().to_string(),
+                });
+            }
+            if commit_present(&source.mirror, sha).await {
+                sha.clone()
+            } else if let Some(url) = &source.fetch_url {
+                let commit_ref = format!("{sha}^{{commit}}");
+                fetch_into_mirror(source, url, sha, &commit_ref).await?
+            } else {
+                return Err(MergeError::MissingCommit {
+                    sha: sha.clone(),
+                    repository: source.mirror.display().to_string(),
+                });
+            }
+        }
+        MergeHead::Branch(name) => {
+            let source_ref = format!("refs/heads/{name}");
+            let local_ref = format!("refs/preloop/merge/heads/{name}");
+            let url = source
+                .fetch_url
+                .as_deref()
+                .ok_or_else(|| MergeError::MissingCommit {
+                    sha: source_ref.clone(),
+                    repository: source.mirror.display().to_string(),
+                })?;
+            fetch_into_mirror(
+                source,
+                url,
+                &format!("+{source_ref}:{local_ref}"),
+                &local_ref,
+            )
+            .await?
+        }
+        MergeHead::PullRef(number) => {
+            let source_ref = format!("refs/pull/{number}/head");
+            let local_ref = format!("refs/preloop/merge/pull/{number}/head");
+            let url = source
+                .fetch_url
+                .as_deref()
+                .ok_or_else(|| MergeError::MissingCommit {
+                    sha: source_ref.clone(),
+                    repository: source.mirror.display().to_string(),
+                })?;
+            fetch_into_mirror(
+                source,
+                url,
+                &format!("+{source_ref}:{local_ref}"),
+                &local_ref,
+            )
+            .await?
+        }
+    };
+
+    for (label, sha) in [("base", &base_sha), ("head", &head_sha)] {
+        if !is_object_id(sha) {
+            return Err(MergeError::Git {
+                operation: "resolve merge parents".to_owned(),
+                message: format!("{label} did not resolve to a commit id (`{sha}`)"),
+            });
+        }
+    }
+    Ok(MergeParents {
+        repository: request.repository.clone(),
+        base_sha,
+        head_sha,
+    })
+}
+
+/// Parse `git merge-tree --write-tree --name-only -z` output.
+///
+/// The first NUL-separated token is the written tree; the following tokens are
+/// conflicted paths, terminated by an empty token (git then appends
+/// conflict-type records, which the caller ignores).
+fn parse_merge_tree_output(stdout: &[u8]) -> Option<(String, Vec<String>)> {
+    let mut parts = stdout.split(|byte| *byte == 0);
+    let tree = parts.next()?;
+    let tree = String::from_utf8_lossy(tree).trim().to_owned();
+    if !is_object_id(&tree) {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for part in parts {
+        if part.is_empty() {
+            break;
+        }
+        paths.push(String::from_utf8_lossy(part).into_owned());
+    }
+    Some((tree, paths))
+}
+
+/// Build the merge commit inside `served` from commits visible to it.
+///
+/// `served` must see both parents' objects — either it is the mirror itself,
+/// or [`link_mirror`] pointed it at the mirror. The merge commit is written
+/// into `served`; a conflict writes nothing.
+pub async fn merge_in(served: &Path, parents: &MergeParents) -> Result<MergeOutcome, MergeError> {
+    for sha in [&parents.base_sha, &parents.head_sha] {
+        if !commit_present(served, sha).await {
+            return Err(MergeError::MissingCommit {
+                sha: sha.clone(),
+                repository: served.display().to_string(),
+            });
+        }
+    }
+
+    let mut command = git_command();
+    command
+        .arg("--git-dir")
+        .arg(served)
+        .args(["merge-tree", "--write-tree", "--name-only", "-z"])
+        .arg(&parents.base_sha)
+        .arg(&parents.head_sha);
+    // Merging two large trees is real compute over local objects.
+    let output = git_output_within(command, "merge-tree", GIT_WORK_TIMEOUT).await?;
+    let parsed = parse_merge_tree_output(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    match (output.status.success(), output.status.code(), parsed) {
+        // Clean merge: one tree, no conflicts.
+        (true, _, Some((tree, _))) => return finish_merge(served, tree, parents).await,
+        // A conflict exits 1 with a real tree and the conflicted paths.
+        (false, Some(1), Some((_, paths))) if !paths.is_empty() => {
+            let mut paths = paths;
+            paths.sort();
+            paths.dedup();
+            Ok(MergeOutcome::Conflict {
+                base_sha: parents.base_sha.clone(),
+                head_sha: parents.head_sha.clone(),
+                paths,
+            })
+        }
+        // Anything else is a genuine git failure: a bad revision exits 1 with
+        // no tree on stdout and the reason on stderr.
+        _ => Err(MergeError::Git {
+            operation: "merge-tree".to_owned(),
+            message: if stderr.is_empty() {
+                "no output".to_owned()
+            } else {
+                stderr
+            },
+        }),
+    }
+}
+
+/// Commit a merged tree with both parents and the fixed preloop identity.
+async fn finish_merge(
+    served: &Path,
+    tree: String,
+    parents: &MergeParents,
+) -> Result<MergeOutcome, MergeError> {
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(served)
+        .args(["commit-tree", &tree])
+        .args(["-p", &parents.base_sha, "-p", &parents.head_sha])
+        .args([
+            "-m",
+            &format!(
+                "preloop test merge of {} into {}",
+                parents.head_sha, parents.base_sha
+            ),
+        ])
+        .env("GIT_AUTHOR_NAME", MERGE_IDENTITY_NAME)
+        .env("GIT_AUTHOR_EMAIL", MERGE_IDENTITY_EMAIL)
+        .env("GIT_AUTHOR_DATE", MERGE_IDENTITY_DATE)
+        .env("GIT_COMMITTER_NAME", MERGE_IDENTITY_NAME)
+        .env("GIT_COMMITTER_EMAIL", MERGE_IDENTITY_EMAIL)
+        .env("GIT_COMMITTER_DATE", MERGE_IDENTITY_DATE);
+    let output = run_git_within(command, "commit-tree", GIT_WORK_TIMEOUT).await?;
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !is_object_id(&sha) {
+        return Err(MergeError::Git {
+            operation: "commit-tree".to_owned(),
+            message: format!("git returned invalid commit id `{sha}`"),
+        });
+    }
+    Ok(MergeOutcome::Merged(MergedMerge {
+        repository: parents.repository.clone(),
+        sha,
+        tree,
+        base_sha: parents.base_sha.clone(),
+        head_sha: parents.head_sha.clone(),
+    }))
+}
+
+/// Point `served` at `mirror`'s object store through `objects/info/alternates`.
+///
+/// The merge commit and its tree live in `served`; its parents' objects (the
+/// base tip's history) stay in the mirror, exactly like the local snapshot's
+/// alternate to the shared object cache. Idempotent, and a no-op when both
+/// paths are the same repository.
+pub async fn link_mirror(served: &Path, mirror: &Path) -> Result<(), MergeError> {
+    let served = tokio::fs::canonicalize(served)
+        .await
+        .map_err(|error| MergeError::Io {
+            path: served.display().to_string(),
+            message: error.to_string(),
+        })?;
+    let mirror = tokio::fs::canonicalize(mirror)
+        .await
+        .map_err(|error| MergeError::Io {
+            path: mirror.display().to_string(),
+            message: error.to_string(),
+        })?;
+    if served == mirror {
+        return Ok(());
+    }
+    let objects = mirror.join("objects");
+    let alternates_path = served.join("objects").join("info").join("alternates");
+    let mut alternates: Vec<String> = match tokio::fs::read_to_string(&alternates_path).await {
+        Ok(existing) => existing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(MergeError::Io {
+                path: alternates_path.display().to_string(),
+                message: error.to_string(),
+            });
+        }
+    };
+    let objects_text = objects.to_string_lossy().into_owned();
+    let already_present = alternates.iter().any(|line| {
+        line == &objects_text
+            || std::fs::canonicalize(line).is_ok_and(|canonical| canonical == objects)
+    });
+    if !already_present {
+        alternates.push(objects_text);
+    }
+    if let Some(parent) = alternates_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| MergeError::Io {
+                path: parent.display().to_string(),
+                message: error.to_string(),
+            })?;
+    }
+    let mut body = alternates.join("\n");
+    body.push('\n');
+    tokio::fs::write(&alternates_path, body)
+        .await
+        .map_err(|error| MergeError::Io {
+            path: alternates_path.display().to_string(),
+            message: error.to_string(),
+        })
+}
+
+/// Publish the merge in `served` so jobs can fetch it: `refs/heads/snapshot`
+/// (plus `refs/pull/<n>/merge` when the number is known), HEAD, and the
+/// upload-pack permissions a shallow single-commit fetch needs.
+pub async fn publish_merge(
+    served: &Path,
+    merge: &MergedMerge,
+    pull_request_number: Option<u64>,
+) -> Result<(), MergeError> {
+    let mut refs: Vec<(String, String)> =
+        vec![("refs/heads/snapshot".to_owned(), merge.sha.clone())];
+    if let Some(number) = pull_request_number {
+        refs.push((format!("refs/pull/{number}/merge"), merge.sha.clone()));
+    }
+    for (name, target) in refs {
+        let mut command = git_command();
+        command
+            .arg("--git-dir")
+            .arg(served)
+            .args(["update-ref", &name, &target]);
+        run_git_within(command, &format!("update-ref {name}"), GIT_CONTROL_TIMEOUT).await?;
+    }
+    for (operation, args) in [
+        (
+            "symbolic-ref HEAD",
+            vec!["symbolic-ref", "HEAD", "refs/heads/snapshot"],
+        ),
+        (
+            "config uploadpack.allowReachableSHA1InWant",
+            vec!["config", "uploadpack.allowReachableSHA1InWant", "true"],
+        ),
+        (
+            "config uploadpack.allowTipSHA1InWant",
+            vec!["config", "uploadpack.allowTipSHA1InWant", "true"],
+        ),
+        (
+            "config uploadpack.allowFilter",
+            vec!["config", "uploadpack.allowFilter", "true"],
+        ),
+    ] {
+        let mut command = git_command();
+        command.arg("--git-dir").arg(served).args(&args);
+        run_git_within(command, operation, GIT_CONTROL_TIMEOUT).await?;
+    }
+    Ok(())
+}
+
+/// Fetch the merge inputs into `source.mirror`, build the merge inside
+/// `served`, and publish it there.
+///
+/// `served` must not be the mirror unless the caller wants the merge written
+/// into the mirror; when they differ, `served` is linked to the mirror's
+/// objects first.
+pub async fn build_merge(
+    source: &MergeSource,
+    request: &MergeRequest,
+    served: &Path,
+) -> Result<MergeOutcome, MergeError> {
+    let parents = fetch_inputs(source, request).await?;
+    let distinct = !same_repository(served, &source.mirror).await;
+    if distinct {
+        link_mirror(served, &source.mirror).await?;
+    }
+    let outcome = merge_in(served, &parents).await?;
+    // When the merge is built straight into the mirror it stays unreferenced
+    // until a run's served repository publishes it: the mirror is shared and
+    // must not advertise a `snapshot` ref of its own.
+    if distinct && let MergeOutcome::Merged(merge) = &outcome {
+        publish_merge(served, merge, request.pull_request_number).await?;
+    }
+    Ok(outcome)
+}
+
+/// Whether two repository paths name the same directory.
+async fn same_repository(left: &Path, right: &Path) -> bool {
+    match (
+        tokio::fs::canonicalize(left).await,
+        tokio::fs::canonicalize(right).await,
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+fn repository_mirror_relative(shared: &SharedState, repository: &str) -> PathBuf {
+    use sha2::Digest;
+
+    let server_url = shared.state.github_urls.server_url.trim_end_matches('/');
+    let key = format!(
+        "{:x}",
+        sha2::Sha256::digest(format!("{server_url}/{repository}").as_bytes())
+    );
+    PathBuf::from("checkout-cache")
+        .join("repositories")
+        .join(format!("merge-{key}.git"))
+}
+
+/// Prepare the engine mirror a webhook delivery's merge is built in, together
+/// with the forge coordinates to fetch from.
+///
+/// Mirrors are keyed per repository under the checkout cache's repositories
+/// root, so the existing retention sweep bounds them. A run serving a merge
+/// from a mirror publishes `refs/preloop/runs/<run_id>` there (see
+/// [`attach_prebuilt_merge`]) and the release path deletes it, which keeps the
+/// size sweep from evicting a mirror a live run still reads through its
+/// alternate.
+pub async fn webhook_merge_source(
+    shared: &SharedState,
+    repository: &str,
+) -> Result<MergeSource, MergeError> {
+    let server_url = shared.state.github_urls.server_url.trim_end_matches('/');
+    let mirror = shared
+        .state
+        .state_dir
+        .join(repository_mirror_relative(shared, repository));
+    ensure_mirror(&mirror).await?;
+    let forge_host = reqwest::Url::parse(server_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    Ok(MergeSource {
+        mirror,
+        fetch_url: Some(format!("{server_url}/{repository}.git")),
+        token: crate::snapshots::forge_read_token(shared, repository).await,
+        forge_host,
+    })
+}
+
+/// Build the submission's `prebuilt_merge` record for a merge that was built
+/// in `mirror`.
+///
+/// The record is what a run's `submit_run_inner` needs to serve the merge
+/// from the engine: the commit, its tree and parents, and the mirror's
+/// state-directory-relative path. `None` when `mirror` is not under the
+/// state directory (nothing could serve it).
+pub fn prebuilt_merge_record(
+    shared: &SharedState,
+    mirror: &Path,
+    merge: &MergedMerge,
+    pull_request_number: Option<u64>,
+) -> Option<preloop_gha_protocol::PrebuiltMerge> {
+    let relative = mirror.strip_prefix(&shared.state.state_dir).ok()?;
+    let expected = repository_mirror_relative(shared, &merge.repository);
+    if relative != expected.as_path() {
+        return None;
+    }
+    Some(preloop_gha_protocol::PrebuiltMerge {
+        sha: merge.sha.clone(),
+        tree: merge.tree.clone(),
+        base_sha: merge.base_sha.clone(),
+        head_sha: merge.head_sha.clone(),
+        repository: merge.repository.clone(),
+        mirror_repository: relative.to_string_lossy().to_string(),
+        pull_request_number,
+    })
+}
+
+/// Create the run's engine-served repository (`snapshots/<run_id>`), which
+/// `snapshot_git_http` serves to the run's jobs. Fails when it already exists.
+async fn create_served_repository(state_dir: &Path, run_id: RunId) -> Result<PathBuf, MergeError> {
+    let served = state_dir.join("snapshots").join(run_id.to_string());
+    if served.exists() {
+        return Err(MergeError::Io {
+            path: served.display().to_string(),
+            message: "served snapshot repository already exists".to_owned(),
+        });
+    }
+    if let Some(parent) = served.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| MergeError::Io {
+                path: parent.display().to_string(),
+                message: error.to_string(),
+            })?;
+    }
+    let mut init = git_command();
+    init.args(["init", "--bare", "--quiet", "--template="])
+        .arg(&served);
+    let output =
+        match git_output_within(init, "initialize served repository", GIT_CONTROL_TIMEOUT).await {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(MergeError::Io {
+                    path: served.display().to_string(),
+                    message: error.to_string(),
+                });
+            }
+        };
+    if !output.status.success() {
+        return Err(MergeError::Io {
+            path: served.display().to_string(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    Ok(served)
+}
+
+/// Publish this run's ownership ref in a prunable mirror and return the
+/// mirror's state-directory-relative path.
+///
+/// Mirrors under the checkout cache are evicted by idle age and by the size
+/// sweep; the sweep treats a repository holding any `refs/preloop/runs/*` as
+/// live, so the ref keeps a mirror alive while a run's served repository can
+/// still fetch through its alternate. `release_remote_checkout_snapshot`
+/// deletes the ref when the run terminalizes. `None` means the mirror is not
+/// prunable (the workspace's object cache), so no ref is needed.
+async fn protect_mirror_for_run(
+    shared: &SharedState,
+    run_id: RunId,
+    mirror: &Path,
+    merge_sha: &str,
+) -> Option<String> {
+    let state_dir = tokio::fs::canonicalize(&shared.state.state_dir)
+        .await
+        .ok()?;
+    let mirror = tokio::fs::canonicalize(mirror).await.ok()?;
+    let relative = mirror.strip_prefix(&state_dir).ok()?;
+    if !mirror.starts_with(state_dir.join("checkout-cache")) {
+        return None;
+    }
+    let mut command = git_command();
+    command.arg("--git-dir").arg(&mirror).args([
+        "update-ref",
+        &format!("refs/preloop/runs/{run_id}"),
+        merge_sha,
+    ]);
+    let output =
+        git_output_within(command, "publish merge-mirror run ref", GIT_CONTROL_TIMEOUT).await;
+    match output {
+        Ok(output) if output.status.success() => Some(relative.to_string_lossy().to_string()),
+        Ok(output) => {
+            warn!(
+                %run_id,
+                path = %mirror.display(),
+                error = %String::from_utf8_lossy(&output.stderr).trim(),
+                "failed to publish the run's merge-mirror ownership ref; the mirror may be evicted early"
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                %run_id,
+                path = %mirror.display(),
+                %error,
+                "failed to publish the run's merge-mirror ownership ref; the mirror may be evicted early"
+            );
+            None
+        }
+    }
+}
+
+/// Attach a built merge to a run's workspace snapshot.
+///
+/// The head snapshot is carried forward (its tree stays the tree of the head
+/// the run's change set is measured against) with `commit_sha` moved to the
+/// merge — the commit the run actually checks out — and `merge` recorded for
+/// payload labelling. A local snapshot's repository already serves the run; a
+/// remote or absent one gets a fresh engine-served repository, so the merge is
+/// fetchable even when the checkout cache is off.
+pub async fn attach_merge(
+    shared: &SharedState,
+    run_id: RunId,
+    mirror: &Path,
+    merge: &MergedMerge,
+    head_snapshot: Option<WorkspaceSnapshot>,
+) -> Result<WorkspaceSnapshot, MergeError> {
+    let state_dir = &shared.state.state_dir;
+    let (served, mut snapshot) = match head_snapshot {
+        Some(head) if head.source == SnapshotSource::LocalWorkspace => {
+            let served = state_dir.join(&head.repository);
+            (served, head)
+        }
+        Some(head) => (create_served_repository(state_dir, run_id).await?, head),
+        None => {
+            let served = create_served_repository(state_dir, run_id).await?;
+            let snapshot = WorkspaceSnapshot {
+                commit_sha: merge.sha.clone(),
+                tree_sha: merge.tree.clone(),
+                head_sha: Some(merge.head_sha.clone()),
+                repository: format!("snapshots/{run_id}"),
+                default_branch: None,
+                before_sha: None,
+                snapshot_timing: None,
+                storage_repository: None,
+                source: SnapshotSource::SelfBuiltMerge,
+                cache_namespace: None,
+                // The merge commit exists only in the engine, but the LFS
+                // objects it references still live upstream. Record the
+                // repository so a missing blob can be fetched on demand.
+                upstream_repository: Some(merge.repository.clone()),
+                upstream_repository_id: None,
+                upstream_private: None,
+                merge: None,
+            };
+            (served, snapshot)
+        }
+    };
+    link_mirror(&served, mirror).await?;
+    publish_merge(&served, merge, None).await?;
+    let mirror_repository = protect_mirror_for_run(shared, run_id, mirror, &merge.sha).await;
+    snapshot.commit_sha = merge.sha.clone();
+    snapshot.merge = Some(SnapshotMerge {
+        sha: merge.sha.clone(),
+        base_sha: merge.base_sha.clone(),
+        head_sha: merge.head_sha.clone(),
+        mirror_repository,
+    });
+    if snapshot.source != SnapshotSource::LocalWorkspace {
+        snapshot.source = SnapshotSource::SelfBuiltMerge;
+        snapshot.storage_repository = None;
+    }
+    Ok(snapshot)
+}
+
+/// Validate a `WorkflowSubmission::prebuilt_merge` and turn it into the run's
+/// served snapshot.
+///
+/// Nothing in the submission is trusted: the mirror path must be a plain
+/// state-directory-relative path, the merge commit must exist there with
+/// exactly the claimed tree and parents, and the served repository is created
+/// under `snapshots/<run_id>` and linked to the mirror.
+pub async fn attach_prebuilt_merge(
+    shared: &SharedState,
+    run_id: RunId,
+    prebuilt: &preloop_gha_protocol::PrebuiltMerge,
+) -> Result<WorkspaceSnapshot, MergeError> {
+    let state_dir = tokio::fs::canonicalize(&shared.state.state_dir)
+        .await
+        .map_err(|error| MergeError::Io {
+            path: shared.state.state_dir.display().to_string(),
+            message: error.to_string(),
+        })?;
+    let relative = Path::new(&prebuilt.mirror_repository);
+    let plain_relative = !relative.is_absolute()
+        && !prebuilt.mirror_repository.is_empty()
+        && relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if !plain_relative {
+        return Err(MergeError::InvalidPrebuilt(format!(
+            "mirror repository `{}` is not a plain state-relative path",
+            prebuilt.mirror_repository
+        )));
+    }
+    let expected = repository_mirror_relative(shared, &prebuilt.repository);
+    if relative != expected.as_path() {
+        return Err(MergeError::InvalidPrebuilt(format!(
+            "mirror repository `{}` is not the cache for `{}`",
+            prebuilt.mirror_repository, prebuilt.repository
+        )));
+    }
+    let mirror = tokio::fs::canonicalize(state_dir.join(relative))
+        .await
+        .map_err(|error| {
+            MergeError::InvalidPrebuilt(format!(
+                "mirror repository `{}` is not readable: {error}",
+                prebuilt.mirror_repository
+            ))
+        })?;
+    if !mirror.starts_with(&state_dir) {
+        return Err(MergeError::InvalidPrebuilt(format!(
+            "mirror repository `{}` escapes the state directory",
+            prebuilt.mirror_repository
+        )));
+    }
+    if !commit_present(&mirror, &prebuilt.sha).await {
+        return Err(MergeError::InvalidPrebuilt(format!(
+            "merge commit {} is not present in `{}`",
+            prebuilt.sha, prebuilt.mirror_repository
+        )));
+    }
+    let parents = rev_parse(&mirror, &format!("{}^@", prebuilt.sha))
+        .await
+        .map_err(|_| {
+            MergeError::InvalidPrebuilt(format!("merge commit {} has no parents", prebuilt.sha))
+        })?;
+    let parents: Vec<&str> = parents.split_whitespace().collect();
+    if parents.len() != 2
+        || !parents[0].eq_ignore_ascii_case(&prebuilt.base_sha)
+        || !parents[1].eq_ignore_ascii_case(&prebuilt.head_sha)
+    {
+        return Err(MergeError::InvalidPrebuilt(format!(
+            "merge commit {} does not have parents [{}, {}]",
+            prebuilt.sha, prebuilt.base_sha, prebuilt.head_sha
+        )));
+    }
+    let tree = rev_parse(&mirror, &format!("{}^{{tree}}", prebuilt.sha)).await?;
+    if !tree.eq_ignore_ascii_case(&prebuilt.tree) {
+        return Err(MergeError::InvalidPrebuilt(format!(
+            "merge commit {} has tree {tree}, not {}",
+            prebuilt.sha, prebuilt.tree
+        )));
+    }
+
+    let merge = MergedMerge {
+        repository: prebuilt.repository.clone(),
+        sha: prebuilt.sha.clone(),
+        tree: tree.clone(),
+        base_sha: prebuilt.base_sha.clone(),
+        head_sha: prebuilt.head_sha.clone(),
+    };
+    let served = create_served_repository(&state_dir, run_id).await?;
+    link_mirror(&served, &mirror).await?;
+    publish_merge(&served, &merge, prebuilt.pull_request_number).await?;
+    let mirror_repository = protect_mirror_for_run(shared, run_id, &mirror, &merge.sha).await;
+    Ok(WorkspaceSnapshot {
+        commit_sha: prebuilt.sha.clone(),
+        tree_sha: tree,
+        head_sha: Some(prebuilt.head_sha.clone()),
+        repository: format!("snapshots/{run_id}"),
+        default_branch: None,
+        before_sha: None,
+        snapshot_timing: None,
+        storage_repository: None,
+        source: SnapshotSource::SelfBuiltMerge,
+        cache_namespace: None,
+        // A prebuilt merge is still a merge of two upstream commits; keep the
+        // repository so its LFS objects remain fetchable on demand.
+        upstream_repository: Some(prebuilt.repository.clone()),
+        upstream_repository_id: None,
+        upstream_private: None,
+        merge: Some(SnapshotMerge {
+            sha: prebuilt.sha.clone(),
+            base_sha: prebuilt.base_sha.clone(),
+            head_sha: prebuilt.head_sha.clone(),
+            mirror_repository,
+        }),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The merge builder's forge fetch is the audit's second gap: a forge that
+    /// accepted the connection and then stalled kept the delivery task (and
+    /// `fetch_inputs`, `build_merge`, and the PR's test merge) alive forever.
+    ///
+    /// `fetch_into_mirror` is this same body with [`GIT_TRANSFER_TIMEOUT`]; the
+    /// deadline is a parameter here so the test can run in milliseconds.
+    #[tokio::test]
+    async fn a_hung_git_ends_the_mirror_fetch_at_the_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, pid_file) = crate::snapshots::bounded_git_tests::hanging_git(temp.path());
+        let mirror = temp.path().join("merge-mirror.git");
+        std::fs::create_dir_all(&mirror).unwrap();
+        let source = MergeSource {
+            mirror: mirror.clone(),
+            fetch_url: Some("https://github.com/owner/repo.git".to_owned()),
+            token: None,
+            forge_host: None,
+        };
+        let error = fetch_into_mirror_within(
+            program,
+            std::time::Duration::from_millis(750),
+            &source,
+            "https://github.com/owner/repo.git",
+            "refs/heads/main",
+            "refs/preloop/merge/base/main",
+        )
+        .await
+        .expect_err("a git that never exits must hit the deadline");
+        let message = format!("{error}");
+        assert!(
+            message.contains("git fetch timed out after 750ms"),
+            "the error must name the dependency and the deadline: {message}"
+        );
+        // A mirror has no engine-level lock (only Git's own per-ref locks, and
+        // a killed fetch leaves none): the next delivery may fetch into it
+        // immediately.
+        let leftovers: Vec<String> = std::fs::read_dir(&mirror)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".lock"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a bounded fetch must not leave locks behind: {leftovers:?}"
+        );
+        let pid = crate::snapshots::bounded_git_tests::wait_for_pid(&pid_file).await;
+        assert!(
+            crate::snapshots::bounded_git_tests::wait_until_finished(
+                &pid,
+                std::time::Duration::from_secs(10)
+            )
+            .await,
+            "the fake git child {pid} outlived the deadline"
+        );
+    }
+
+    /// A `git` killed at its deadline leaves the lock file it held behind —
+    /// `SIGKILL` is uncatchable — and every later fetch into that mirror would
+    /// fail with "Unable to create '…lock': File exists". The mirror has no
+    /// engine lock, so only a lock older than any possible fetch is provably
+    /// dead; that sweep must run before the fetch, while a young lock (which a
+    /// concurrent delivery may still hold) must survive.
+    #[tokio::test]
+    async fn a_dead_lock_from_a_killed_mirror_fetch_is_swept_before_the_next_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, _pid_file) = crate::snapshots::bounded_git_tests::hanging_git(temp.path());
+        let mirror = temp.path().join("merge-mirror.git");
+        std::fs::create_dir_all(mirror.join("refs/preloop/merge/base")).unwrap();
+        let dead = mirror.join("refs/preloop/merge/base/main.lock");
+        let live = mirror.join("refs/preloop/merge/base/other.lock");
+        std::fs::write(&dead, "").unwrap();
+        std::fs::write(&live, "").unwrap();
+        let age = GIT_TRANSFER_TIMEOUT + std::time::Duration::from_secs(60);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        filetime::set_file_mtime(
+            &dead,
+            filetime::FileTime::from_unix_time(now - (age.as_secs() as i64) - 60, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(&live, filetime::FileTime::from_unix_time(now, 0)).unwrap();
+
+        let source = MergeSource {
+            mirror: mirror.clone(),
+            fetch_url: Some("https://github.com/owner/repo.git".to_owned()),
+            token: None,
+            forge_host: None,
+        };
+        let _ = fetch_into_mirror_within(
+            program,
+            std::time::Duration::from_millis(750),
+            &source,
+            "https://github.com/owner/repo.git",
+            "refs/heads/main",
+            "refs/preloop/merge/base/main",
+        )
+        .await
+        .expect_err("a git that never exits must hit the deadline");
+
+        assert!(
+            !dead.exists(),
+            "a lock older than any possible fetch must be swept before the fetch"
+        );
+        assert!(
+            live.exists(),
+            "a young lock may belong to a concurrent delivery and must survive"
+        );
+    }
+
+    #[test]
+    fn remote_auth_is_scoped_to_the_origin_port() {
+        assert!(
+            auth_header_for_remote("https://github.com:8443/acme/repo.git", "token", None)
+                .is_none()
+        );
+        assert!(
+            auth_header_for_remote(
+                "https://ghe.example:9443/acme/repo.git",
+                "token",
+                Some("ghe.example"),
+            )
+            .is_none()
+        );
+        let (key, _) = auth_header_for_remote(
+            "https://ghe.example:9443/acme/repo.git",
+            "token",
+            Some("ghe.example:9443"),
+        )
+        .expect("explicitly configured origin");
+        assert_eq!(key, "http.https://ghe.example:9443/.extraheader");
+    }
+
+    fn parse(bytes: &[u8]) -> Option<(String, Vec<String>)> {
+        parse_merge_tree_output(bytes)
+    }
+
+    /// A real mirror holding a two-parent merge of `owner/repo`, plus the
+    /// state that serves it, so both attach paths run their git plumbing.
+    async fn merge_fixture() -> (tempfile::TempDir, Arc<SharedState>, PathBuf, MergedMerge) {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = Arc::new(SharedState {
+            state: crate::AppState::new(temp.path().join("state"))
+                .await
+                .unwrap(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        let mirror = shared
+            .state
+            .state_dir
+            .join(repository_mirror_relative(&shared, "owner/repo"));
+        ensure_mirror(&mirror).await.unwrap();
+
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "preloop-test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(work.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "topic"]);
+        std::fs::write(work.join("head.txt"), "head\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "head"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(work.join("main.txt"), "main\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "main"]);
+        git(&["merge", "-q", "--no-ff", "topic", "-m", "merge"]);
+        let merge_sha = git(&["rev-parse", "HEAD"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        let parents = git(&["rev-list", "--parents", "-n", "1", "HEAD"]);
+        let parents: Vec<&str> = parents.split_whitespace().skip(1).collect();
+        assert_eq!(parents.len(), 2, "fixture merge must have two parents");
+        git(&[
+            "push",
+            "-q",
+            mirror.to_str().unwrap(),
+            "main:refs/heads/main",
+            "topic:refs/heads/topic",
+        ]);
+        let merge = MergedMerge {
+            repository: "owner/repo".to_owned(),
+            sha: merge_sha,
+            tree,
+            base_sha: parents[0].to_owned(),
+            head_sha: parents[1].to_owned(),
+        };
+        (temp, shared, mirror, merge)
+    }
+
+    /// A self-built merge's commit lives only in the engine, but its LFS
+    /// objects are still upstream. Both attach paths must record the upstream
+    /// repository, or an LFS miss is served as a 404 instead of being fetched.
+    #[tokio::test]
+    async fn self_built_merge_snapshots_record_the_upstream_repository() {
+        let (_temp, shared, mirror, merge) = merge_fixture().await;
+
+        let attached = attach_merge(&shared, RunId::new(), &mirror, &merge, None)
+            .await
+            .expect("attach_merge serves the built merge");
+        assert_eq!(attached.source, SnapshotSource::SelfBuiltMerge);
+        assert_eq!(attached.upstream_repository.as_deref(), Some("owner/repo"));
+        assert_eq!(attached.upstream_repository_id, None);
+        assert_eq!(
+            attached.upstream_private, None,
+            "visibility stays unknown; the LFS route treats that as public"
+        );
+
+        let prebuilt = prebuilt_merge_record(&shared, &mirror, &merge, Some(7))
+            .expect("the mirror is under the state directory");
+        let attached = attach_prebuilt_merge(&shared, RunId::new(), &prebuilt)
+            .await
+            .expect("attach_prebuilt_merge serves the prebuilt merge");
+        assert_eq!(attached.source, SnapshotSource::SelfBuiltMerge);
+        assert_eq!(attached.upstream_repository.as_deref(), Some("owner/repo"));
+        assert_eq!(attached.upstream_repository_id, None);
+        assert_eq!(attached.upstream_private, None);
+    }
+
+    #[test]
+    fn parses_a_clean_merge_tree() {
+        let tree = "a".repeat(40);
+        let output = format!("{tree}\0");
+        let (parsed_tree, paths) = parse(output.as_bytes()).expect("clean output parses");
+        assert_eq!(parsed_tree, tree);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn parses_conflicted_paths_and_stops_at_the_separator() {
+        let tree = "b".repeat(40);
+        let mut output = Vec::new();
+        output.extend_from_slice(tree.as_bytes());
+        output.push(0);
+        output.extend_from_slice(b"src/a.rs\0src/b.rs\0");
+        // Conflict-type records follow an empty token; they are not paths.
+        output.extend_from_slice(b"\x001\0src/a.rs\0CONFLICT (content)\0");
+        let (parsed_tree, paths) = parse(&output).expect("conflict output parses");
+        assert_eq!(parsed_tree, tree);
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
+    fn rejects_output_that_does_not_start_with_a_tree() {
+        assert!(parse(b"merge-tree: not something we can merge\n").is_none());
+        assert!(parse(b"").is_none());
+    }
+}

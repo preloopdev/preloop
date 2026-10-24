@@ -1,0 +1,98 @@
+---
+title: "GitHub-compatible REST API"
+description: "Dispatch workflows and inspect or control runs through the GitHub-shaped API served by Preloop."
+---
+
+Preloop serves a small GitHub-compatible REST surface for integrations that already call GitHub Actions. Point the client at the engine origin—not at `/api/v3`—and authenticate every request.
+
+## Base URL and authentication
+
+Use an engine URL such as:
+
+```text
+https://ci.example.com
+```
+
+The dispatch routes are rooted at `/repos/...`. `PRELOOP_GITHUB_API_URL` is different: it configures the engine's outbound upstream GitHub API (default `https://api.github.com`) and does not change the engine's listening URL.
+
+The accepted `Authorization` schemes are `Bearer` and `token` (scheme names are case-insensitive). The credential chain is:
+
+| Credential | Verification | Actor and trust |
+|---|---|---|
+| Native system token | Constant-time comparison with the engine token | `preloop-system`; `AdminManual` |
+| `PRELOOP_GITHUB_TOKEN` PAT | Constant-time comparison | GitHub user when reachable, otherwise `preloop-pat`; `AdminManual` |
+| Registered App JWT | RS256 signature, registered App ID, and expiry | App bot; `AdminManual` |
+| Installation token minted by this engine | In-memory mint ledger, expiry, exact repository, and permissions | App bot; `AppDispatch` |
+| Other App installation token | Upstream `GET /installation` plus repository-access validation | App bot; `AppDispatch` |
+
+Third-party installation validation is cached by token hash for 60 seconds and fails closed: an upstream refusal is `401`, while an upstream transport or validation failure is `502`. A workflow dispatch requires `actions: write` (or `admin`); a repository dispatch requires `contents: write` (or `admin`). Read endpoints require repository coverage. `AdminManual` and `AppDispatch` can pass repository secrets, subject to the workflow and operator policy.
+
+## Dispatch a workflow
+
+### Workflow dispatch
+
+```http
+POST /repos/OWNER/REPO/actions/workflows/ci.yml/dispatches
+Authorization: Bearer TOKEN
+Content-Type: application/json
+
+{"ref":"main","inputs":{"environment":"staging"}}
+```
+
+`workflow_id` accepts a filename (`ci.yml`), stem (`ci`), or `.github/workflows/ci.yml` path. Numeric workflow IDs are not tracked. Omit `ref` to use the repository's default branch. Branch and tag refs are accepted; a bare name tries a branch and then a tag.
+
+The workflow must declare `workflow_dispatch`; otherwise the response is `409`. Success is `204 No Content`. The request is rejected before a run is created when JSON is malformed or the body/input shape is wrong.
+
+| Status | Meaning |
+|---:|---|
+| `400` | Malformed JSON. |
+| `401` | Missing or invalid credential. |
+| `403` | Repository is inaccessible or the credential lacks `actions: write`. |
+| `404` | Repository, workflow, or ref is not available. |
+| `409` | The workflow has no `workflow_dispatch` trigger. |
+| `422` | Input validation failed. |
+| `502` | Upstream GitHub or workflow/ref lookup failed. |
+
+Input validation follows the workflow declaration. Required inputs must be present; defaults are applied; boolean, number, string, and choice values are converted according to their declared type; and choice values must appear in `options`. Unknown input keys are retained in the event payload.
+
+### Repository dispatch
+
+```http
+POST /repos/OWNER/REPO/dispatches
+Authorization: token TOKEN
+Content-Type: application/json
+
+{"event_type":"deploy","client_payload":{"region":"us-east"}}
+```
+
+`event_type` is required, nonempty, and at most 100 Unicode characters. `client_payload` must be an object when supplied. The event uses the repository's default branch and broadcasts to every workflow whose `on.repository_dispatch.types` matches; an omitted `types` list matches every event type. Success is `204`, including when no workflow matches.
+
+Repository dispatch errors are `400` for malformed JSON, `401` for invalid credentials, `403` for repository or `contents: write` denial, `404` for repository/default-ref failure, `422` for an invalid event type or payload, and `502` for an upstream lookup failure.
+
+## Read workflows and runs
+
+| Method and path | Response |
+|---|---|
+| `GET /repos/OWNER/REPO/actions/workflows` | `200` with `total_count` and `workflows[]`; each item has a stable hashed `id`, name, path, and `state: "active"`. |
+| `GET /repos/OWNER/REPO/actions/runs` | `200` with newest-first `workflow_runs[]`; items include stable ID, native run ID, status, conclusion, and run metadata. |
+
+The run list does not provide GitHub-style pagination or filtering. There is no run-detail route under `/repos/...`; use the native run endpoints for detailed logs and events.
+
+## Rerun, cancel, and job actions
+
+Preloop also serves these GitHub-shaped controls, using the same dispatch authentication and an `actions: write` requirement:
+
+```text
+POST /repos/OWNER/REPO/actions/runs/RUN_ID/rerun
+POST /repos/OWNER/REPO/actions/runs/RUN_ID/rerun-failed-jobs
+POST /repos/OWNER/REPO/actions/runs/RUN_ID/cancel
+POST /repos/OWNER/REPO/actions/jobs/JOB_ID/rerun
+```
+
+These routes use the stable IDs returned by the run listing and return an HTTP error when the run or job is not available.
+
+## Related compatibility surfaces
+
+`/api/v3` is reserved for runner registration, registration-token compatibility, deprecation checks, and authenticated checkout relay paths. It is not the base path for dispatch. The `/_apis`, `/broker`, `/twirp`, and OIDC paths are runner and protocol surfaces, not general-purpose GitHub REST APIs.
+
+Keep the engine origin private or path-filtered. The native management API, runner registration, signed artifact URLs, and job protocol carry credentials and are not substitutes for the public GitHub API. See [Deployment](/control-plane/operate/deploy) and [Security](/control-plane/operate/security) before exposing an engine.

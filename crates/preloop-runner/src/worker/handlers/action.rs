@@ -24,6 +24,20 @@ pub fn run_action<'a>(
     ctx: &'a mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    run_action_nested(uses, with, workspace, ctx, cancel_rx, 0)
+}
+
+/// Run an action step entered at composite nesting `depth`. Composite steps
+/// that re-enter an action pass their own depth plus one, so the cap in
+/// `composite.rs` bounds every cycle, including `./` fallbacks and remote refs.
+pub(crate) fn run_action_nested<'a>(
+    uses: &'a str,
+    with: &'a serde_json::Value,
+    workspace: &'a str,
+    ctx: &'a mut StepContext<'_>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    depth: u32,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         info!("Running action: {uses}");
 
@@ -36,7 +50,8 @@ pub fn run_action<'a>(
             super::container::run_docker_action(uses, with, workspace, ctx).await
         } else if uses.starts_with("./") || uses.starts_with("../") {
             let action_dir = std::path::Path::new(workspace).join(uses);
-            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx, None).await
+            run_action_from_dir_nested(&action_dir, with, workspace, ctx, cancel_rx, None, depth)
+                .await
         } else if uses.starts_with("$/") {
             // Preparation rewrote `$/path` to the workflow repository at its
             // commit and staged it. Unstaged means unresolvable: never fall
@@ -50,24 +65,43 @@ pub fn run_action<'a>(
                 )
             })?;
             let action_dir = std::path::PathBuf::from(action_dir);
-            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx, None).await
+            run_action_from_dir_nested(&action_dir, with, workspace, ctx, cancel_rx, None, depth)
+                .await
         } else {
             let action_dir = resolve_remote_action(uses, workspace, ctx)?;
-            run_action_from_dir(&action_dir, with, workspace, ctx, cancel_rx, Some(uses)).await
+            run_action_from_dir_nested(
+                &action_dir,
+                with,
+                workspace,
+                ctx,
+                cancel_rx,
+                Some(uses),
+                depth,
+            )
+            .await
         }
     })
 }
 
-/// Run an action from a resolved directory.
-pub(crate) async fn run_action_from_dir(
+/// Run an action from a resolved directory at composite nesting `depth`.
+pub(crate) async fn run_action_from_dir_nested(
     action_dir: &std::path::Path,
     with: &serde_json::Value,
     workspace: &str,
     ctx: &mut StepContext<'_>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     action_name: Option<&str>,
+    depth: u32,
 ) -> Result<()> {
     let manifest = super::factory::load_action_manifest(action_dir)?;
+
+    // The action is now running: register its post hook, exactly where the
+    // official runner does — `ActionRunner.RunAsync` registers the post job
+    // step for the Pre and the Main stage once `taskManager.LoadAction` has
+    // returned a definition. A step whose action never resolves or loads, or
+    // whose environment or file commands failed before reaching this handler,
+    // therefore registers nothing and its post hook is skipped.
+    ctx.hooks.register(&ctx.step_id);
 
     match manifest.runs_using.as_str() {
         "node12" | "node16" | "node20" | "node22" | "node24" => {
@@ -89,8 +123,8 @@ pub(crate) async fn run_action_from_dir(
             .await
         }
         "composite" => {
-            super::composite::run_composite_action(
-                &manifest, action_dir, with, workspace, ctx, cancel_rx,
+            super::composite::run_composite_action_at_depth(
+                &manifest, action_dir, with, workspace, ctx, cancel_rx, depth,
             )
             .await
         }

@@ -849,39 +849,6 @@ pub async fn broker_acquire_job(
     let mut message = ctx.message;
     let github_token_request = ctx.token_request;
     let id_token_granted = ctx.id_token_granted;
-    // The stored message is a secret-free template: fill `variables` (plus
-    // value-derived mask hints) from the SecretProvider scoped to the run,
-    // then serialize — the filled message is never written back.
-    let filled = crate::message_template::fill_template(
-        &mut message,
-        shared.state.secret_provider.as_ref(),
-        &ctx.repository,
-        ctx.request.run_id,
-    )
-    .map_err(|error| ApiError::internal(format!("fill job message template: {error}")))?;
-    if !filled.names.is_empty() {
-        tracing::debug!(
-            request_id,
-            secrets = filled.names.len(),
-            "filled secret variables into job message at acquire"
-        );
-    }
-    // Merge every resolved scope value (env-tier secrets included) into the
-    // node masker entry seeded at submit: masking stays wider than the
-    // injected variable set so unreferenced values are still redacted.
-    if !filled.masked.is_empty() {
-        let plan_id = message.plan.plan_id.clone();
-        let mut inner = shared.state.inner.lock().await;
-        let mut merged: Vec<String> = inner
-            .plan_secret_masker
-            .get(&plan_id)
-            .map(|v| (**v).clone())
-            .unwrap_or_default();
-        merged.extend(filled.masked.iter().cloned());
-        merged.sort();
-        merged.dedup();
-        inner.plan_secret_masker.insert(plan_id, Arc::new(merged));
-    }
     // Fork restriction needs the trust tier + declared permissions; both are
     // recoverable without the build-time request. The submission stores the
     // tier as a plain kebab-case string ("untrusted-fork-pull-request"), not
@@ -1056,7 +1023,7 @@ pub async fn broker_acquire_job(
             // verified (fresh cache, or re-introspected here: the job may have
             // queued past the cache TTL); unverifiable authority stays
             // withheld and the job keeps an empty token surface.
-            match crate::runs::verified_pat_scopes(&pat).await {
+            match crate::runs::verified_pat_scopes(&shared.state, &pat).await {
                 Some(scopes) => {
                     message.variables.insert(
                         "system.github.token.pat_scopes".to_owned(),
@@ -1084,12 +1051,49 @@ pub async fn broker_acquire_job(
             }
         }
     }
+    // Fill after the claim has applied the minted token: the fill resolves
+    // `${{ secrets.GITHUB_TOKEN }}` and `${{ github.token }}` in reusable
+    // `secrets:` maps and job `env:` against the message as the claim leaves
+    // it, so both read the token the claim minted (or the PAT it fell back to).
+    // The stored message is a secret-free template: fill `variables` (plus
+    // value-derived mask hints) from the SecretProvider scoped to the run,
+    // then serialize — the filled message is never written back.
+    let filled = crate::message_template::fill_template(
+        &mut message,
+        shared.state.secret_provider.as_ref(),
+        &ctx.repository,
+        ctx.request.run_id,
+    )
+    .map_err(|error| ApiError::internal(format!("fill job message template: {error}")))?;
+    if !filled.names.is_empty() {
+        tracing::debug!(
+            request_id,
+            secrets = filled.names.len(),
+            "filled secret variables into job message at acquire"
+        );
+    }
+    // Merge every resolved scope value (env-tier secrets included) into the
+    // node masker entry seeded at submit: masking stays wider than the
+    // injected variable set so unreferenced values are still redacted.
+    if !filled.masked.is_empty() {
+        let plan_id = message.plan.plan_id.clone();
+        let mut inner = shared.state.inner.lock().await;
+        let mut merged: Vec<String> = inner
+            .plan_secret_masker
+            .get(&plan_id)
+            .map(|v| (**v).clone())
+            .unwrap_or_default();
+        merged.extend(filled.masked.iter().cloned());
+        merged.sort();
+        merged.dedup();
+        inner.plan_secret_masker.insert(plan_id, Arc::new(merged));
+    }
     // The snapshot checkout token is pinned onto the step at submission,
-    // but a job can sit queued well past its ~50-minute lifetime. The
-    // checkout would then be answered with a git 401 that the step can
-    // never recover from — it replays whatever the message carries. Re-mint
-    // the pinned inputs at claim so the token is fresh exactly when the job
-    // first runs.
+    // but a job can sit queued past the lifetime of the credential minted
+    // then. The checkout would then be answered with a git 401 that the step
+    // can never recover from — it replays whatever the message carries.
+    // Re-mint the pinned inputs at claim so the token is fresh exactly when
+    // the job first runs.
     let re_minted = re_mint_snapshot_credentials(&mut message, &shared.state);
     if re_minted > 0 {
         tracing::info!(
@@ -1105,9 +1109,11 @@ pub async fn broker_acquire_job(
             endpoint.url = Some(run_service_url.clone());
             endpoint.authorization.parameters.insert(
                 "AccessToken".to_owned(),
-                shared
-                    .state
-                    .mint_runtime_token(&message.plan.plan_id, &message.job_id),
+                shared.state.mint_runtime_token_for_job(
+                    &message.plan.plan_id,
+                    &message.job_id,
+                    message.job_timeout,
+                ),
             );
             endpoint.data.insert(
                 "ResultsServiceUrl".to_owned(),
@@ -1186,10 +1192,10 @@ pub async fn broker_acquire_job(
 /// snapshot.
 ///
 /// Every delivery path must call this when it renders the stored template: a
-/// job can sit queued (or paused in a debug session) well past the runtime
-/// token's ~50-minute lifetime, and a checkout or redirected git fetch
-/// replaying the stored credential would be answered with a 401 it can never
-/// recover from.
+/// job can sit queued (or paused in a debug session) past the lifetime of the
+/// credential minted when the template was stored, and a checkout or
+/// redirected git fetch replaying that stored credential would be answered
+/// with a 401 it can never recover from.
 pub fn re_mint_snapshot_credentials(
     message: &mut preloop_gha_protocol::azdo::AgentJobRequestMessage,
     state: &AppState,
@@ -1206,7 +1212,11 @@ pub fn re_mint_snapshot_credentials(
         return 0;
     }
 
-    let fresh = state.mint_runtime_token(&message.plan.plan_id, &message.job_id);
+    let fresh = state.mint_runtime_token_for_job(
+        &message.plan.plan_id,
+        &message.job_id,
+        message.job_timeout,
+    );
     if let Some(rewrite) = message.preloop_snapshot_origin_rewrite.as_mut() {
         // Same credential shape `runs::build_job_artifacts` pinned at
         // submission: the snapshot endpoint authenticates the job-scoped

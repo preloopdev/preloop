@@ -818,7 +818,7 @@ mod tests {
         let state_dir = dir.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         assert!(
-            crate::store_admin::prepare_brand_new_local(&state_dir).unwrap(),
+            crate::store_admin::prepare_brand_new_local(&state_dir, None).unwrap(),
             "an absent store is initialized"
         );
         let path = state_dir.join("preloop.db");
@@ -826,7 +826,7 @@ mod tests {
         verify_sqlite(&conn).unwrap();
         drop(conn);
         assert!(
-            !crate::store_admin::prepare_brand_new_local(&state_dir).unwrap(),
+            !crate::store_admin::prepare_brand_new_local(&state_dir, None).unwrap(),
             "an existing store is never re-initialized"
         );
     }
@@ -845,7 +845,7 @@ mod tests {
         let outside = dir.path().join("outside.db");
         let link = state_dir.join("preloop.db");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
-        let error = crate::store_admin::prepare_brand_new_local(&state_dir).unwrap_err();
+        let error = crate::store_admin::prepare_brand_new_local(&state_dir, None).unwrap_err();
         assert!(error.to_string().contains("symlink"), "{error}");
         assert!(
             !outside.exists(),
@@ -874,7 +874,7 @@ mod tests {
         std::fs::create_dir_all(&state_dir).unwrap();
 
         assert!(
-            crate::store_admin::prepare_brand_new_local(&state_dir).unwrap(),
+            crate::store_admin::prepare_brand_new_local(&state_dir, None).unwrap(),
             "a fresh store is initialized"
         );
         let store = dir.path().join("store.db");
@@ -882,7 +882,7 @@ mod tests {
         let before = std::fs::metadata(&store).unwrap();
         std::os::unix::fs::symlink(&store, state_dir.join("preloop.db")).unwrap();
         assert!(
-            !crate::store_admin::prepare_brand_new_local(&state_dir).unwrap(),
+            !crate::store_admin::prepare_brand_new_local(&state_dir, None).unwrap(),
             "an existing store behind a link is left alone"
         );
         let after = std::fs::metadata(&store).unwrap();
@@ -896,14 +896,14 @@ mod tests {
         // A directory (a FIFO, a device) is never a store to migrate into.
         let occupied = dir.path().join("occupied");
         std::fs::create_dir_all(occupied.join("preloop.db")).unwrap();
-        let error = crate::store_admin::prepare_brand_new_local(&occupied).unwrap_err();
+        let error = crate::store_admin::prepare_brand_new_local(&occupied, None).unwrap_err();
         assert!(error.to_string().contains("not a regular file"), "{error}");
 
         // A link onto a non-file cannot become the store either.
         let linked = dir.path().join("linked");
         std::fs::create_dir_all(&linked).unwrap();
         std::os::unix::fs::symlink(&occupied, linked.join("preloop.db")).unwrap();
-        let error = crate::store_admin::prepare_brand_new_local(&linked).unwrap_err();
+        let error = crate::store_admin::prepare_brand_new_local(&linked, None).unwrap_err();
         assert!(error.to_string().contains("symlink"), "{error}");
     }
 

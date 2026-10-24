@@ -17,15 +17,16 @@ use std::time::Duration;
 
 use github_setup::{ApiOutcome, api_list_secrets};
 
-mod aenv_egress;
 mod app_manifest;
 mod dap_client;
 mod debug_session;
+mod engine_app_setup;
 mod github_auth;
 mod github_setup;
 mod init;
 
 mod push;
+mod sandbox;
 mod server_install;
 mod store;
 mod update;
@@ -36,22 +37,9 @@ pub(crate) fn server_url() -> String {
 }
 
 fn should_send_local_workspace_header(url: &str, uses_default_transport: bool) -> bool {
-    if uses_default_transport {
-        return true;
-    }
-
     // An explicit loopback URL is still a local engine invocation. Do not
     // trust a host path for an arbitrary remote server.
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+    uses_default_transport || url_is_loopback(url)
 }
 
 fn mounted_control_origin(public_url: &str) -> Option<String> {
@@ -99,6 +87,43 @@ fn engine_unreachable_context() -> String {
 
 const PRE_PUSH_HOOK: &str = r#"#!/usr/bin/env bash
 # pre-push hook: soft CI gate for preloop.
+#
+# Install per checkout:
+#   cp contrib/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# (or let `preloop run` offer it for you). contrib/pre-push mirrors this
+# string; a unit test fails if the two drift apart.
+#
+# What it does, on `git push origin <branch>`:
+#   1. Skips the gate when any commit being pushed carries [skip ci], exactly
+#      as the engine suppresses that push's CI run. Only the commits in this
+#      push are examined; a [skip ci] elsewhere in the branch's history (say,
+#      on main) is not this push's business.
+#   2. Otherwise runs `preloop run` (CI on the current tree), holding the push
+#      open while CI runs. The gate itself never pushes anything — git's own
+#      push proceeds with your commits once CI is green. For the checked-out
+#      branch's current commit only: other refs pass with a warning, because
+#      the tree CI would test is not the tree being pushed.
+#   3. CI green  -> exit 0; git pushes normally.
+#   4. CI red    -> exit 1. The push is aborted; the branch never reaches
+#      GitHub. `git push --no-verify` is the escape hatch: it skips the gate.
+#   5. No engine running -> the gate is skipped with a notice saying so, and
+#      the push proceeds: a soft gate must not brick `git push` when there is
+#      no engine to evaluate it. Unreachability is decided from preloop's own
+#      machine-readable marker, never from CI step output that mentions a
+#      network error.
+#
+# A workflow is always selected explicitly, because `preloop run` refuses to
+# guess when .github/workflows/ holds several files: PRELOOP_PREPUSH_WORKFLOW
+# (with optional PRELOOP_PREPUSH_JOB) picks one, else the repository's only
+# workflow is used, else the gate is skipped with a notice.
+#
+# Verdicts are cached per (remote, server, commit): a re-push of the same
+# commit reuses the recorded run's live terminal status instead of re-running
+# CI, and an interrupted hook resumes the run it already started.
+#
+# This is a SOFT gate: it is advisory per-machine. Anyone can push without the
+# hook (web UI, another machine). Server-side enforcement is a separate concern.
+
 set -euo pipefail
 
 # Chain a previously installed hook (another tool's), if any: run it first
@@ -133,21 +158,76 @@ zero_sha=0000000000000000000000000000000000000000
 head_branch="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
 head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
 
+# No engine is running (or it is unreachable), so CI cannot be evaluated: skip
+# the gate loudly and let the push proceed. This is the normal state on a
+# laptop where nothing was started — it must never read as "CI failed".
+engine_not_running_note() {
+  echo "preloop: no preloop engine is running at ${endpoint} — CI gate skipped for this push" >&2
+  echo "preloop: start one to gate pushes on CI: 'preloop serve' (foreground) or 'preloop server install' (background service)" >&2
+}
+
+# Select the workflow to run, so `preloop run` is never invoked without one:
+# with several workflows in .github/workflows/ and no override, `run` refuses
+# with "specify a workflow with -f", and a soft gate must not block a push it
+# cannot evaluate.
+workflow_args=()
+resolve_workflow_args() {
+  if [[ -n "${PRELOOP_PREPUSH_WORKFLOW:-}" ]]; then
+    if [[ -n "${PRELOOP_PREPUSH_JOB:-}" ]]; then
+      workflow_args=(-f "$PRELOOP_PREPUSH_WORKFLOW" --job "$PRELOOP_PREPUSH_JOB")
+    else
+      workflow_args=(-f "$PRELOOP_PREPUSH_WORKFLOW")
+    fi
+    return 0
+  fi
+  local candidate found="" count=0
+  for candidate in .github/workflows/*.yml .github/workflows/*.yaml; do
+    if [[ -f "$candidate" ]]; then
+      count=$(( count + 1 ))
+      found="$candidate"
+    fi
+  done
+  if [[ $count -eq 0 ]]; then
+    echo "preloop: no workflow found under .github/workflows/ — CI gate skipped for this push" >&2
+    return 1
+  fi
+  if [[ $count -gt 1 ]]; then
+    echo "preloop: .github/workflows/ holds ${count} workflows — set PRELOOP_PREPUSH_WORKFLOW (optionally with PRELOOP_PREPUSH_JOB) to choose one; CI gate skipped for this push" >&2
+    return 1
+  fi
+  if [[ -n "${PRELOOP_PREPUSH_JOB:-}" ]]; then
+    workflow_args=(-f "$found" --job "$PRELOOP_PREPUSH_JOB")
+  else
+    workflow_args=(-f "$found")
+  fi
+  return 0
+}
+
 run_ci_or_resume() {
   local local_sha="$1" branch="$2" remote_sha="$3"
-  local log_range
-  # [skip ci] in any pushed commit bypasses the gate (mirrors preloop's
-  # server-side skip-label handling). A new branch carries an all-zero
-  # remote sha — log the single revision, not an invalid range.
+  local pushed
+  # [skip ci]: mirror the engine's push adapter
+  # (crates/preloop-runner-server/src/events/push.rs), which suppresses a run
+  # when *any* commit in the pushed batch carries a skip label — not only the
+  # tip. Only the commits actually being pushed are examined: on a new branch
+  # `git log "$local_sha"` walks every ancestor and would match an old
+  # [skip ci] on main that this push does not carry.
   if [[ "$remote_sha" == "$zero_sha" ]]; then
-    log_range="$local_sha"
+    # New remote ref: every commit not already on a remote.
+    pushed="$(git rev-list "$local_sha" --not --remotes 2>/dev/null || true)"
   else
-    log_range="${remote_sha}..$local_sha"
+    pushed="$(git rev-list "${remote_sha}..${local_sha}" 2>/dev/null || true)"
   fi
   # No pipe to grep -q here: under pipefail, grep's early exit SIGPIPEs
   # git log, the pipeline reports 141, and the bypass never fires.
-  if grep -qi '\[skip *ci\]' <<< "$(git log --format=%B "$log_range" 2>/dev/null)"; then
+  if [[ -n "$pushed" ]] && grep -qi '\[skip *ci\]' <<< "$(git log --no-walk --format=%B $pushed 2>/dev/null)"; then
     echo "preloop: [skip ci] found — pushing ${branch} without the CI gate"
+    return 0
+  fi
+
+  # A workflow must be picked before any engine contact: without one the gate
+  # cannot be evaluated, and a soft gate skips rather than blocks.
+  if ! resolve_workflow_args; then
     return 0
   fi
 
@@ -165,7 +245,7 @@ run_ci_or_resume() {
     set -e
     if [[ $status_rc -eq 0 ]]; then
       printf '%s\n' "$status_output"
-    elif grep -q "$ENGINE_UNREACHABLE_MARKER" "$status_err"; then
+    elif grep -q 'PRELOOP_UNREACHABLE' "$status_err"; then
       printf 'unreachable\n'
     else
       printf 'error\n'
@@ -183,12 +263,16 @@ run_ci_or_resume() {
           echo "preloop: cached CI verdict for ${local_sha:0:12}: success"
           return 0 ;;
         failure|cancelled|skipped)
-          echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
+          echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push, or bypass the gate with 'git push --no-verify' (or rm $cache)" >&2
           return 1 ;;
+        unreachable)
+          engine_not_running_note
+          return 0 ;;
         in_progress|queued|pending)
           echo "preloop: run ${run_id} still in progress — waiting for CI before pushing ${branch}..."
           waited=0
           timeout_secs="${PRELOOP_HOOK_TIMEOUT_SECS:-3600}"
+          timed_out=1
           while (( waited < timeout_secs )); do
             sleep 15
             waited=$(( waited + 15 ))
@@ -198,34 +282,45 @@ run_ci_or_resume() {
                 echo "preloop: CI passed for ${branch}"
                 return 0 ;;
               failure|cancelled|skipped)
-                echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push (or rm $cache)" >&2
+                echo "preloop: cached CI verdict for ${local_sha:0:12}: ${verdict} — fix and re-push, or bypass the gate with 'git push --no-verify' (or rm $cache)" >&2
                 return 1 ;;
               in_progress|queued|pending) ;;
               unreachable)
-                echo "preloop: cannot reach the engine to resume run ${run_id} — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+                engine_not_running_note
                 return 0 ;;
               error)
-                echo "preloop: cannot validate cached run ${run_id} — push aborted" >&2
-                return 1 ;;
+                # The engine answered but the run could not be resolved:
+                # re-evaluate the commit with a fresh CI run instead of
+                # blocking a push on a verdict we cannot trust.
+                echo "preloop: cannot validate cached run ${run_id} — running CI fresh" >&2
+                timed_out=0
+                break ;;
             esac
           done
-          echo "preloop: CI did not finish within ${timeout_secs}s — push aborted" >&2
-          return 1 ;;
+          if [[ $timed_out -eq 1 ]]; then
+            echo "preloop: CI is still running after ${timeout_secs}s — push aborted; raise PRELOOP_HOOK_TIMEOUT_SECS to wait longer, or bypass the gate with 'git push --no-verify'" >&2
+            return 1
+          fi ;;
         error)
           echo "preloop: cannot resolve run ${run_id} — running CI fresh" >&2 ;;
       esac
     fi
   fi
 
-  # Run CI. Fail open only on the machine-readable engine-unreachable marker
-  # emitted by preloop itself — never on CI step output that happens to
-  # mention a network error.
+  # Run CI. It is skipped — not failed — when the gate cannot be evaluated:
+  # no CLI binary, or no engine to talk to (decided from preloop's own
+  # machine-readable marker, never from CI step output that happens to
+  # mention a network error).
+  if ! command -v "$preloop_bin" >/dev/null 2>&1; then
+    echo "preloop: '${preloop_bin}' (PRELOOP_BIN) not found — CI gate skipped for this push" >&2
+    return 0
+  fi
   local log error_log run_pid run_status i
   log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-XXXXXX")"
   error_log="$(mktemp "${TMPDIR:-/tmp}/preloop-push-error-XXXXXX")"
   echo "preloop: running CI on preloop before pushing ${branch} (this holds the push)..."
   set +e
-  "$preloop_bin" run >"$log" 2>"$error_log" &
+  "$preloop_bin" run "${workflow_args[@]}" >"$log" 2>"$error_log" &
   run_pid=$!
   # Record the run id as soon as the engine accepts it, so an interrupted
   # hook (Ctrl-C, crash) resumes the same run on the next push instead of
@@ -241,13 +336,13 @@ run_ci_or_resume() {
   wait "$run_pid"
   run_status=$?
   set -e
-  if grep -q "$ENGINE_UNREACHABLE_MARKER" "$error_log"; then
-    echo "preloop: engine unreachable — pushing ${branch} WITHOUT the CI gate (fail-open)" >&2
+  if grep -q 'PRELOOP_UNREACHABLE' "$error_log"; then
     rm -f "$log" "$error_log"
+    engine_not_running_note
     return 0
   fi
   if [[ $run_status -ne 0 ]]; then
-    echo "preloop: CI failed for ${branch} — push aborted. Details:" >&2
+    echo "preloop: CI failed for ${branch} — push aborted; fix CI, or bypass the gate with 'git push --no-verify'. Details:" >&2
     tail -n 30 "$log" >&2
     tail -n 30 "$error_log" >&2
     rm -f "$log" "$error_log"
@@ -387,7 +482,7 @@ pub(crate) fn api_token() -> Option<String> {
         .or_else(|_| std::env::var("PRELOOP_SYSTEM_TOKEN"))
         .ok()
         .or_else(|| {
-            preloop_runner_server::credential_store::load_engine_token_from_env(&preloop_home())
+            preloop_runner_server::credential_store::load_engine_token(&preloop_home())
                 .ok()
                 .flatten()
         })
@@ -401,10 +496,95 @@ pub(crate) fn api_token() -> Option<String> {
             if home == cwd_default {
                 return None;
             }
-            preloop_runner_server::credential_store::load_engine_token_from_env(&cwd_default)
+            preloop_runner_server::credential_store::load_engine_token(&cwd_default)
                 .ok()
                 .flatten()
         })
+}
+
+/// Deadline for opening a TCP connection to the engine's management port.
+///
+/// A control-op deadline, not a data one: a loopback connect completes in
+/// microseconds and an engine reached over a WAN completes in well under a
+/// second. Unbounded, a firewalled port that swallows SYNs (or an engine whose
+/// accept queue is wedged) parked an interactive CLI command forever.
+pub(crate) const ENGINE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle bound on the engine client: the longest the CLI waits for *any* byte
+/// before declaring the connection dead.
+///
+/// This is the stream protection, so it must sit above the engine's own
+/// liveness bounds. The live log feed closes itself after 5 minutes of
+/// silence (`preloop-runner-server/src/live_logs.rs`, `IDLE_TIMEOUT` = 300 s),
+/// so 10 minutes only fires when the engine has genuinely stopped talking.
+/// It is deliberately *not* a total-request deadline: `preloop logs --follow`
+/// and the run event feed are legitimately silent for minutes and legitimately
+/// last for hours, and a total would cut them off mid-run.
+pub(crate) const ENGINE_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Total deadline for one one-shot engine control request (status, list,
+/// submit, cancel, rerun, `push` bookkeeping).
+///
+/// A healthy engine answers these in milliseconds; 30 s leaves room for a busy
+/// control plane and for a remote engine's round trip, while a wedged one fails
+/// the command instead of hanging it. The streams (`--follow`), durable log
+/// fetches, and bundle uploads do not use it — see the constants below.
+pub(crate) const ENGINE_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Total deadline for fetching one run's or job's durable logs.
+///
+/// The whole body is buffered before it is printed, so a total is the right
+/// bound here: there is no incremental progress for the user to watch. A job
+/// log is capped by the engine's per-job log limit, so 5 minutes is comfortably
+/// above a multi-megabyte fetch over loopback or a remote link, and still ends
+/// a stall inside one coffee break.
+pub(crate) const ENGINE_LOG_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Total deadline for uploading a git bundle to the engine.
+///
+/// The engine caps a bundle at 512 MiB. A loopback upload of that size takes
+/// seconds and a remote engine on a slow uplink takes minutes, so 15 minutes
+/// keeps the largest legitimate upload working while a wedged engine cannot
+/// park `preloop run`/`preloop push` forever (the upload happens before the run
+/// is even submitted).
+pub(crate) const ENGINE_BUNDLE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// Total deadline for one `cosign` provenance check of a base image.
+///
+/// `cosign verify` resolves the image's signature and attestations in the
+/// registry and may consult the Rekor transparency log; with a cold cache and a
+/// multi-hundred-megabyte image that is minutes, not seconds. Ten minutes is
+/// generous for that path and still ends a registry or Rekor stall that would
+/// otherwise hang `preloop build-golden` indefinitely.
+const COSIGN_VERIFY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Build the engine client with explicit deadlines.
+///
+/// Split out so a test can prove the bounds fire with short values; production
+/// always goes through [`build_client`], which passes the constants above.
+fn build_engine_client(connect: Duration, idle: Duration) -> reqwest::Client {
+    preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+        .connect_timeout(connect)
+        .read_timeout(idle)
+        .build()
+        .expect("valid HTTP client configuration")
+}
+
+/// One-shot request against the engine's native API, under `deadline`.
+///
+/// The client already carries the connect and idle-read bounds
+/// ([`ENGINE_CONNECT_TIMEOUT`], [`ENGINE_READ_TIMEOUT`]); this adds the total
+/// that fits the call: an engine that accepts TCP and never answers must fail
+/// the command, not hang it. Keeping the per-request total in one place is what
+/// lets a test exercise it against a stalled listener with a short deadline,
+/// rather than only asserting that some constant was passed somewhere.
+fn engine_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    deadline: Duration,
+) -> reqwest::RequestBuilder {
+    client.request(method, url).timeout(deadline)
 }
 
 pub(crate) fn build_client() -> reqwest::Client {
@@ -413,9 +593,18 @@ pub(crate) fn build_client() -> reqwest::Client {
     // is the runner/guest surface: it deliberately refuses native APIs
     // (`/api/v1/runs` and friends 404 there), so it must never be the
     // default transport for CLI commands.
-    reqwest::Client::builder()
-        .build()
-        .expect("valid HTTP client configuration")
+    //
+    // `with_tls_roots` pins verification to the shared in-process root set:
+    // the platform verifier would consult the OS trust daemon on every
+    // handshake, and that daemon can prompt or hang.
+    //
+    // Every caller gets the connect and idle-read bounds, so no command can
+    // wait on a wedged engine forever. They bound a *stalled* connection, not
+    // total work: one-shot calls add their own total through `engine_request`
+    // (`ENGINE_CONTROL_TIMEOUT`, `ENGINE_LOG_FETCH_TIMEOUT`,
+    // `ENGINE_BUNDLE_UPLOAD_TIMEOUT`) and the streams rely on the idle bound
+    // alone, on purpose.
+    build_engine_client(ENGINE_CONNECT_TIMEOUT, ENGINE_READ_TIMEOUT)
 }
 
 pub(crate) fn preloop_home() -> PathBuf {
@@ -425,88 +614,17 @@ pub(crate) fn preloop_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".preloop"))
 }
 
-/// Which microVM substrate the engine drives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VmBackend {
-    /// SmolVM: libkrun on macOS, libkrun/KVM on Linux.
-    Smolvm,
-    /// AgentENV: a Firecracker control plane over `/dev/kvm`.
-    Agentenv,
-}
-
-impl VmBackend {
-    /// The backend name as it is written in `PRELOOP_VM_BACKEND`.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Smolvm => "smolvm",
-            Self::Agentenv => "agentenv",
-        }
-    }
-}
-
-/// Resolve the VM backend for this process.
-///
-/// `PRELOOP_VM_BACKEND=smolvm|agentenv` is authoritative. Without it, SmolVM
-/// is selected everywhere: AgentENV stays available as an opt-in
-/// (`PRELOOP_VM_BACKEND=agentenv`) for KVM hosts that have an `aenv` CLI,
-/// but it is not the default until the end-to-end pool interaction is proven
-/// out (see `benchmarks/substrates/REPORT.md` §4).
-///
-/// An unrecognized value is an error rather than a silent fallback: booting
-/// jobs on a substrate the operator did not ask for is exactly the kind of
-/// surprise a typo must not cause.
-pub(crate) fn vm_backend() -> anyhow::Result<VmBackend> {
-    match std::env::var("PRELOOP_VM_BACKEND") {
-        Ok(value) if value.eq_ignore_ascii_case("smolvm") => Ok(VmBackend::Smolvm),
-        Ok(value)
-            if value.eq_ignore_ascii_case("agentenv") || value.eq_ignore_ascii_case("aenv") =>
-        {
-            Ok(VmBackend::Agentenv)
-        }
-        Ok(value) if value.trim().is_empty() => Ok(default_vm_backend()),
-        Ok(value) => {
-            anyhow::bail!("unknown PRELOOP_VM_BACKEND `{value}` (expected `smolvm` or `agentenv`)")
-        }
-        Err(_) => Ok(default_vm_backend()),
-    }
-}
-
-/// The backend chosen when the operator expressed no preference: SmolVM on
-/// every host. AgentENV is strictly opt-in via `PRELOOP_VM_BACKEND`.
-fn default_vm_backend() -> VmBackend {
-    VmBackend::Smolvm
-}
-
-/// The VM provider for the resolved backend, boxed so the pool's type does
-/// not depend on the choice.
-pub(crate) fn vm_provider(backend: VmBackend) -> Box<dyn preloop_vm::VmProvider> {
-    match backend {
-        VmBackend::Smolvm => Box::new(preloop_vm::SmolVmProvider::default()),
-        VmBackend::Agentenv => Box::new(preloop_vm::agentenv::AgentEnvProvider::default()),
-    }
-}
-
-/// A command that runs an argv inside `machine`'s guest, for whichever backend
-/// owns that machine. The caller appends the guest argv.
+/// A command that runs an argv inside `machine`'s guest. The caller appends
+/// the guest argv.
 ///
 /// `preloop shell` and `preloop debug` reach into a paused job's VM from a
-/// separate process, so this is the one place that knows how to address a
-/// guest per backend: SmolVM by machine name, AgentENV by the sandbox id the
-/// engine recorded in its registry.
+/// separate process. Pool machines are sandboxes served by this host's SmolVM
+/// driver, which uses the pool's machine name as the native name, so the
+/// SmolVM CLI addresses them directly.
 pub(crate) fn guest_exec_command(machine: &str) -> anyhow::Result<std::process::Command> {
-    match vm_backend()? {
-        VmBackend::Smolvm => {
-            let mut command = smolvm_command()?;
-            command.args(["machine", "exec", "--name", machine, "--"]);
-            Ok(command)
-        }
-        VmBackend::Agentenv => {
-            let sandbox = recorded_sandbox(machine)?;
-            let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
-            command.args(["exec", &sandbox, "--"]);
-            Ok(command)
-        }
-    }
+    let mut command = smolvm_command()?;
+    command.args(["machine", "exec", "--name", machine, "--"]);
+    Ok(command)
 }
 
 /// A command that copies a host file to `remote` inside `machine`'s guest.
@@ -515,97 +633,16 @@ pub(crate) fn guest_upload_command(
     local: &str,
     remote: &str,
 ) -> anyhow::Result<std::process::Command> {
-    match vm_backend()? {
-        VmBackend::Smolvm => {
-            let mut command = smolvm_command()?;
-            command.args(["machine", "cp", local, &format!("{machine}:{remote}")]);
-            Ok(command)
-        }
-        VmBackend::Agentenv => {
-            let sandbox = recorded_sandbox(machine)?;
-            let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
-            command.args(["upload", &sandbox, local, remote]);
-            Ok(command)
-        }
-    }
+    let mut command = smolvm_command()?;
+    command.args(["machine", "cp", local, &format!("{machine}:{remote}")]);
+    Ok(command)
 }
 
 /// An interactive shell attached to `machine`'s guest.
 pub(crate) fn guest_shell_command(machine: &str) -> anyhow::Result<std::process::Command> {
-    match vm_backend()? {
-        VmBackend::Smolvm => {
-            let mut command = smolvm_command()?;
-            command.args(["machine", "shell", "--name", machine]);
-            Ok(command)
-        }
-        VmBackend::Agentenv => {
-            let sandbox = recorded_sandbox(machine)?;
-            let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
-            command.args(["cn", &sandbox]);
-            Ok(command)
-        }
-    }
-}
-
-/// Resume an AgentENV sandbox before an attach. SmolVM's shell command owns
-/// its own lifecycle, so it needs no separate resume command.
-pub(crate) fn guest_resume_command(machine: &str) -> anyhow::Result<Option<std::process::Command>> {
-    if vm_backend()? != VmBackend::Agentenv {
-        return Ok(None);
-    }
-    let sandbox = recorded_sandbox(machine)?;
-    let timeout = std::env::var("PRELOOP_AENV_TTL_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|seconds| *seconds >= 60)
-        .unwrap_or(3600)
-        .to_string();
-    let mut command = std::process::Command::new(preloop_vm::agentenv::binary());
-    command.args(["resume", &sandbox, "--timeout", &timeout]);
-    Ok(Some(command))
-}
-
-pub(crate) fn resume_guest_if_needed(machine: &str) -> anyhow::Result<()> {
-    let Some(mut resume) = guest_resume_command(machine)? else {
-        return Ok(());
-    };
-
-    let mut probe = guest_exec_command(machine)?;
-    probe.args(["/bin/true"]);
-    if probe.status().is_ok_and(|status| status.success()) {
-        return Ok(());
-    }
-
-    // The engine's attach watcher may resume concurrently; a failed resume
-    // command is not fatal while the sandbox still comes up. After the
-    // resume attempt, poll until envd actually answers — a bare `resume`
-    // returning does not mean `cn`'s proxy is already serving ("410 Gone:
-    // sandbox is not proxyable" was observed on the first attach right
-    // after a resume).
-    let _ = resume.status();
-    let mut ready = guest_exec_command(machine)?;
-    ready.args(["/bin/true"]);
-    for attempt in 0..20 {
-        if ready.status().is_ok_and(|status| status.success()) {
-            return Ok(());
-        }
-        if attempt == 19 {
-            anyhow::bail!("AgentENV sandbox `{machine}` did not become ready after resume");
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    unreachable!()
-}
-
-/// The AgentENV sandbox behind `machine`, or an explanation of why the guest
-/// cannot be reached.
-fn recorded_sandbox(machine: &str) -> anyhow::Result<String> {
-    preloop_vm::agentenv::recorded_sandbox(machine).with_context(|| {
-        format!(
-            "no AgentENV sandbox is recorded for machine `{machine}`; the engine that created it \
-             may have exited, or its sandbox TTL expired"
-        )
-    })
+    let mut command = smolvm_command()?;
+    command.args(["machine", "shell", "--name", machine]);
+    Ok(command)
 }
 
 /// A `smolvm` command carrying Preloop's Linux VM-sandbox environment.
@@ -615,7 +652,7 @@ fn recorded_sandbox(machine: &str) -> anyhow::Result<String> {
 /// it when needed, and `machine shell` does the same — so these spawns must
 /// carry the exact seccomp/Landlock/cgroup environment the VM provider
 /// applies to its own boots. This is the single chokepoint for them; the
-/// policy lives in [`preloop_vm::smolvm_sandbox_env`] and is a no-op on
+/// policy lives in [`preloop_sandbox::drivers::smolvm::cli::smolvm_sandbox_env`] and is a no-op on
 /// macOS, matching the provider.
 pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
     let mut command = std::process::Command::new("smolvm");
@@ -626,13 +663,23 @@ pub(crate) fn smolvm_command() -> anyhow::Result<std::process::Command> {
     // paused, service-owned machine. `apply_smolvm_runtime_env` fills the
     // same gap from the effective Preloop home (and isolates `HOME` on macOS,
     // where SmolVM ignores `SMOLVM_DATA_DIR`); an operator value still wins.
-    preloop_vm::apply_smolvm_runtime_env(&mut command, None)?;
-    preloop_vm::apply_smolvm_sandbox_env(&mut command)?;
+    preloop_sandbox::drivers::smolvm::cli::apply_smolvm_runtime_env(&mut command, None)?;
+    preloop_sandbox::drivers::smolvm::cli::apply_smolvm_sandbox_env(&mut command)?;
     Ok(command)
 }
 
 #[cfg(test)]
 pub(crate) static SMOLVM_PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serializes every test that reads or writes process-global environment
+/// variables (`PRELOOP_HOME`, `PRELOOP_CONFIG`, `PRELOOP_CREDENTIAL_STORE`,
+/// `PRELOOP_TOKEN`, `HOME`, …). Process env is per-process state, so parallel
+/// test threads would otherwise race each other's `set_var`/`remove_var`
+/// pairs and observe each other's transient values across modules. Sync
+/// tests take it with [`tokio::sync::Mutex::blocking_lock`]; async tests with
+/// `lock().await`.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A fake `smolvm` on PATH that records the sandbox environment it was given
 /// and answers the debug-session byte-count probe. Serialized with
@@ -665,31 +712,21 @@ exit 0
 
 /// Run `test` with a fake `smolvm` first on PATH, restoring PATH afterwards.
 ///
-/// The backend is pinned to SmolVM for the duration: these tests assert the
-/// argv and environment of `smolvm` spawns, and on a Linux host that has
-/// `/dev/kvm` and an `aenv` binary the backend default would otherwise select
-/// AgentENV and never spawn the fake at all.
 #[cfg(test)]
 pub(crate) fn with_fake_smolvm_path<T>(test: impl FnOnce(&PathBuf) -> T) -> T {
     let _guard = SMOLVM_PATH_LOCK.blocking_lock();
     let (directory, executable) = fake_smolvm_on_path();
     let previous = std::env::var_os("PATH");
-    let previous_backend = std::env::var_os("PRELOOP_VM_BACKEND");
     let mut path = directory.path().as_os_str().to_owned();
     path.push(":");
     if let Some(previous) = &previous {
         path.push(previous);
     }
     unsafe { std::env::set_var("PATH", path) };
-    unsafe { std::env::set_var("PRELOOP_VM_BACKEND", "smolvm") };
     let result = test(&executable);
     match previous {
         Some(previous) => unsafe { std::env::set_var("PATH", previous) },
         None => unsafe { std::env::remove_var("PATH") },
-    }
-    match previous_backend {
-        Some(previous) => unsafe { std::env::set_var("PRELOOP_VM_BACKEND", previous) },
-        None => unsafe { std::env::remove_var("PRELOOP_VM_BACKEND") },
     }
     result
 }
@@ -742,11 +779,11 @@ enum Command {
 
     /// Configure credentials, the golden image, and how to run — in one step.
     ///
-    /// In a terminal this is a four-step wizard (credentials, golden, run
-    /// mode, preflight); with stdin or stdout not a TTY it takes the same
-    /// answers as flags and never prompts, so scripts and agents get the same
-    /// config. `--probe --json` reports host capabilities without touching
-    /// anything. Re-running reconfigures in place.
+    /// In a terminal this is a five-step wizard (credentials, golden,
+    /// workflows, run mode, preflight); with stdin or stdout not a TTY it
+    /// takes the same answers as flags and never prompts, so scripts and
+    /// agents get the same config. `--probe --json` reports host capabilities
+    /// without touching anything. Re-running reconfigures in place.
     Init(init::InitArgs),
 
     /// Verify the GitHub credential configuration.
@@ -765,8 +802,9 @@ enum Command {
     /// pending migrations, report migration state — and the one-time import
     /// of a legacy v11 `preloop.db`.
     ///
-    /// `preloop serve` never migrates: a missing, older or newer control
-    /// schema refuses at boot and names `preloop store migrate` as the fix.
+    /// `preloop serve` initializes only a brand-new local store and otherwise
+    /// never migrates: an older, newer or divergent control schema refuses at
+    /// boot and names `preloop store migrate` as the fix.
     /// SQLite migrations take a consistent backup before changing anything
     /// (refinery has no down; restore the backup to roll back).
     Store(store::StoreArgs),
@@ -796,6 +834,8 @@ enum Command {
 
     /// Poll GitHub Releases and atomically install the matching binary.
     Update(update::UpdateArgs),
+    /// Drive the Sandbox Service: templates, pools, sandboxes, host agents.
+    Sandbox(sandbox::SandboxArgs),
 
     /// Run the control plane and microVM runner pool in the foreground.
     ///
@@ -804,8 +844,8 @@ enum Command {
     /// tunnel or reverse proxy at `--listen` to receive events from GitHub.
     Serve(ServeArgs),
 
-    /// Former name for `serve`. Retained because `ensure_engine_running`
-    /// spawns it by name, and to keep existing supervisor units working.
+    /// Former name for `serve`. Retained so existing supervisor units and
+    /// scripts that still invoke it keep working.
     #[command(hide = true)]
     Engine,
 
@@ -926,12 +966,19 @@ struct RunArgs {
     #[arg(long, value_name = "PATH")]
     payload: Option<PathBuf>,
 
-    /// Base ref for pull_request or merge_group events.
+    /// Pull-request base ref for merge construction and hosted bundle
+    /// prerequisites.
     #[arg(long)]
     base: Option<String>,
+
+    /// Commit message for the real submit-time commit created by `--push`
+    /// when the working tree is dirty. Without this flag, `$EDITOR` is
+    /// prefilled; non-interactive runs use a generated message.
+    #[arg(short = 'm', long = "message")]
+    message: Option<String>,
     /// Open a live debug session when a job fails. Without this flag, failed
-    /// AgentENV jobs are cleaned up normally. SmolVM retains its historical
-    /// terminal-attached default for compatibility.
+    /// jobs are cleaned up normally; a terminal-attached run keeps the
+    /// historical debug-on-failure default.
     #[arg(long, conflicts_with = "no_debug")]
     debug: bool,
 
@@ -988,6 +1035,14 @@ struct RunArgs {
         action = clap::ArgAction::Set
     )]
     pr_draft: bool,
+
+    /// Test the branch alone instead of the merge of the pull request's
+    /// current base tip into it. Only affects `--event pull_request` runs
+    /// against a local engine: by default those run on the merge (the base
+    /// tip is fetched from origin), like GitHub's `refs/pull/<n>/merge`.
+    /// Use this when the base branch cannot be fetched.
+    #[arg(long)]
+    no_merge: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -1082,8 +1137,17 @@ async fn main() -> anyhow::Result<()> {
     // `RUST_LOG` defaults to `info` (the old `fmt::init()` default of ERROR hid
     // pool provisioning faults). The runtime is held for the life of `main`
     // and flushed with a bounded 2s shutdown on exit.
+    //
+    // OTLP goes through the OTLP-only exporter client builder: this process
+    // hosts the engine (`preloop serve`), and without the customizer the
+    // blocking exporter client falls back to reqwest's platform verifier —
+    // on macOS `SecTrustEvaluateWithError` asks `trustd`/`securityd` with no
+    // deadline, so a hung trust daemon would stall the export thread and the
+    // shutdown flush. Same installer `preloop-runner` and
+    // `preloop-runner-server` pass.
     let obs_config = preloop_observability::ObservabilityConfig::from_env()
-        .with_service_version(env!("CARGO_PKG_VERSION"));
+        .with_service_version(env!("CARGO_PKG_VERSION"))
+        .with_otel_client_builder(preloop_runner_server::shared_http::with_tls_roots_blocking);
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     observability_runtime.install_fmt_subscriber();
@@ -1117,6 +1181,7 @@ async fn main() -> anyhow::Result<()> {
         Command::BuildGolden(args) => cmd_build_golden(args).await,
         Command::GoldenPath(args) => cmd_golden_path(args).await,
         Command::Update(args) => update::run(args).await,
+        Command::Sandbox(args) => sandbox::run(args).await,
         // Local configuration commands must not spawn the engine.
         Command::Setup(args) => github_setup::cmd_setup(args).await,
         Command::Init(args) => init::run(args, Some(observability.clone())).await,
@@ -1130,10 +1195,13 @@ async fn main() -> anyhow::Result<()> {
         // control-plane engine for a command that never contacts it.
         Command::Plan(args) => cmd_plan(args).await,
         _ => {
-            // Bootstrap the engine for client commands, but bind the outcome
-            // instead of `?` so the telemetry flush below still runs when
-            // engine startup fails.
-            match ensure_engine_running().await {
+            // Client commands require an engine that is already running
+            // (#658): none of them starts one. The probe targets the endpoint
+            // the command will use — `dap --url` overrides `PRELOOP_URL`, and
+            // probing the default there would refuse a live engine. Bind the
+            // outcome instead of `?` so the telemetry flush below still runs
+            // when it is missing.
+            match require_running_engine(command_engine_url(&cli.command)).await {
                 Ok(()) => match cli.command {
                     Command::Run(args) => cmd_run(args).await,
                     Command::Plan(_) => unreachable!("plan is handled before engine bootstrap"),
@@ -1149,6 +1217,7 @@ async fn main() -> anyhow::Result<()> {
                     Command::Push(args) => cmd_push(args).await,
                     Command::Webhooks(args) => webhooks::run(args).await,
                     Command::Update(_)
+                    | Command::Sandbox(_)
                     | Command::Serve(_)
                     | Command::Engine
                     | Command::BuildGolden(_)
@@ -1281,7 +1350,7 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         control_origin: None,
         control_socket: None,
         control_upstream: None,
-        dns: Some(runner_dns()),
+        dns: runner_dns(),
         registration_token_env: TOKEN_ENV.into(),
         labels: vec![
             "self-hosted".into(),
@@ -1314,13 +1383,15 @@ async fn cmd_build_golden(args: BuildGoldenArgs) -> anyhow::Result<()> {
         preparing_signal: None,
         pool_status: None,
         observability: None,
+        // A one-shot bake has no engine to share a funnel with; the pool
+        // builds a private one so this download still honours the breakers.
+        github: None,
     };
     let payload = artifact_payload(&output, &config.base_image);
-    // The bake follows the engine's backend: SmolVM writes a portable
-    // `.smolmachine`, AgentENV writes a descriptor naming the server-side
-    // snapshot it just created (portable only within that server).
-    let backend = vm_backend()?;
-    RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
+    // The bake runs through an in-process sandbox service with this
+    // host's SmolVM driver: `pack` writes a portable `.smolmachine`.
+    let sandboxes = crate::sandbox::LocalSandboxes::start(&preloop_home()).await?;
+    RunnerPool::new(sandboxes.machines(), config)?
         .rebuild_artifact()
         .await?;
     if payload != output {
@@ -1381,10 +1452,10 @@ async fn verify_base_image(base_image: &str) -> anyhow::Result<()> {
         anyhow::bail!("base image `{base_image}` is not a registry reference; nothing to verify");
     }
     require_digest_pinned_base(base_image)?;
-    verify_base_image_with(&repo, base_image)
+    verify_base_image_with(&repo, base_image).await
 }
 
-fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
+async fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
     let identity = std::env::var("PRELOOP_BASE_IMAGE_IDENTITY_REGEXP").unwrap_or_else(|_| {
         format!(
             "^https://github.com/{repo}/.github/workflows/(dump|attest-local)\\.yml@refs/heads/"
@@ -1412,13 +1483,13 @@ fn verify_base_image_with(repo: &str, base_image: &str) -> anyhow::Result<()> {
         verify_args.extend(["--key", key]);
     }
     verify_args.extend(identity_args.iter().copied());
-    run_verifier("cosign", &verify_args, "cosign signature")?;
+    run_verifier("cosign", &verify_args, "cosign signature").await?;
     let mut attest_args: Vec<&str> = vec!["verify-attestation", base_image, "--type", "spdx"];
     if let Some(key) = &key {
         attest_args.extend(["--key", key]);
     }
     attest_args.extend(identity_args.iter().copied());
-    run_verifier("cosign", &attest_args, "cosign SPDX SBOM attestation")
+    run_verifier("cosign", &attest_args, "cosign SPDX SBOM attestation").await
 }
 
 fn require_digest_pinned_base(base_image: &str) -> anyhow::Result<()> {
@@ -1447,11 +1518,33 @@ fn require_digest_pinned_base(base_image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
-    let status = std::process::Command::new(binary)
-        .args(args)
-        .status()
-        .with_context(|| format!("failed to run `{binary}`; is it installed?"))?;
+/// Run one `cosign` subcommand to completion under [`COSIGN_VERIFY_TIMEOUT`].
+///
+/// `cosign verify` is a network client: it resolves the image in the registry
+/// and may query the Rekor transparency log. Run as a plain
+/// `std::process::Command::status()` it inherited the terminal and waited with
+/// no timeout at all, so a stalled registry or transparency log hung
+/// `preloop build-golden` for as long as the stall lasted. It now runs through
+/// `preloop_observability::deadline::run_command_status`, so the deadline below
+/// kills the child instead of leaving it behind.
+async fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
+    let mut command = tokio::process::Command::new(binary);
+    command.args(args);
+    let status = match preloop_observability::deadline::run_command_status(
+        command,
+        COSIGN_VERIFY_TIMEOUT,
+        what,
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(error) if error.timed_out() => anyhow::bail!(
+            "`{binary}` {what} did not finish within {}s and was killed: the registry or the \
+             transparency log is not answering",
+            COSIGN_VERIFY_TIMEOUT.as_secs()
+        ),
+        Err(error) => return Err(anyhow::Error::new(error).context(format!("running `{binary}`"))),
+    };
     if !status.success() {
         anyhow::bail!("{what} verification failed for the base image (exit {status})");
     }
@@ -1467,98 +1560,131 @@ fn run_verifier(binary: &str, args: &[&str], what: &str) -> anyhow::Result<()> {
 /// a misconfigured auth layer by succeeding where an anonymous probe would
 /// not. Authenticated readiness is checked against `/readyz` separately.
 async fn probe_engine_health(client: &reqwest::Client, url: &str) -> bool {
+    probe_engine_health_within(client, url, probe_timeout(url)).await
+}
+
+/// [`probe_engine_health`] against an explicit budget, so both endpoint
+/// classes can be covered without a network that is actually slow.
+async fn probe_engine_health_within(client: &reqwest::Client, url: &str, budget: Duration) -> bool {
     client
         .get(format!("{url}/healthz"))
-        .timeout(Duration::from_millis(500))
+        .timeout(budget)
         .send()
         .await
         .is_ok()
 }
 
-async fn ensure_engine_running() -> anyhow::Result<()> {
-    if std::env::var("PRELOOP_URL").is_ok() {
+/// How long the liveness probe waits for `/healthz` before it calls the
+/// endpoint dead.
+///
+/// The two budgets exist because the endpoints are not alike. A loopback
+/// engine answers in microseconds when it is listening and refuses the
+/// connection instantly when it is not, so a client command probes it
+/// tightly: the pre-push hook runs `preloop run`, and time spent waiting on a
+/// silent local endpoint is time it spends on every push. An explicit
+/// `PRELOOP_URL` may cross a network — a tunnel, a reverse proxy, a VPN —
+/// where a healthy `/healthz` can legitimately take longer than that, so the
+/// remote budget waits out one slow round trip instead of reporting a live
+/// engine as absent. Neither budget is negotiable at runtime: the probe has
+/// to refuse a genuinely dead endpoint in bounded time, and a stalled
+/// endpoint must not hang the command.
+const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The liveness-probe budget for `url` — see [`LOOPBACK_PROBE_TIMEOUT`].
+fn probe_timeout(url: &str) -> Duration {
+    if url_is_loopback(url) {
+        LOOPBACK_PROBE_TIMEOUT
+    } else {
+        REMOTE_PROBE_TIMEOUT
+    }
+}
+
+/// The whole client-side engine-access policy, and it has exactly two
+/// outcomes: an engine that answers lets the command proceed, anything else
+/// refuses. No client command may start an engine (#658 — a `preloop run`
+/// from the pre-push hook used to boot a control plane and a smolVM on the
+/// developer's machine); `preloop serve` is the only entry point that starts
+/// one.
+///
+/// Pure on purpose: the start path is gone, so this is the policy's entire
+/// surface and tests cover it without touching the process table.
+fn engine_access(reachable: bool, url: &str) -> anyhow::Result<()> {
+    if reachable {
         return Ok(());
     }
+    Err(no_engine_error(url))
+}
 
+/// What a client command says, and exits non-zero with, when nothing answers
+/// the liveness probe: what was probed, and both ways to start an engine.
+///
+/// The message carries [`ENGINE_UNREACHABLE_MARKER`] through
+/// [`engine_unreachable_context`]. That is a compatibility contract, not
+/// decoration: the pre-push hook fails open only on that marker, so dropping
+/// it would turn a missing engine into "CI failed" and block pushes with a
+/// verdict about a run that never happened.
+fn no_engine_error(url: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no engine is running at {url} — start one with `preloop serve` (foreground) \
+         or `preloop server install` (supervised service)"
+    )
+    .context(engine_unreachable_context())
+}
+
+/// Probe the endpoint this CLI would use — `PRELOOP_URL` when set, else the
+/// local default — and refuse when nothing answers.
+///
+/// `PRELOOP_URL` still means "talk to that engine": it is probed like any
+/// other endpoint, never assumed live, and never replaced by a locally
+/// started one.
+///
+/// `url_override` is the endpoint a command carries itself (`dap --url`). It
+/// is probed instead of the default: the command will talk to that engine, so
+/// probing anywhere else would refuse a live one.
+async fn require_running_engine(url_override: Option<&str>) -> anyhow::Result<()> {
     let client = build_client();
-    let url = server_url();
+    let url = url_override.map(str::to_owned).unwrap_or_else(server_url);
+    // Anonymous liveness probe — see `probe_engine_health`.
+    let reachable = probe_engine_health(&client, &url).await;
+    engine_access(reachable, &url)
+}
 
-    // The liveness probe is anonymous — see `probe_engine_health`.
-    if probe_engine_health(&client, &url).await {
-        return Ok(());
+/// The endpoint a client command selects for itself, when it has one. `None`
+/// means the command talks to whatever `PRELOOP_URL` (else the local default)
+/// names, which [`server_url`] resolves.
+fn command_engine_url(command: &Command) -> Option<&str> {
+    match command {
+        Command::Dap(args) => args.url.as_deref(),
+        _ => None,
     }
+}
 
-    eprintln!("[preloop] Starting local background engine...");
-
-    let preloop_dir = preloop_home();
-    let state_dir = preloop_dir.join("state");
-    let pid_path = preloop_dir.join("preloop.pid");
-
+/// First-run preparation for the one command that starts an engine: create
+/// the home and, when the control database is brand-new (absent or empty),
+/// initialize it through the embedded migrations, so a fresh `PRELOOP_HOME`
+/// serves with no extra step.
+///
+/// The database prepared is the one the boot will open: `store_url` is
+/// `preloop serve --store`, and `None` falls back to `PRELOOP_STORE_URL` and
+/// then to the state-dir default — the same precedence the server resolves
+/// (`StoreTarget::resolve`).
+///
+/// An existing database is never touched: `preloop serve` does not migrate,
+/// and an older, newer or divergent schema still fails the boot with
+/// `preloop store migrate` in the message. `PRELOOP_STORE_URL` redirects the
+/// store — a Postgres URL is the operator's to provision.
+fn prepare_local_engine_home(
+    home: &std::path::Path,
+    store_url: Option<&str>,
+) -> anyhow::Result<()> {
+    let state_dir = home.join("state");
     std::fs::create_dir_all(&state_dir)?;
-    set_private_directory_permissions(&preloop_dir)?;
-
-    // Brand-new local installs: initialize the control database here so
-    // first use stays zero-config. Anything that already exists is left
-    // untouched — the engine refuses a missing/older/newer schema and
-    // `preloop store migrate` is the explicit upgrade path (never implicit).
-    if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir)? {
-        eprintln!(
-            "[preloop] initialized the local control database ({}), migrations applied",
-            state_dir.join("preloop.db").display()
-        );
+    set_private_directory_permissions(home)?;
+    if preloop_runner_server::store_admin::prepare_brand_new_local(&state_dir, store_url)? {
+        eprintln!("[preloop] initialized the brand-new control database");
     }
-
-    let store = preloop_runner_server::credential_store::store_from_env(&preloop_dir);
-    let token = prepare_engine_token(
-        &preloop_dir,
-        std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
-        store.as_ref(),
-    )?;
-
-    let engine_bin = std::env::current_exe().context("resolve preloop executable")?;
-
-    let mut cmd = std::process::Command::new(&engine_bin);
-    cmd.arg("engine");
-    cmd.env("PRELOOP_SYSTEM_TOKEN", token);
-    cmd.env("PRELOOP_HOME", &preloop_dir);
-    if std::env::var_os("RUST_LOG").is_none() {
-        cmd.env("RUST_LOG", "info,preloop=debug");
-    }
-
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(preloop_dir.join("engine.log"))?;
-
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(log_file.try_clone()?);
-    cmd.stderr(log_file);
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn engine at {}", engine_bin.display()))?;
-
-    let _ = std::fs::write(&pid_path, child.id().to_string());
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(30) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!("engine exited before becoming ready: {status}");
-        }
-        if client
-            .get(format!("{url}/healthz"))
-            .timeout(Duration::from_millis(300))
-            .send()
-            .await
-            .is_ok()
-        {
-            eprintln!("[preloop] Engine ready.");
-            return Ok(());
-        }
-    }
-
-    anyhow::bail!("engine auto-boot timed out after 30 seconds");
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1614,7 +1740,7 @@ fn prepare_engine_token(
     )
 }
 
-/// Move any inline GitHub credential in `config` into the OS credential
+/// Move any inline GitHub credential in `config` into the selected credential
 /// store, returning whether anything moved.
 ///
 /// Only the `legacy_*` fields are inspected, and those are populated purely
@@ -1802,7 +1928,11 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     // which is what the server itself loads at startup. Fill any gaps from
     // it so the startup report matches what the server will actually see.
     let mut file_config = preloop_runner_server::config::load_config()?;
-    let store = preloop_runner_server::credential_store::store_from_env(&preloop_home());
+    let config_path = preloop_runner_server::config::config_path();
+    let store = preloop_runner_server::credential_store::selected_store_for_config(
+        &config_path,
+        file_config.credential_store.as_deref(),
+    )?;
     // Read before migrating: migration moves the inline values out of
     // `config.github`, and the freshly stored ones are not re-resolved here.
     let from_file = github_auth::StoredAuth {
@@ -1813,9 +1943,7 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     };
     if migrate_legacy_github_credentials(&mut file_config, store.as_ref())? {
         preloop_runner_server::config::write_config(&file_config)?;
-        eprintln!(
-            "[preloop] migrated legacy GitHub credentials to the operating-system credential store"
-        );
+        eprintln!("[preloop] migrated legacy GitHub credentials to the credential store");
     }
     auth.fill_gaps(from_file);
 
@@ -1837,6 +1965,20 @@ fn resolve_github_auth(args: &ServeArgs, state_dir: &std::path::Path) -> anyhow:
     Ok(())
 }
 
+/// The pool snapshot an engine starts from. `mode` is the one field with no
+/// per-field setter, and its default is `Warm`, so an on-demand engine must
+/// set it here or `preloop status` advertises a warm pool that does not exist.
+fn initial_pool_snapshot(pool_enabled: bool) -> preloop_observability::status::PoolSnapshot {
+    preloop_observability::status::PoolSnapshot {
+        mode: if pool_enabled {
+            preloop_observability::status::PoolMode::Warm
+        } else {
+            preloop_observability::status::PoolMode::OnDemand
+        },
+        ..Default::default()
+    }
+}
+
 async fn cmd_engine(
     args: ServeArgs,
     observability: preloop_observability::Observability,
@@ -1847,7 +1989,7 @@ async fn cmd_engine(
 
     // Keep AppState's resolver on the same engine home as this CLI.
     unsafe { std::env::set_var("PRELOOP_HOME", &home) };
-    let store = preloop_runner_server::credential_store::store_from_env(&home);
+    let store = preloop_runner_server::credential_store::engine_store(&home)?;
     let token = prepare_engine_token(
         &home,
         std::env::var("PRELOOP_SYSTEM_TOKEN").ok(),
@@ -1890,14 +2032,23 @@ async fn cmd_engine(
     let runner_url = std::env::var("PRELOOP_RUNNER_URL").unwrap();
     let control_origin = mounted_control_origin(&runner_url);
 
+    // `preloop serve` is the only command that starts an engine (#658), so
+    // it owns the zero-config first run: create the home and initialize a
+    // brand-new control database. The removed client-command auto-start used
+    // to perform this step. `--store` selects the database, exactly as it
+    // selects the one the server below opens.
+    prepare_local_engine_home(&home, args.store.as_deref())?;
+
     // Resolve GitHub credentials before `AppState::new` reads the environment.
     // Both `github_app::load_from_env` and the webhook-secret lookup happen
     // inside `serve`, so anything published after that call is ignored.
     //
     // The offer comes first: `preloop init` writes credentials too, and a
     // credential configured by the wizard must be the one this process picks
-    // up, not the one it read a moment earlier.
-    offer_init_when_unconfigured().await?;
+    // up, not the one it read a moment earlier. The wizard may also resolve a
+    // public URL of its own (the App flow's question), which has to reach the
+    // engine *this* process is about to start.
+    offer_init_when_unconfigured(&public_url).await?;
     resolve_github_auth(&args, &state_dir)?;
 
     // Shared with the runner pool so it can size provisioning to the work
@@ -1927,15 +2078,14 @@ async fn cmd_engine(
     // never shows a warm pool that is not configured; `desired` is filled
     // from the resolved config below.
     let pool_status = std::sync::Arc::new(preloop_observability::status::PoolStatus::new(
-        preloop_observability::status::PoolSnapshot {
-            mode: if pool_enabled {
-                preloop_observability::status::PoolMode::Warm
-            } else {
-                preloop_observability::status::PoolMode::OnDemand
-            },
-            ..Default::default()
-        },
+        initial_pool_snapshot(pool_enabled),
     ));
+    // One outbound-GitHub funnel for the whole engine: the server's webhook,
+    // dispatch and check-run paths and the runner pool's golden downloads all
+    // resolve through these breakers, so a GitHub outage is discovered once
+    // and the golden lookup is refused instead of spending its own 30 s
+    // metadata deadline rediscovering it.
+    let github = preloop_runner_server::github_breaker::GithubFunnel::default();
     let pool_config = local_runner_pool_config(
         &home,
         runner_url.clone(),
@@ -1948,6 +2098,7 @@ async fn cmd_engine(
         pending_registrations.clone(),
         pool_status.clone(),
         observability.clone(),
+        Some(github.clone()),
     );
     // Report the real pool configuration: the configured warm size (or zero
     // in on-demand mode) instead of the zero-sized warm default.
@@ -1958,8 +2109,55 @@ async fn cmd_engine(
         // the Warm/OnDemand seed picked from the enable switch alone.
         Err(_) => pool_status.set_mode(preloop_observability::status::PoolMode::Disabled),
     }
+    // Resolve the VM substrate and run the guest-agent rootfs guard *before*
+    // the server exists. `pool_available` decides whether the control plane
+    // demands a provision token from every registering runner, so a pool the
+    // guard disables has to be known here: clearing the pool afterwards would
+    // leave the server in pool-managed assignment mode with no pool to mint a
+    // token, and jobs the engine could otherwise hand to an ordinary runner
+    // would wait on the provisioning list forever.
+    //
+    // The guard fails the pool fast, once, on a rootfs the resolved smolvm
+    // cannot manage. Booting from it would leave every machine unstoppable
+    // ("running guest agent does not support safe shutdown; VM left
+    // unchanged"), which the pool would otherwise retry, with the same opaque
+    // error, for hours. The engine keeps serving so `preloop status` and the
+    // recovery commands still work; the guard's message names both rootfs
+    // paths, both agent hashes, the host version, and the remedy.
+    let mut agent_guard_error = None;
+    if let Ok(config) = &pool_config {
+        if !pool_enabled {
+            if config.use_fork {
+                tracing::info!(
+                    "warm runner pool disabled; forking one VM per queued job from the golden"
+                );
+            } else {
+                tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
+            }
+        }
+        // Supervisor-side, once, before any VM boots: systemd's
+        // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
+        // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
+        // get no cpu/memory/pids limit files. This performs the same
+        // vacate-then-enable dance `smolvm serve` does. It is the only
+        // place Preloop writes to the cgroup hierarchy — the CLI paths
+        // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
+        // root read-only and never mutate it.
+        preloop_sandbox::drivers::smolvm::cli::init_vm_cgroup_delegation();
+        // The public build ships one driver, so the guest-agent guard always
+        // runs: every machine this pool boots comes from the SmolVM driver.
+        if let Err(error) = preloop_sandbox::drivers::smolvm::cli::agent_rootfs::guard(
+            std::path::Path::new("smolvm"),
+        ) {
+            tracing::error!("{error}");
+            tracing::error!("runner pool disabled until the smolvm guest agent is repaired");
+            pool_status.set_mode(preloop_observability::status::PoolMode::Disabled);
+            agent_guard_error = Some(error);
+        }
+    }
     let pool_available = match &pool_config {
-        Ok(_) => true,
+        Ok(_) if agent_guard_error.is_none() => true,
+        Ok(_) => false,
         Err(error) => {
             // "jobs queue until a runner is available" was the old message,
             // but a missing bundle means no runner will EVER become
@@ -1971,10 +2169,14 @@ async fn cmd_engine(
                 "no runner pool: jobs will fail after the queue grace window. \
                  Install the Linux guest runner with `preloop update`, or set \
                  PRELOOP_RUNNER_BUNDLE to a directory containing preloop-runner \
-                 (see docs/vm-images.md)"
+                 (see docs/control-plane/operate/vm-images.mdx)"
             );
             false
         }
+    };
+    let pool_config = match pool_config {
+        Ok(config) if agent_guard_error.is_none() => Some(config),
+        _ => None,
     };
     let mut server = tokio::spawn(preloop_runner_server::serve(
         preloop_runner_server::ServerConfig {
@@ -1987,6 +2189,7 @@ async fn cmd_engine(
             pending_registrations: pool_available.then_some(pending_registrations),
             pool_status: Some(pool_status.clone()),
             observability: Some(observability),
+            github: Some(github),
             require_job_assignments: env_flag("PRELOOP_REQUIRE_JOB_ASSIGNMENTS", false),
             state_dir,
             store_url: args.store.clone(),
@@ -2004,63 +2207,270 @@ async fn cmd_engine(
         result = &mut server => return result?,
         result = wait_for_engine_socket(&socket, listen) => result?,
     }
+    // This process now owns the engine socket, so no other engine on this home
+    // is provisioning. The machines the stale agent left unstoppable are still
+    // running: `machine stop` refuses them, and the pool's own startup cleanup
+    // will not run because the pool is disabled. Reap them here, where the
+    // purge cannot race a live engine.
+    if agent_guard_error.is_some() {
+        purge_stuck_vms();
+    }
+
+    // Every way out of this process — the normal shutdown below, a pool that
+    // never recovers, an error return like a failed sandbox service startup —
+    // must not leave VMs running: see `VmTeardownOnExit`. Armed before the
+    // first pool spawn so even those early returns run the exit scan.
+    let _vm_teardown = VmTeardownOnExit;
 
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut pool = match pool_config {
-        Ok(config) => {
-            if !pool_enabled {
-                if config.use_fork {
-                    tracing::info!(
-                        "warm runner pool disabled; forking one VM per queued job from the golden"
-                    );
-                } else {
-                    tracing::info!("warm runner pool disabled; provisioning one VM per queued job");
-                }
-            }
-            let pool_shutdown = shutdown.clone();
-            // Supervisor-side, once, before any VM boots: systemd's
-            // `Delegate=cpu memory pids` chowns this unit's cgroup subtree but
-            // leaves `cgroup.subtree_control` empty, so a `vm-<pid>` leaf would
-            // get no cpu/memory/pids limit files. This performs the same
-            // vacate-then-enable dance `smolvm serve` does. It is the only
-            // place Preloop writes to the cgroup hierarchy — the CLI paths
-            // (`preloop shell`, debug-session `machine exec`/`cp`) resolve the
-            // root read-only and never mutate it.
-            preloop_vm::init_vm_cgroup_delegation();
-            let backend = vm_backend()?;
-            tracing::info!(backend = backend.as_str(), "VM substrate selected");
-            Some(tokio::spawn(async move {
-                RunnerPool::new(std::sync::Arc::new(vm_provider(backend)), config)?
-                    .run(pool_shutdown)
-                    .await
-            }))
-        }
-        Err(_) => None,
+
+    // The runner pool gets its machines from the embedded Sandbox Service.
+    // Without a pool there is nothing to place here, so do not open the
+    // service (or bind its API) at all.
+    let sandboxes = sandbox::start_if_pool(pool_config.is_some(), &home).await?;
+    let machines = sandboxes.as_ref().map(sandbox::LocalSandboxes::machines);
+
+    let spawn_pool = |config: &RunnerPoolConfig,
+                      pool_shutdown: tokio_util::sync::CancellationToken| {
+        let config = config.clone();
+        let machines = machines
+            .clone()
+            .expect("a configured pool always starts the sandbox service");
+        tokio::spawn(async move { RunnerPool::new(machines, config)?.run(pool_shutdown).await })
+    };
+    // Each generation gets a fresh child token: `RunnerPool::run` cancels the
+    // token it is handed when a slot ends so its siblings drain, and reusing
+    // the same token would hand the replacement pool an already-fired
+    // cancellation that makes it exit `Ok` — and stop the engine — instantly.
+    let mut pool = pool_config
+        .as_ref()
+        .map(|config| spawn_pool(config, shutdown.child_token()));
+
+    // A pool task that returns an error ends only the pool, not the engine:
+    // `RunnerPool::run` ran its teardown on the way out, so nothing is left
+    // running, and the server must keep answering clients (including
+    // `preloop status`, which is how this failure is diagnosed). The pool is
+    // rebuilt on an exponential backoff; a run that reached steady state
+    // resets the backoff so a one-off failure retries quickly.
+    let mut signal = Box::pin(engine_shutdown_signal());
+    let stop = supervise_pool(
+        &mut server,
+        &mut pool,
+        signal.as_mut(),
+        |restart| {
+            tracing::error!(%restart, "runner pool exited; rebuilding it after a backoff");
+            pool_status.record_provision_failure();
+            !pool_preparing.load(std::sync::atomic::Ordering::Acquire)
+        },
+        || {
+            pool_config
+                .as_ref()
+                .map(|config| spawn_pool(config, shutdown.child_token()))
+        },
+    )
+    .await;
+    let result = match stop {
+        Stop::Server(result) | Stop::Pool(result) => Some(result),
+        Stop::Signal => None,
     };
 
-    if let Some(pool_task) = pool.as_mut() {
-        tokio::select! {
-            result = &mut server => { result??; return Ok(()); },
-            result = pool_task => { result??; return Ok(()); },
-            _ = engine_shutdown_signal() => {},
-        }
-    } else {
-        tokio::select! {
-            result = &mut server => { result??; return Ok(()); },
-            _ = engine_shutdown_signal() => {},
-        }
-    }
     shutdown.cancel();
-    if let Some(pool_task) = pool.as_mut()
-        && tokio::time::timeout(Duration::from_secs(30), &mut *pool_task)
-            .await
-            .is_err()
-    {
-        pool_task.abort();
-    }
+    settle_pool(&mut pool, Duration::from_secs(30)).await;
     server.abort();
     let _ = std::fs::remove_file(socket);
-    Ok(())
+    match result {
+        Some(result) => result,
+        None => Ok(()),
+    }
+}
+
+/// First wait before rebuilding a pool whose task returned an error.
+const POOL_RESTART_MIN: Duration = Duration::from_secs(1);
+/// Longest wait between pool rebuilds; each consecutive failure doubles the
+/// previous wait.
+const POOL_RESTART_MAX: Duration = Duration::from_secs(300);
+/// A pool that finished preparing and then ran this long reached steady
+/// state; a later failure restarts from [`POOL_RESTART_MIN`] instead of
+/// inheriting a stale maximum.
+const POOL_STEADY_AFTER: Duration = Duration::from_secs(60);
+
+/// Why the engine is stopping; each result is handled *after* the pool has
+/// settled, never by an early return past its teardown.
+#[derive(Debug)]
+enum Stop {
+    Server(anyhow::Result<()>),
+    Pool(anyhow::Result<()>),
+    Signal,
+}
+
+fn flatten_task_result<E: Into<anyhow::Error>>(
+    result: Result<Result<(), E>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    result.map_err(anyhow::Error::from)?.map_err(Into::into)
+}
+
+/// Wait for the first reason the engine must stop.
+///
+/// `signal` is borrowed, not consumed: the caller loops over this function
+/// when it restarts a failed pool, and the pending signal future must
+/// survive between iterations.
+///
+/// When the pool task is the one that ended the race, its handle is consumed
+/// out of `pool`: a finished `JoinHandle` panics if it is polled again, and
+/// the shutdown sequence that follows would otherwise wait on it.
+async fn wait_for_stop<S, P>(
+    server: &mut tokio::task::JoinHandle<Result<(), S>>,
+    pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
+    signal: std::pin::Pin<&mut impl Future<Output = ()>>,
+) -> Stop
+where
+    S: Into<anyhow::Error>,
+    P: Into<anyhow::Error>,
+{
+    let stop = {
+        let pool_ended = async {
+            match pool.as_mut() {
+                Some(task) => flatten_task_result(task.await),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            result = &mut *server => Stop::Server(flatten_task_result(result)),
+            result = pool_ended => Stop::Pool(result),
+            _ = signal => Stop::Signal,
+        }
+    };
+    if matches!(stop, Stop::Pool(_)) {
+        *pool = None;
+    }
+    stop
+}
+
+/// Run the server/pool race until the engine must stop, rebuilding a failed
+/// pool instead of ending the process.
+///
+/// A `RunnerPool::run` that returns an error has already torn every machine
+/// down, so the failure is survivable: `report` sees it (logging, status
+/// counters) and answers whether the dead pool had finished preparing —
+/// only a pool that reached steady state resets the backoff, because a slow
+/// persistent failure (a multi-GB unpack on a full disk) must keep doubling
+/// rather than hot-retry every second. `respawn` builds the next
+/// generation's handle; each generation must carry a fresh child token
+/// because `RunnerPool::run` cancels the token it is handed when a slot
+/// ends.
+///
+/// While the backoff sleeps the server and the shutdown signal stay in the
+/// race — a dead HTTP side stops the engine now instead of after the sleep
+/// spawning a pool for a dead server. `Stop::Server`, `Stop::Pool(Ok(..))`,
+/// and `Stop::Signal` end the loop untouched.
+async fn supervise_pool<S, P>(
+    server: &mut tokio::task::JoinHandle<Result<(), S>>,
+    pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
+    signal: std::pin::Pin<&mut impl Future<Output = ()>>,
+    mut report: impl FnMut(&anyhow::Error) -> bool,
+    mut respawn: impl FnMut() -> Option<tokio::task::JoinHandle<Result<(), P>>>,
+) -> Stop
+where
+    S: Into<anyhow::Error>,
+    P: Into<anyhow::Error>,
+{
+    let mut restart_backoff = POOL_RESTART_MIN;
+    let mut signal = signal;
+    loop {
+        let pool_started = std::time::Instant::now();
+        match wait_for_stop(server, pool, signal.as_mut()).await {
+            Stop::Pool(Err(error)) => {
+                let reached_steady = report(&error) && pool_started.elapsed() >= POOL_STEADY_AFTER;
+                if reached_steady {
+                    restart_backoff = POOL_RESTART_MIN;
+                }
+                tokio::select! {
+                    result = &mut *server => {
+                        return Stop::Server(flatten_task_result(result));
+                    }
+                    _ = signal.as_mut() => return Stop::Signal,
+                    _ = tokio::time::sleep(restart_backoff) => {}
+                }
+                restart_backoff = restart_backoff.saturating_mul(2).min(POOL_RESTART_MAX);
+                *pool = respawn();
+            }
+            stop => return stop,
+        }
+    }
+}
+
+/// Give the pool `grace` to reach its own teardown after the shutdown token
+/// fired, then abort and join it.
+///
+/// The join matters: a pool that did not finish inside the window can be
+/// stuck in a provider call that never observes the token, and the exit guard
+/// scans for VMs next — a slot must not be able to boot one after that scan,
+/// or it is stranded on the host.
+async fn settle_pool<P>(
+    pool: &mut Option<tokio::task::JoinHandle<Result<(), P>>>,
+    grace: Duration,
+) {
+    if let Some(task) = pool.as_mut()
+        && tokio::time::timeout(grace, &mut *task).await.is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
+    *pool = None;
+}
+
+/// Stop every VM this engine owns as the process exits.
+///
+/// SmolVM's `_boot-vm` hypervisor is detached from the CLI that spawned it —
+/// it survives the parent by design — and each packed machine's
+/// `pack/layers-cs` APFS sparseimage stays mounted for the life of the VM. An
+/// engine that exits with a machine still running leaves a hypervisor and a
+/// mount nothing can reach: the next engine cannot adopt them, and the home
+/// cannot be removed (`rm -rf` → `Resource busy`) until the host reboots.
+///
+/// The pool runs its own teardown on every path it reaches; this is the
+/// backstop for the paths it does not. Both steps are safe against a live
+/// machine: the purge keys on this home's boot-config paths (and `All` is
+/// sound because by now this process is exiting, so nothing of ours can be
+/// running), and a mount whose hypervisor still exists is skipped.
+struct VmTeardownOnExit;
+
+impl Drop for VmTeardownOnExit {
+    fn drop(&mut self) {
+        purge_stuck_vms();
+    }
+}
+
+/// Kill the detached hypervisors and layer mounts nothing can reach any more.
+///
+/// Two callers: the exit backstop above, and the startup path where the
+/// guest-agent guard disables the runner pool. The second is the case this
+/// sweep exists for — a guest agent the resolved smolvm cannot stop refused
+/// every `machine stop`, so the machines of the previous engine are still
+/// running when the next one starts, and disabling the pool means
+/// `RunnerPool::run` never gets to run its own startup cleanup.
+///
+/// Both steps are safe against a live machine: the purge keys on this home's
+/// boot-config paths (and `All` is sound because the caller is either exiting
+/// or holding the engine's socket, so nothing of ours is provisioning), and a
+/// mount whose hypervisor still exists is skipped.
+fn purge_stuck_vms() {
+    match preloop_sandbox::drivers::smolvm::cli::purge_orphaned_vms(
+        preloop_sandbox::drivers::smolvm::cli::OrphanPurge::All,
+    ) {
+        Ok(killed) if killed > 0 => {
+            tracing::info!(killed, "purged orphaned SmolVM hypervisor processes")
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "orphaned hypervisor purge failed"),
+    }
+    match preloop_sandbox::drivers::smolvm::cli::detach_orphaned_layer_mounts() {
+        Ok(detached) if detached > 0 => {
+            tracing::info!(detached, "detached orphaned SmolVM layer mounts")
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "orphaned layer-mount detach failed"),
+    }
 }
 
 async fn engine_shutdown_signal() {
@@ -2088,9 +2498,12 @@ async fn wait_for_engine_socket(
     // and port); the Unix client rides the control socket instead. 500ms
     // timeout, 30s window.
     #[cfg(unix)]
-    let client = reqwest::Client::builder().unix_socket(socket).build()?;
+    let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+        .unix_socket(socket)
+        .build()?;
     #[cfg(not(unix))]
-    let client = reqwest::Client::new();
+    let client =
+        preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder()).build()?;
     let readyz_url = format!("http://{listen}/readyz");
     let start = std::time::Instant::now();
     let mut last_reason: Option<String> = None;
@@ -2197,7 +2610,12 @@ fn configured_base_image() -> anyhow::Result<String> {
 /// `serve` with no golden configured: offer the wizard when a human is
 /// watching, otherwise say the one line an operator needs. A non-interactive
 /// `serve` (systemd, CI, a pipe) must never block on a prompt.
-async fn offer_init_when_unconfigured() -> anyhow::Result<()> {
+///
+/// `engine_public_url` is the origin this engine resolved for itself before the
+/// wizard ran. The wizard can resolve a different one — the App flow asks for
+/// the address GitHub is given — and the handoff installs that answer into the
+/// running engine (or reports which origin won when the two disagree).
+async fn offer_init_when_unconfigured(engine_public_url: &str) -> anyhow::Result<()> {
     let config = preloop_runner_server::config::load_config()?;
     if preloop_runner_server::config::golden_base_image(&config).is_some() {
         return Ok(());
@@ -2225,33 +2643,26 @@ async fn offer_init_when_unconfigured() -> anyhow::Result<()> {
     // graph is genuinely cyclic (`serve` offers `init`, which can start
     // `serve`); the mode this entry point forces is what keeps it from
     // recursing at runtime.
-    Box::pin(init::run_from_serve()).await?;
+    let resolved = Box::pin(init::run_from_serve()).await?;
+    // The engine has not started serving yet, and its Check Run links and
+    // webhook health check read the origin off this environment: the answer
+    // has to land here, in-process, or the App would point at the new URL
+    // while every link and health check stayed on the old one.
+    if let Some(note) = init::apply_engine_public_url(engine_public_url, resolved.as_deref()) {
+        eprintln!("[preloop] {note}");
+    }
     eprintln!("[preloop] configuration written; continuing to serve");
     Ok(())
 }
 
-// Configuration assembly, not a public API: the parameter list mirrors the
-// inputs the pool genuinely needs.
-#[allow(clippy::too_many_arguments)]
-fn local_runner_pool_config(
-    home: &std::path::Path,
-    server_url: String,
-    control_origin: Option<String>,
-    control_upstream: Option<String>,
-    queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
-    pool_enabled: bool,
-    preparing_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pending_registrations: std::sync::Arc<
-        std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
-    >,
-    pool_status: std::sync::Arc<preloop_observability::status::PoolStatus>,
-    observability: preloop_observability::Observability,
-) -> anyhow::Result<RunnerPoolConfig> {
-    let control_bridge = home.join("control-bridge");
-    std::fs::create_dir_all(&control_bridge)?;
-    set_private_directory_permissions(&control_bridge)?;
-    let runner_bundle = std::env::var_os("PRELOOP_RUNNER_BUNDLE")
+/// The Linux runner bundle the engine mounts: `PRELOOP_RUNNER_BUNDLE` when it
+/// names a usable tree, otherwise the installed or development bundle beside
+/// this executable.
+///
+/// Shared with `preloop volumes prune`, which must keep the volume of the
+/// bundle the engine would actually mount.
+pub(crate) fn discovered_runner_bundle() -> Option<PathBuf> {
+    std::env::var_os("PRELOOP_RUNNER_BUNDLE")
         .map(PathBuf::from)
         .filter(|path| linux_runner_bundle(path))
         .or_else(|| {
@@ -2289,29 +2700,33 @@ fn local_runner_pool_config(
                 .find(|directory| directory.join("preloop-runner").is_file())
         })
         .filter(|path| linux_runner_bundle(path))
-        .context("Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/vm-images.md)")?;
-    let backend = vm_backend()?;
-    // AgentENV has no socket relay: the guest dials the runner URL over plain
-    // TCP, so a loopback URL points at the guest itself and no job can ever
-    // register. Fail here with the fix instead of timing jobs out one by one.
-    // An explicit control upstream is the exception: the guest then reaches
-    // the engine over virtio-net at that address instead.
-    if backend == VmBackend::Agentenv && control_upstream.is_none() && url_is_loopback(&server_url)
-    {
-        anyhow::bail!(
-            "PRELOOP_RUNNER_URL is loopback ({server_url}) but the AgentENV backend \
-             reaches the engine over TCP from inside the guest, where loopback is \
-             the guest itself: set PRELOOP_RUNNER_URL to a host-reachable address \
-             (e.g. http://<lan-ip>:<port>), or set PRELOOP_CONTROL_UPSTREAM"
-        );
-    }
-    // With a reachable URL in hand, reconcile the host-side exception that
-    // lets sandboxes actually dial it: the node deny-list complement plus the
-    // ordered firewall rules. No-op on drift-free hosts; loud failure
-    // otherwise (a half-open egress reads as jobs queueing forever).
-    if backend == VmBackend::Agentenv {
-        aenv_egress::ensure_engine_egress(&server_url)?;
-    }
+}
+
+// Configuration assembly, not a public API: the parameter list mirrors the
+// inputs the pool genuinely needs.
+#[allow(clippy::too_many_arguments)]
+fn local_runner_pool_config(
+    home: &std::path::Path,
+    server_url: String,
+    control_origin: Option<String>,
+    control_upstream: Option<String>,
+    queue_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    next_job_runs_on: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
+    pool_enabled: bool,
+    preparing_signal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pending_registrations: std::sync::Arc<
+        std::sync::RwLock<std::collections::BTreeMap<String, std::time::SystemTime>>,
+    >,
+    pool_status: std::sync::Arc<preloop_observability::status::PoolStatus>,
+    observability: preloop_observability::Observability,
+    github: Option<preloop_runner_server::github_breaker::GithubFunnel>,
+) -> anyhow::Result<RunnerPoolConfig> {
+    let control_bridge = home.join("control-bridge");
+    std::fs::create_dir_all(&control_bridge)?;
+    set_private_directory_permissions(&control_bridge)?;
+    let runner_bundle = discovered_runner_bundle().context(
+        "Linux runner bundle unavailable; set PRELOOP_RUNNER_BUNDLE to a directory containing a Linux preloop-runner, or build one with `just build-preloop` (docs/control-plane/operate/vm-images.mdx)",
+    )?;
     // The mounted control socket only makes sense when the runner URL is
     // loopback (the VM reaches the host through the socket relay). With
     // `PRELOOP_RUNNER_URL` pointing at a host-reachable LAN address — the
@@ -2321,10 +2736,8 @@ fn local_runner_pool_config(
     // it `None` is what switches the transport.
     let control_socket = control_origin.as_ref().map(|_| home.join("preloop.sock"));
     // When a TCP upstream is configured, skip the socket mount — the
-    // guest control bridge will forward via TCP instead of vsock. AgentENV
-    // cannot forward a host socket into a guest at all, so the same TCP
-    // transport is the only option there.
-    let control_socket = if control_upstream.is_some() || backend == VmBackend::Agentenv {
+    // guest control bridge will forward via TCP instead of vsock.
+    let control_socket = if control_upstream.is_some() {
         None
     } else {
         control_socket
@@ -2351,9 +2764,8 @@ fn local_runner_pool_config(
         } else {
             0
         },
-        // Forking is safe on every backend now: file-pack backends always
-        // restore the packed golden, and AgentENV keeps immutable,
-        // re-forkable snapshots. Size-zero mode still prepares one golden and
+        // Forking is safe when the provider restores packed goldens or keeps
+        // immutable snapshots. Size-zero mode still prepares one golden and
         // forks a disposable VM per job.
         use_fork: env_flag("PRELOOP_USE_FORK", true),
         // Multiple engines on one host must not share a namespace: smolvm
@@ -2406,7 +2818,7 @@ fn local_runner_pool_config(
         control_origin,
         control_socket,
         control_upstream,
-        dns: Some(runner_dns()),
+        dns: runner_dns(),
         registration_token_env: "PRELOOP_SYSTEM_TOKEN".into(),
         labels: runner_pool_labels(),
         cpus,
@@ -2429,6 +2841,7 @@ fn local_runner_pool_config(
         preparing_signal: Some(preparing_signal),
         pool_status: Some(pool_status),
         observability: Some(observability),
+        github,
     })
 }
 
@@ -2510,17 +2923,18 @@ fn runner_storage_gib() -> u32 {
         .filter(|value| *value > 0)
         .unwrap_or(RUNNER_STORAGE_GIB)
 }
-/// Guest DNS resolver. The host's `/etc/resolv.conf` is commonly a loopback
-/// systemd-resolved stub, which is unreachable from a microVM; use the
-/// operator override when supplied and otherwise a public resolver. The
-/// default must answer from any network — an ISP-scoped resolver (e.g.
-/// Comcast's 75.75.75.75) silently times out for guests on every other
-/// carrier, which is how image pulls die with `lookup … i/o timeout`.
-fn runner_dns() -> String {
-    std::env::var("PRELOOP_RUNNER_DNS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "8.8.8.8".to_owned())
+
+/// Only an operator override is explicit guest DNS. When unset, the provider
+/// selects its resolver for the actual network backend and workload.
+fn runner_dns() -> Option<String> {
+    runner_dns_override(std::env::var("PRELOOP_RUNNER_DNS").ok().as_deref())
+}
+
+fn runner_dns_override(configured: Option<&str>) -> Option<String> {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 /// Resident memory an idle runner VM actually holds, in MiB.
@@ -2750,7 +3164,15 @@ fn usable_diff_base(base: &str) -> bool {
 
 /// Remotes configured for this repository, in git's order.
 fn git_remotes() -> Vec<String> {
-    std::process::Command::new("git")
+    git_remotes_in(None)
+}
+
+fn git_remotes_in(repository: Option<&std::path::Path>) -> Vec<String> {
+    let mut command = std::process::Command::new("git");
+    if let Some(repository) = repository {
+        command.arg("-C").arg(repository);
+    }
+    command
         .arg("remote")
         .output()
         .ok()
@@ -2907,10 +3329,9 @@ fn strip_branch_prefix(raw: &str) -> &str {
 
 /// Branch a `pull_request` run should be filtered against.
 ///
-/// GitHub applies `on.pull_request.branches` to the PR's *target* branch, not
-/// the head branch. Without this a local PR run filters on the checked-out
-/// branch and a workflow gated to `branches: [main]` never matches. Only
-/// derived when the payload does not already carry a base ref.
+/// GitHub applies `on.pull_request.branches` to the PR's target branch. When
+/// no target is supplied, use the remote's advertised default branch rather
+/// than the checked-out branch's tracking ref.
 fn default_local_filter_branch(
     event: &str,
     base: Option<&str>,
@@ -2927,18 +3348,80 @@ fn default_local_filter_branch(
     {
         return None;
     }
-    // An explicit `--base` is the user's stated PR target and names the branch
-    // filters apply to whether or not the ref exists locally — shallow clones
-    // and un-fetched bases are normal. Only the fallback needs a real ref,
-    // because it has nothing else to go on.
-    let base = match base {
-        Some(base) => base.to_owned(),
-        None => resolve_local_diff_base(None)?,
-    };
-    // Filters are written against branch names (`main`), not remote-qualified
-    // refs (`origin/main`), but branches can contain slashes (`feature/auth`).
+    let base = base.map(str::to_owned).or_else(local_default_branch)?;
     let name = strip_branch_prefix(&base).to_owned();
     (!name.is_empty()).then_some(name)
+}
+
+/// The base branch whose tip rides in a hosted dirty-submit bundle. The server
+/// builds the test merge against `pull_request_base_branch`, which reads the
+/// payload's `pull_request.base.ref` first, then `--base`, then the derived
+/// filter branch; the bundle must carry the tip of that same branch or the
+/// engine has nothing to merge against.
+fn submit_base_branch(
+    payload: &serde_json::Value,
+    base_arg: Option<&str>,
+    derived_filter_branch: Option<&str>,
+) -> Option<String> {
+    payload
+        .get("pull_request")
+        .and_then(|pr| pr.get("base"))
+        .and_then(|base| base.get("ref"))
+        .and_then(serde_json::Value::as_str)
+        .or(base_arg)
+        .or(derived_filter_branch)
+        .map(|raw| strip_branch_prefix(raw).to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+fn local_default_branch() -> Option<String> {
+    local_default_branch_in(std::path::Path::new("."))
+}
+
+fn local_default_branch_in(repository: &std::path::Path) -> Option<String> {
+    for remote in git_remotes_in(Some(repository)) {
+        let local = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args([
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                &format!("refs/remotes/{remote}/HEAD"),
+            ])
+            .output();
+        if let Ok(output) = local
+            && output.status.success()
+        {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !branch.is_empty() {
+                return Some(branch);
+            }
+        }
+
+        let advertised = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(["ls-remote", "--symref", &remote, "HEAD"])
+            .output();
+        let Ok(output) = advertised else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let output = String::from_utf8_lossy(&output.stdout);
+        let branch = output.lines().find_map(|line| {
+            let (reference, name) = line.split_once('\t')?;
+            (name == "HEAD")
+                .then(|| reference.strip_prefix("ref: refs/heads/"))
+                .flatten()
+        });
+        if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+            return Some(format!("{remote}/{branch}"));
+        }
+    }
+    None
 }
 
 fn collect_local_reusable_workflows(
@@ -2973,6 +3456,12 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // A hook that fails to install after the user accepted is a real
     // failure: report it instead of silently running ungated.
     maybe_offer_hook()?;
+    run_workflow(args).await
+}
+
+/// Everything `preloop run` does after the interactive hook offer: build the
+/// submission from the flags and the checkout, send it, and follow the run.
+async fn run_workflow(args: RunArgs) -> anyhow::Result<()> {
     let workflow_path = resolve_workflow_path(args.file.as_deref())?;
     let workflow_yaml = std::fs::read_to_string(&workflow_path)
         .with_context(|| format!("failed to read workflow: {}", workflow_path.display()))?;
@@ -3022,26 +3511,44 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     .await?;
 
     let push_requested = args.push || args.create_pr;
-    // A dirty working tree is allowed with --push: CI runs on the server's
-    // snapshot of the uncommitted state, and after it passes the CLI
-    // materializes a commit whose tree is exactly what CI tested (see
-    // `decide_dirty_push_opts`). A clean tree pins the push to HEAD directly.
+    // Dirty push submissions are committed before they leave this process.
+    // The commit is created in a private index, so the user's index, refs, and
+    // working tree remain untouched while the engine receives a real C.
     let dirty = if push_requested {
         git_porcelain().context("failed to check the working tree for --push")?
     } else {
         Vec::new()
     };
     let dirty_push = push_requested && !dirty.is_empty();
+    let submit_commit = if dirty_push {
+        // A hosted pull-request merge is built against the base branch, so the
+        // base tip rides in the bundle; every other event tests C alone.
+        let base_branch = (event == "pull_request" && !args.no_merge)
+            .then(|| {
+                submit_base_branch(
+                    &payload,
+                    args.base.as_deref(),
+                    derived_filter_branch.as_deref(),
+                )
+            })
+            .flatten();
+        Some(create_submit_commit(
+            args.message.as_deref(),
+            &dirty,
+            &detect_git_ref(),
+            base_branch.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let tested_head = if push_requested && !dirty_push {
         Some((git_rev_parse("HEAD")?, git_rev_parse("HEAD^{tree}")?))
     } else {
         None
     };
 
-    let implicit_smolvm_debug = !matches!(vm_backend()?, VmBackend::Agentenv)
-        && !args.no_debug
-        && !args.detach
-        && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let implicit_smolvm_debug =
+        !args.no_debug && !args.detach && std::io::IsTerminal::is_terminal(&std::io::stdin());
     let debug_on_failure = args.debug || implicit_smolvm_debug;
     let preserve_on_failure = debug_on_failure || args.preserve_on_failure;
 
@@ -3052,7 +3559,6 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         repository: detect_repository(),
         git_ref: detect_git_ref(),
         workflow_path: Some(workflow_path.display().to_string()),
-        local_workspace: None,
         secrets,
         reusable_workflows,
         selected_jobs: args.job.into_iter().collect(),
@@ -3065,6 +3571,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // list the server was just handed.
         changed_paths_known: derived_changed_paths.is_some(),
         filter_branch: derived_filter_branch,
+        // A local `pull_request` run tests the merge of the current base tip
+        // into the head by default (like GitHub's `refs/pull/<n>/merge`);
+        // `--no-merge` is the explicit escape back to testing the branch
+        // alone.
+        no_merge: args.no_merge,
         // `--debug` keeps the failed runner waiting for a verdict;
         // `--preserve-on-failure` only keeps a completed failed VM for shell.
         preserve_on_failure,
@@ -3074,32 +3585,59 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     // Overridden rather than set in the literal so a plain run keeps the
     // protocol's own defaults for `sha` and `actor`.
     if push_requested {
-        // The base commit: for a clean tree this IS the tested commit; for a
-        // dirty tree it is the parent of the materialized CI-verified commit.
-        submission.sha = git_rev_parse("HEAD")?;
-        // The server names the requester in the PR body it opens.
+        // C is the exact commit CI will test. Clean submissions keep HEAD;
+        // dirty submissions carry C and its tree in the hosted bundle.
+        submission.sha = submit_commit
+            .as_ref()
+            .map(|commit| commit.sha.clone())
+            .unwrap_or(git_rev_parse("HEAD")?);
         if let Some(name) = git_config_user_name() {
             submission.actor = name;
         }
         submission.push = Some(preloop_gha_protocol::PushRequest {
             create_pr: args.create_pr,
             draft_pr: args.pr_draft,
-            // The server verifies the branch head for a dirty-tree push (the
-            // materialized commit) instead of the base sha.
-            dirty: dirty_push,
+            dirty: false,
         });
-        if let Some((_, head_tree)) = tested_head {
-            submission.push_tree = Some(head_tree);
+        submission.push_tree = submit_commit
+            .as_ref()
+            .map(|commit| commit.tree.clone())
+            .or_else(|| tested_head.map(|(_, head_tree)| head_tree));
+        if let Some(commit) = submit_commit.as_ref()
+            && event == "pull_request"
+            && let Some(head) = submission
+                .payload
+                .get_mut("pull_request")
+                .and_then(|pr| pr.get_mut("head"))
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            head.insert("sha".to_owned(), serde_json::json!(commit.sha));
         }
     }
 
     let client = build_client();
     let url = server_url();
+    if let Some(commit) = submit_commit.as_ref() {
+        // The bundle is single-use scratch: remove it whether or not the upload
+        // succeeded, so a refused or failed upload (413, network error) cannot
+        // strand up to 512 MiB in the temp directory.
+        let uploaded = upload_git_bundle(&client, &url, &commit.bundle_path, api_token()).await;
+        let _ = std::fs::remove_file(&commit.bundle_path);
+        submission.git_bundle_id = Some(uploaded?);
+    }
     // Secrets redact on plain serialization; sending them is opt-in.
-    let mut request = client
-        .post(format!("{url}/api/v1/runs"))
-        .json(&submission.to_request_json()?);
-    if should_send_local_workspace_header(&url, std::env::var("PRELOOP_URL").is_err()) {
+    let mut request = engine_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{url}/api/v1/runs"),
+        ENGINE_CONTROL_TIMEOUT,
+    )
+    .json(&submission.to_request_json()?);
+    // A bundled submission carries its own workspace; a workspace header would
+    // point the engine at the live checkout instead of the commit under test.
+    if submit_commit.is_none()
+        && should_send_local_workspace_header(&url, std::env::var("PRELOOP_URL").is_err())
+    {
         let workspace = std::fs::canonicalize(".")?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(workspace.as_os_str().to_string_lossy().as_bytes());
@@ -3159,6 +3697,11 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
     let mut last_activity = std::time::Instant::now();
     let mut last_backpressure = std::time::Instant::now();
     loop {
+        // No total deadline: the server holds this stream open until the run is
+        // terminal, which can be hours. A stalled engine is caught by the
+        // client's connect deadline plus `ENGINE_READ_TIMEOUT` (10 idle
+        // minutes), which surfaces as a stream error and takes the reconnect
+        // path below.
         let mut events_request = client.get(format!(
             "{url}/api/v1/runs/{}/events.ndjson",
             accepted.run_id
@@ -3376,11 +3919,18 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
         // Push-back runs on any conclusion: a draft PR with red checks is
         // the reviewable state. Sync progress goes to stderr so piped
         // stdout stays clean.
+        let tree_unchanged = submit_commit.as_ref().is_none_or(submit_tree_unchanged);
+        // Only a push that actually succeeded may offer to move the branch: a
+        // declined or failed push has published nothing to move to.
+        let mut pushed = false;
         let push_error = if push_requested {
-            if dirty_push {
-                // The PR decision happens after CI for a dirty tree: the
-                // user saw the result and chooses y/N/d now (or a label /
-                // explicit flag decides in non-interactive runs).
+            if dirty_push && !tree_unchanged {
+                eprintln!(
+                    "not pushing submit commit: the working tree changed since submission; \
+                     re-submit to test the new tree"
+                );
+                Some(anyhow::anyhow!("working tree changed since submit"))
+            } else if dirty_push {
                 match decide_dirty_push_opts(
                     &dirty,
                     args.push,
@@ -3388,15 +3938,18 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     args.pr_draft,
                     status == ExecutionStatus::Success,
                 )? {
-                    Some(opts) => push::push_run(
-                        &client,
-                        &url,
-                        api_token(),
-                        &accepted.run_id.to_string(),
-                        Some(opts),
-                    )
-                    .await
-                    .err(),
+                    Some(opts) => {
+                        let result = push::push_run(
+                            &client,
+                            &url,
+                            api_token(),
+                            &accepted.run_id.to_string(),
+                            Some(opts),
+                        )
+                        .await;
+                        pushed = result.is_ok();
+                        result.err()
+                    }
                     None => {
                         eprintln!(
                             "not pushing (declined) — CI result was informational. \
@@ -3407,19 +3960,28 @@ async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     }
                 }
             } else {
-                push::push_run(
+                let result = push::push_run(
                     &client,
                     &url,
                     api_token(),
                     &accepted.run_id.to_string(),
                     None,
                 )
-                .await
-                .err()
+                .await;
+                pushed = result.is_ok();
+                result.err()
             }
         } else {
             None
         };
+        if pushed
+            && dirty_push
+            && tree_unchanged
+            && status == ExecutionStatus::Success
+            && let Some(commit) = submit_commit.as_ref()
+        {
+            offer_branch_move(&commit.sha)?;
+        }
         if let Some(error) = &push_error {
             eprintln!(
                 "push failed: {error:#}\n\
@@ -3459,7 +4021,12 @@ async fn runner_capacity(
     url: &str,
     run_id: RunId,
 ) -> anyhow::Result<Option<(usize, usize)>> {
-    let mut request = client.get(format!("{url}/api/v1/runners?run_id={run_id}"));
+    let mut request = engine_request(
+        client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runners?run_id={run_id}"),
+        ENGINE_CONTROL_TIMEOUT,
+    );
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -3635,6 +4202,335 @@ fn git_porcelain() -> anyhow::Result<Vec<String>> {
         .lines()
         .map(str::to_owned)
         .collect())
+}
+#[derive(Debug)]
+struct SubmitCommit {
+    sha: String,
+    tree: String,
+    bundle_path: PathBuf,
+}
+
+/// A number unique to this process and call, so concurrent submissions in one
+/// process never share an index, message, bundle file or ref namespace.
+fn next_scratch_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A scratch file path in the temp directory, unique to this process and call.
+fn submit_scratch(label: &str, extension: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "preloop-{label}-{}-{}.{extension}",
+        std::process::id(),
+        next_scratch_id()
+    ))
+}
+
+/// `git -C <repo> <args>` with extra environment; returns trimmed stdout.
+fn git_in(
+    repo: &std::path::Path,
+    envs: &[(&str, &std::ffi::OsStr)],
+    args: &[&str],
+) -> anyhow::Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .envs(envs.iter().copied())
+        .args(args)
+        .output()
+        .with_context(|| format!("git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The tree the working tree would commit: tracked changes plus untracked,
+/// non-ignored files, computed in a private index so the user's real index
+/// never moves. The index starts from HEAD, not empty: git keeps tracking a
+/// file that an ignore rule now matches only when the index already lists it,
+/// so an empty index would silently delete such a file from the submit.
+fn worktree_tree_in(repo: &std::path::Path) -> anyhow::Result<String> {
+    let index = submit_scratch("index", "tmp");
+    let env = [("GIT_INDEX_FILE", index.as_os_str())];
+    let tree = git_in(repo, &env, &["read-tree", "HEAD"])
+        .and_then(|_| git_in(repo, &env, &["add", "-A"]))
+        .and_then(|_| git_in(repo, &env, &["write-tree"]));
+    let _ = std::fs::remove_file(&index);
+    tree
+}
+
+/// The commit a hosted pull-request merge is built against: the freshest known
+/// tip of `origin/<base>`. A stale local branch of the same name is used only
+/// when there is no remote-tracking ref at all.
+fn resolve_base_tip_in(repo: &std::path::Path, base: &str) -> anyhow::Result<String> {
+    let base = base.strip_prefix("refs/heads/").unwrap_or(base);
+    // The merge should test the base as it is now. Offline, fall back to the
+    // last fetched tip, and say so rather than testing it silently.
+    if git_in(repo, &[], &["fetch", "--quiet", "origin", base]).is_err() {
+        eprintln!("warning: could not fetch origin/{base}; merging against the last fetched tip");
+    }
+    for candidate in [
+        format!("refs/remotes/origin/{base}^{{commit}}"),
+        format!("refs/heads/{base}^{{commit}}"),
+    ] {
+        if let Ok(sha) = git_in(repo, &[], &["rev-parse", "--verify", "-q", &candidate]) {
+            return Ok(sha);
+        }
+    }
+    anyhow::bail!(
+        "base branch `{base}` was not found on `origin` or locally; fetch it, pass --base, \
+         or use --no-merge"
+    )
+}
+
+/// Create the immutable commit uploaded for a dirty hosted submit. Git
+/// `commit-tree` bypasses commit-msg hooks by design; only a private index is
+/// used, so the user's staging area and branch pointer never move. The editor
+/// opens only for a person at a terminal: a pipe or CI run must never hang on it.
+fn create_submit_commit(
+    explicit_message: Option<&str>,
+    dirty: &[String],
+    git_ref: &str,
+    base_branch: Option<&str>,
+) -> anyhow::Result<SubmitCommit> {
+    let editor = submit_editor(
+        std::env::var("EDITOR").ok(),
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    );
+    create_submit_commit_in(
+        std::path::Path::new("."),
+        explicit_message,
+        editor.as_deref(),
+        dirty,
+        git_ref,
+        base_branch,
+    )
+}
+
+/// The editor to compose the submit message in: `$EDITOR` when one is set and
+/// a person is at the terminal, never otherwise.
+fn submit_editor(editor_env: Option<String>, interactive: bool) -> Option<String> {
+    editor_env
+        .filter(|editor| !editor.trim().is_empty())
+        .filter(|_| interactive)
+}
+
+fn create_submit_commit_in(
+    repo: &std::path::Path,
+    explicit_message: Option<&str>,
+    editor: Option<&str>,
+    dirty: &[String],
+    git_ref: &str,
+    base_branch: Option<&str>,
+) -> anyhow::Result<SubmitCommit> {
+    let parent = git_in(repo, &[], &["rev-parse", "HEAD"])?;
+    let tree = worktree_tree_in(repo)?;
+    let branch = git_ref
+        .strip_prefix("refs/heads/")
+        .unwrap_or(git_ref)
+        .to_owned();
+    let mut message = explicit_message
+        .map(str::to_owned)
+        .unwrap_or_else(|| generated_submit_message(&branch, dirty));
+    if explicit_message.is_none()
+        && let Some(editor) = editor
+    {
+        message = edit_submit_message(editor, &message)?;
+    }
+    if !message.contains("Preloop-Tested-Tree:") {
+        if !message.ends_with('\n') {
+            message.push('\n');
+        }
+        message.push_str(&format!("\nPreloop-Tested-Tree: {tree}\n"));
+    }
+    let identity = |key: &str| {
+        git_in(repo, &[], &["config", key])
+            .ok()
+            .filter(|value| !value.is_empty())
+    };
+    let name = identity("user.name")
+        .ok_or_else(|| anyhow::anyhow!("git user.name is required for a dirty submit"))?;
+    let email = identity("user.email")
+        .ok_or_else(|| anyhow::anyhow!("git user.email is required for a dirty submit"))?;
+    let author = [
+        ("GIT_AUTHOR_NAME", std::ffi::OsStr::new(&name)),
+        ("GIT_AUTHOR_EMAIL", std::ffi::OsStr::new(&email)),
+        ("GIT_COMMITTER_NAME", std::ffi::OsStr::new(&name)),
+        ("GIT_COMMITTER_EMAIL", std::ffi::OsStr::new(&email)),
+    ];
+    let sha = git_in(
+        repo,
+        &author,
+        &["commit-tree", &tree, "-p", &parent, "-m", &message],
+    )?;
+
+    // Bundle exactly what the engine needs and nothing else: the submitted
+    // commit and, for a pull-request merge, the base tip. `--all` would ship
+    // every branch, stash and remote-tracking ref in the repository.
+    let namespace = format!(
+        "refs/preloop/submit/{}-{}",
+        std::process::id(),
+        next_scratch_id()
+    );
+    let mut refs = vec![format!("{namespace}/head")];
+    let bundle_path = submit_scratch("submit", "bundle");
+    let bundled = (|| -> anyhow::Result<()> {
+        git_in(repo, &[], &["update-ref", &refs[0], &sha])?;
+        if let Some(base) = base_branch {
+            let base = base.strip_prefix("refs/heads/").unwrap_or(base);
+            let tip = resolve_base_tip_in(repo, base)?;
+            let base_ref = format!("{namespace}/base/{base}");
+            git_in(repo, &[], &["update-ref", &base_ref, &tip])?;
+            refs.push(base_ref);
+        }
+        let bundle_arg = bundle_path.to_string_lossy();
+        let mut args = vec!["bundle", "create", bundle_arg.as_ref()];
+        args.extend(refs.iter().map(String::as_str));
+        git_in(repo, &[], &args)?;
+        Ok(())
+    })();
+    // The refs only name the bundle's contents; the repository keeps none.
+    for name in &refs {
+        let _ = git_in(repo, &[], &["update-ref", "-d", name]);
+    }
+    if let Err(error) = bundled {
+        let _ = std::fs::remove_file(&bundle_path);
+        return Err(error);
+    }
+    Ok(SubmitCommit {
+        sha,
+        tree,
+        bundle_path,
+    })
+}
+
+/// Let the user edit the commit message the way `git commit` does: the command
+/// goes through a shell so `EDITOR="code --wait"` works.
+fn edit_submit_message(editor: &str, initial: &str) -> anyhow::Result<String> {
+    let path = submit_scratch("message", "txt");
+    std::fs::write(&path, initial).context("write prefilled submit message")?;
+    let status = std::process::Command::new("sh")
+        .args(["-c", &format!("{editor} \"$1\""), "preloop"])
+        .arg(&path)
+        .status()
+        .context("run $EDITOR for submit commit");
+    let edited = match status {
+        Ok(status) if status.success() => {
+            std::fs::read_to_string(&path).context("read submit message")
+        }
+        Ok(_) => Err(anyhow::anyhow!(
+            "$EDITOR failed while composing the submit commit"
+        )),
+        Err(error) => Err(error),
+    };
+    let _ = std::fs::remove_file(&path);
+    edited
+}
+
+fn generated_submit_message(branch: &str, dirty: &[String]) -> String {
+    let mut dirs = dirty
+        .iter()
+        .filter_map(|line| line.get(3..))
+        .filter_map(|path| path.split('/').next())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs.dedup();
+    format!(
+        "wip({branch}): {} files in {}",
+        dirty.len(),
+        if dirs.is_empty() {
+            ".".to_owned()
+        } else {
+            dirs.join(", ")
+        }
+    )
+}
+
+fn run_git_status<const N: usize>(args: [&str; N]) -> anyhow::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .context("run git command")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+async fn upload_git_bundle(
+    client: &reqwest::Client,
+    url: &str,
+    path: &std::path::Path,
+    token: Option<String>,
+) -> anyhow::Result<String> {
+    let body = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read git bundle {}", path.display()))?;
+    let mut request = engine_request(
+        client,
+        reqwest::Method::POST,
+        format!("{url}/api/v1/bundles"),
+        ENGINE_BUNDLE_UPLOAD_TIMEOUT,
+    )
+    .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+    .body(body);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.context("upload git bundle")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("bundle upload returned {status}: {body}");
+    }
+    let body: serde_json::Value = response.json().await.context("decode bundle upload")?;
+    body["bundle_id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("bundle upload response omitted bundle_id"))
+}
+/// Whether the working tree still holds exactly the submitted tree on top of
+/// the submitted parent. Compared by tree hash: `git status --porcelain` lists
+/// the same line for a file edited again after CI started, so it cannot tell.
+fn submit_tree_unchanged(commit: &SubmitCommit) -> bool {
+    submit_tree_unchanged_in(std::path::Path::new("."), commit)
+}
+
+fn submit_tree_unchanged_in(repo: &std::path::Path, commit: &SubmitCommit) -> bool {
+    let parent = git_in(repo, &[], &["rev-parse", &format!("{}^", commit.sha)]).ok();
+    let head = git_in(repo, &[], &["rev-parse", "HEAD"]).ok();
+    parent.is_some()
+        && parent == head
+        && worktree_tree_in(repo).ok().as_deref() == Some(commit.tree.as_str())
+}
+
+/// Moving the checked-out branch to C changes the user's worktree, so it is
+/// offered only after an explicit answer and only when the tree still matches
+/// the tree submitted for CI.
+fn offer_branch_move(commit: &str) -> anyhow::Result<()> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(());
+    }
+    eprint!("CI-tested commit {commit} is pushed. Move this branch to it? [y/N] ");
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("reading branch-move answer")?;
+    if input.trim().eq_ignore_ascii_case("y") {
+        run_git_status(["reset", "--mixed", commit])?;
+        eprintln!("moved the current branch to {commit}");
+    }
+    Ok(())
 }
 
 /// Decide, after CI on a dirty tree, whether to materialize the tested tree,
@@ -4011,7 +4907,12 @@ async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
         // (success/failure/cancelled/skipped/in_progress/queued/pending) for
         // scripts like the pre-push hook. Connection failures carry the
         // engine-unreachable marker so the hook can fail open.
-        let mut request = client.get(format!("{url}/api/v1/runs/{run_id}"));
+        let mut request = engine_request(
+            &client,
+            reqwest::Method::GET,
+            format!("{url}/api/v1/runs/{run_id}"),
+            ENGINE_CONTROL_TIMEOUT,
+        );
         if let Some(token) = api_token() {
             request = request.bearer_auth(token);
         }
@@ -4034,7 +4935,12 @@ async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     // Native bearer required for /api/v1/status (same as other native calls)
-    let mut status_req = client.get(format!("{url}/api/v1/status"));
+    let mut status_req = engine_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/status"),
+        ENGINE_CONTROL_TIMEOUT,
+    );
     if let Some(token) = api_token() {
         status_req = status_req.bearer_auth(token);
     }
@@ -4072,7 +4978,12 @@ async fn cmd_status(args: StatusArgs) -> anyhow::Result<()> {
         serde_json::from_str(&status_text).context("parse status json")?;
 
     // Fetch recent runs for table (preserve existing behavior)
-    let mut runs_req = client.get(format!("{url}/api/v1/runs?limit={}", args.limit));
+    let mut runs_req = engine_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runs?limit={}", args.limit),
+        ENGINE_CONTROL_TIMEOUT,
+    );
     if let Some(token) = api_token() {
         runs_req = runs_req.bearer_auth(token);
     }
@@ -4603,7 +5514,12 @@ async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
         return follow_run_logs(&client, &url, &run_id, args.job.as_deref()).await;
     }
 
-    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
+    let mut request = engine_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runs/{run_id}/logs"),
+        ENGINE_LOG_FETCH_TIMEOUT,
+    );
     let query = logs_query(args.job.as_deref(), args.step);
     if !query.is_empty() {
         request = request.query(&query);
@@ -4629,7 +5545,14 @@ async fn fetch_run_job_logs(
     run_id: &str,
     job: Option<&str>,
 ) -> anyhow::Result<String> {
-    let mut request = client.get(format!("{url}/api/v1/runs/{run_id}/logs"));
+    // One shot, and the whole body is buffered before it is printed, so a total
+    // deadline is correct here (unlike `follow_run_logs`, which streams).
+    let mut request = engine_request(
+        client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runs/{run_id}/logs"),
+        ENGINE_LOG_FETCH_TIMEOUT,
+    );
     if let Some(job) = job {
         request = request.query(&[("job", job)]);
     }
@@ -4651,6 +5574,11 @@ async fn fetch_run_job_logs(
 /// client drains every queued SSE frame before returning; if a completed job
 /// has no retained in-memory snapshot (for example after a server restart),
 /// the durable job-log endpoint supplies the missing output.
+///
+/// No total deadline here on purpose: a job legitimately streams for hours. The
+/// hang protection is the client's connect deadline plus its idle read bound
+/// ([`ENGINE_READ_TIMEOUT`]), which fires only after the engine has sent
+/// nothing at all for longer than its own 5-minute liveness window.
 async fn follow_run_logs(
     client: &reqwest::Client,
     url: &str,
@@ -4756,7 +5684,12 @@ async fn cmd_cancel(args: CancelArgs) -> anyhow::Result<()> {
             .await?
             .ok_or_else(|| anyhow::anyhow!("no active runs found"))?,
     };
-    let mut request = client.post(format!("{url}/api/v1/runs/{run_id}/cancel"));
+    let mut request = engine_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{url}/api/v1/runs/{run_id}/cancel"),
+        ENGINE_CONTROL_TIMEOUT,
+    );
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -4786,9 +5719,13 @@ async fn cmd_rerun(args: RerunArgs) -> anyhow::Result<()> {
     } else {
         serde_json::json!({ "mode": "all" })
     };
-    let mut request = client
-        .post(format!("{url}/api/v1/runs/{run_id}/rerun"))
-        .json(&body);
+    let mut request = engine_request(
+        &client,
+        reqwest::Method::POST,
+        format!("{url}/api/v1/runs/{run_id}/rerun"),
+        ENGINE_CONTROL_TIMEOUT,
+    )
+    .json(&body);
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -4819,7 +5756,12 @@ async fn latest_run_id(
         || "limit=1".to_owned(),
         |status| format!("status={status}&limit=1"),
     );
-    let mut request = client.get(format!("{url}/api/v1/runs?{query}"));
+    let mut request = engine_request(
+        client,
+        reqwest::Method::GET,
+        format!("{url}/api/v1/runs?{query}"),
+        ENGINE_CONTROL_TIMEOUT,
+    );
     if let Some(token) = api_token() {
         request = request.bearer_auth(token);
     }
@@ -4857,7 +5799,7 @@ async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
     eprintln!("[preloop] Exit the shell to release the VM.");
 
     // Build the guest shell command BEFORE claiming the marker: an invalid
-    // sandbox override (SmolVM) or a missing sandbox record (AgentENV) makes
+    // sandbox override (SmolVM) or a missing sandbox record makes
     // this fail, and the claim below must not exist yet when it does —
     // otherwise the preserved VM would stay marked ACTIVE (with the
     // heartbeat touching the marker) until the orchestrator's idle timeout,
@@ -4866,12 +5808,12 @@ async fn cmd_shell(args: ShellArgs) -> anyhow::Result<()> {
 
     // Claim the session before starting so the orchestrator stops counting
     // down; the guard writes ACTIVE, starts the heartbeat, and resumes a
-    // suspended AgentENV sandbox.
+    // suspended sandbox.
     let attach = debug_session::DebugAttach::claim(Some(&machine_name)).await?;
 
     // Attach interactively. On SmolVM this boots a stopped machine, so the
     // sandbox environment applies exactly as for a provider spawn; on
-    // AgentENV it attaches to the paused sandbox the engine recorded.
+    // a remote backend it attaches to the paused sandbox the engine recorded.
     let status = command
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -4934,12 +5876,266 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
 
-    /// Serializes tests that mutate process-global env vars read by
-    /// `local_runner_pool_config` (`PRELOOP_RUNNER_BUNDLE`,
-    /// `PRELOOP_RUNNER_BASE_IMAGE`, `PRELOOP_RUNNER_CPUS`,
-    /// `PRELOOP_RUNNER_STORAGE_GB`): parallel test threads would otherwise
-    /// race each other's set_var/remove_var pairs.
-    static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn runner_dns_preserves_provider_choice_unless_explicitly_overridden() {
+        assert_eq!(runner_dns_override(None), None);
+        assert_eq!(runner_dns_override(Some("  ")), None);
+        assert_eq!(
+            runner_dns_override(Some(" 10.0.0.53 ")),
+            Some("10.0.0.53".into())
+        );
+    }
+
+    fn never_ending_server() -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        tokio::spawn(std::future::pending())
+    }
+
+    /// A listener that accepts connections and then never writes a byte: the
+    /// wedged-engine symptom from the incident (TCP accepted, no answer).
+    async fn listening_but_silent() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((_socket, _peer)) = listener.accept().await else {
+                return;
+            };
+            std::future::pending::<()>().await
+        });
+        address
+    }
+
+    /// The client-level idle bound, not just a per-request total: a call site
+    /// that only builds the shared client still cannot be held open by an
+    /// engine that accepts the connection and never answers.
+    #[tokio::test]
+    async fn a_silent_engine_cannot_hold_a_cli_request_open() {
+        let address = listening_but_silent().await;
+        // `build_client()` uses the production values; the same constructor
+        // with short ones is what a test can wait for.
+        let idle = Duration::from_millis(200);
+        let client = build_engine_client(Duration::from_millis(200), idle);
+        let started = std::time::Instant::now();
+        let error = client
+            .get(format!("http://{address}/api/v1/runs"))
+            .send()
+            .await
+            .expect_err("an engine that never answers must not hold the request");
+        assert!(error.is_timeout(), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the idle bound must end the request: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The per-request control total is what ends a request whose headers
+    /// arrived but whose body never does, even while the client's idle bound is
+    /// still far away. Without it, `preloop status` / `preloop logs` would sit
+    /// on a wedged engine until the idle bound, or forever before that bound
+    /// existed.
+    #[tokio::test]
+    async fn a_control_request_deadline_ends_a_stalled_response_body() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _peer)) = listener.accept().await else {
+                return;
+            };
+            // Headers now, body never: the promise of 1024 bytes is a lie.
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n")
+                .await;
+            std::future::pending::<()>().await
+        });
+
+        // The idle bound is far above the total, so only the total can fire.
+        let client = build_engine_client(Duration::from_secs(5), Duration::from_secs(60));
+        let response = engine_request(
+            &client,
+            reqwest::Method::GET,
+            format!("http://{address}/api/v1/runs"),
+            Duration::from_millis(200),
+        )
+        .send()
+        .await
+        .expect("headers arrive, so `send` succeeds");
+        let started = std::time::Instant::now();
+        let error = response
+            .text()
+            .await
+            .expect_err("a body that never arrives must not be buffered forever");
+        assert!(error.is_timeout(), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the request total must end the body read: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A pool that ends the race (a failed slot) is consumed by
+    /// `wait_for_stop`: the shutdown sequence that follows must neither
+    /// re-poll the finished handle (tokio panics: "JoinHandle polled after
+    /// completion") nor lose the pool's own error.
+    #[tokio::test]
+    async fn pool_that_ends_the_engine_is_settled_without_repolling() {
+        let mut server = never_ending_server();
+        let mut pool = Some(tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("slot failed"))
+        }));
+
+        let stop = wait_for_stop(
+            &mut server,
+            &mut pool,
+            std::pin::Pin::new(&mut std::future::pending()),
+        )
+        .await;
+        let Stop::Pool(Err(error)) = stop else {
+            panic!("the pool's failure must be reported as the stop reason");
+        };
+        assert_eq!(error.to_string(), "slot failed");
+
+        settle_pool(&mut pool, Duration::from_millis(50)).await;
+        assert!(pool.is_none());
+        server.abort();
+    }
+
+    /// A pool stuck past the grace window is aborted *and joined* before
+    /// `settle_pool` returns, so no slot can boot a VM after the exit guard's
+    /// scan.
+    #[tokio::test]
+    async fn stuck_pool_is_aborted_and_joined_after_the_grace_window() {
+        let alive = std::sync::Arc::new(());
+        let held = alive.clone();
+        let mut pool = Some(tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<Result<(), anyhow::Error>>().await
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(std::sync::Arc::strong_count(&alive), 2);
+
+        settle_pool(&mut pool, Duration::from_millis(20)).await;
+
+        assert!(pool.is_none());
+        assert_eq!(
+            std::sync::Arc::strong_count(&alive),
+            1,
+            "the aborted pool task must be joined, dropping everything it held"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_stops_the_engine_while_the_pool_keeps_its_handle() {
+        let mut server = never_ending_server();
+        let mut pool: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
+            Some(tokio::spawn(std::future::pending()));
+
+        let stop = wait_for_stop(
+            &mut server,
+            &mut pool,
+            std::pin::Pin::new(&mut std::future::ready(())),
+        )
+        .await;
+
+        assert!(matches!(stop, Stop::Signal));
+        assert!(
+            pool.is_some(),
+            "a still-running pool must stay joinable for the settle step"
+        );
+        settle_pool(&mut pool, Duration::from_millis(20)).await;
+        server.abort();
+    }
+
+    /// A pool generation that fails after cancelling its own shutdown token
+    /// — exactly what `RunnerPool::run` does on a slot failure — must not
+    /// poison the replacement: the respawned generation gets a fresh child
+    /// token that is not already cancelled. This is the regression the
+    /// supervise loop exists for; without child tokens the engine would
+    /// observe an instant `Ok` exit and shut down.
+    #[tokio::test]
+    async fn restarted_pool_gets_an_uncancelled_shutdown_token() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut server = never_ending_server();
+
+        let generation_token = shutdown.child_token();
+        let first_token = generation_token.clone();
+        let mut pool = Some(tokio::spawn(async move {
+            first_token.cancel();
+            Err::<(), anyhow::Error>(anyhow::anyhow!("slot failed"))
+        }));
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_respawn = seen.clone();
+        let parent = shutdown.clone();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            supervise_pool(
+                &mut server,
+                &mut pool,
+                std::pin::Pin::new(&mut std::future::pending()),
+                |_| true,
+                || {
+                    let token = parent.child_token();
+                    seen_respawn.lock().unwrap().push(token.clone());
+                    Some(tokio::spawn(async move {
+                        token.cancelled().await;
+                        Ok(())
+                    }))
+                },
+            )
+            .await
+        })
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the replacement pool must run until cancellation, not exit instantly"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one generation was respawned");
+        assert!(
+            !seen[0].is_cancelled(),
+            "the respawned pool's token must not inherit generation one's cancellation"
+        );
+        assert!(
+            !shutdown.is_cancelled(),
+            "a pool's own cancellation must never reach the engine token"
+        );
+    }
+
+    /// If the HTTP server dies during the restart backoff the engine stops
+    /// immediately instead of sleeping to the ceiling and spawning a pool
+    /// for a dead server.
+    #[tokio::test]
+    async fn server_death_during_pool_backoff_stops_the_engine() {
+        let mut server = tokio::spawn(async { anyhow::bail!("listener died") });
+        let mut pool = Some(tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("golden unpack failed"))
+        }));
+
+        let stop = tokio::time::timeout(
+            Duration::from_millis(POOL_RESTART_MIN.as_millis() as u64 + 300),
+            supervise_pool(
+                &mut server,
+                &mut pool,
+                std::pin::Pin::new(&mut std::future::pending()),
+                |_| true,
+                || None,
+            ),
+        )
+        .await
+        .expect("a dead server must stop the engine inside the backoff window");
+
+        let Stop::Server(Err(error)) = stop else {
+            panic!("server failure must be the stop reason, got {stop:?}");
+        };
+        assert_eq!(error.to_string(), "listener died");
+        // Whether the pool arm or the server arm won the first race is
+        // nondeterministic; the assertion that matters is above: the stop
+        // reason is the server error, inside the backoff window.
+    }
+
+    // Env-var serialization for these tests lives in the crate-wide
+    // [`crate::TEST_ENV_LOCK`].
 
     mod github_credential_migration {
         use super::super::migrate_legacy_github_credentials;
@@ -5242,7 +6438,7 @@ mod tests {
 
     #[test]
     fn runner_cpus_honors_positive_values_and_rejects_invalid_values() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         for (value, expected) in [
             ("1", 1),
             (" 8 ", 8),
@@ -5264,7 +6460,7 @@ mod tests {
 
     #[test]
     fn runner_storage_gib_ignores_invalid_or_zero_values() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         for (value, expected) in [
             ("80", 80),
             (" 96 ", 96),
@@ -5356,7 +6552,7 @@ mod tests {
     /// `PRELOOP_RUNNER_BASE_IMAGE` still overrides it.
     #[test]
     fn the_pool_reads_the_golden_init_recorded() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let mut config = preloop_runner_server::config::ConfigFile::default();
@@ -5424,7 +6620,7 @@ mod tests {
     /// it forever and idle runners would be replaced forever.
     #[test]
     fn only_the_official_golden_keeps_environment_replacement() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         // The config resolves a Linux guest runner bundle; fabricate one so
         // the construction reaches the base-image decision.
@@ -5470,6 +6666,7 @@ mod tests {
                     preloop_observability::status::PoolSnapshot::default(),
                 )),
                 preloop_observability::Observability::noop(),
+                None,
             )
             .unwrap();
             unsafe {
@@ -5522,7 +6719,7 @@ mod tests {
 
     #[test]
     fn packed_artifact_cache_key_tracks_base_image_digest() {
-        let _env_guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
         let home = tempfile::tempdir().unwrap();
         let bundle = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -5557,6 +6754,7 @@ mod tests {
                     preloop_observability::status::PoolSnapshot::default(),
                 )),
                 preloop_observability::Observability::noop(),
+                None,
             )
             .unwrap();
             unsafe {
@@ -5692,6 +6890,84 @@ mod tests {
         assert!(
             default_local_changed_paths("workflow_dispatch", None, &serde_json::json!({}))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn local_default_branch_uses_advertised_head_when_local_head_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("origin.git");
+        let seed = temp.path().join("seed");
+        let workspace = temp.path().join("workspace");
+        let run_git = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .expect("git runs in local default-branch fixture");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--quiet",
+                "--initial-branch=main",
+                seed.to_str().unwrap(),
+            ],
+        );
+        run_git(&seed, &["config", "user.name", "Preloop Test"]);
+        run_git(&seed, &["config", "user.email", "test@example.test"]);
+        std::fs::write(seed.join("base.txt"), "base\n").unwrap();
+        run_git(&seed, &["add", "base.txt"]);
+        run_git(&seed, &["commit", "-qm", "base"]);
+        let remote_url = remote.to_str().unwrap();
+        run_git(&seed, &["remote", "add", "origin", remote_url]);
+        run_git(&seed, &["push", "--quiet", "origin", "main"]);
+
+        run_git(
+            temp.path(),
+            &[
+                "init",
+                "--quiet",
+                "--initial-branch=feature",
+                workspace.to_str().unwrap(),
+            ],
+        );
+        run_git(&workspace, &["remote", "add", "origin", remote_url]);
+        assert_eq!(
+            local_default_branch_in(&workspace).as_deref(),
+            Some("origin/main")
+        );
+
+        run_git(
+            &workspace,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/local-default",
+            ],
+        );
+        assert_eq!(
+            local_default_branch_in(&workspace).as_deref(),
+            Some("origin/local-default"),
+            "an existing local remote-HEAD symbolic ref remains preferred"
         );
     }
 
@@ -6075,6 +7351,7 @@ mod tests {
     #[tokio::test]
     async fn shell_spawn_carries_the_sandbox_environment() {
         let _guard = crate::SMOLVM_PATH_LOCK.lock().await;
+        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
         let (directory, executable) = crate::fake_smolvm_on_path();
         let previous_path = std::env::var_os("PATH");
         let previous_home = std::env::var_os("PRELOOP_HOME");
@@ -6184,11 +7461,39 @@ mod tests {
         assert_eq!(args.run_id.as_deref(), Some("run-abc"));
     }
 
+    /// The hook `preloop run` installs and the copy shipped in
+    /// `contrib/pre-push` for manual installs must stay byte-identical, and
+    /// the script must grep for the literal marker the CLI emits: inside the
+    /// raw string the shell cannot see `ENGINE_UNREACHABLE_MARKER`, so a
+    /// rename there would silently turn the fail-open path into a failure.
+    #[test]
+    fn pre_push_hook_matches_contrib_and_the_marker() {
+        let contrib = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contrib/pre-push"),
+        )
+        .expect("read contrib/pre-push");
+        assert_eq!(
+            PRE_PUSH_HOOK, contrib,
+            "contrib/pre-push must mirror the installed pre-push hook"
+        );
+        assert!(
+            PRE_PUSH_HOOK.contains(ENGINE_UNREACHABLE_MARKER),
+            "the hook must grep for the literal marker the CLI emits"
+        );
+        assert!(
+            !PRE_PUSH_HOOK.contains("$ENGINE_UNREACHABLE_MARKER"),
+            "the hook is installed verbatim: a Rust constant inside it would be an unbound shell variable"
+        );
+    }
+
     #[test]
     fn hook_lifecycle() {
         // All tests in this binary share one process working directory and
         // run in parallel threads; restore the original cwd so the tempdir
         // (and this test's `.git/`) cannot leak into other tests.
+        // The other cwd-changing test holds the same lock, so the two
+        // cannot swap directories under each other.
+        let _cwd_lock = crate::TEST_ENV_LOCK.blocking_lock();
         struct CwdGuard(std::path::PathBuf);
         impl Drop for CwdGuard {
             fn drop(&mut self) {
@@ -6273,6 +7578,469 @@ mod tests {
         assert!(hook_decided(), "should be decided after declining");
     }
 
+    /// `preloop run` hands every flag, and every fact it derives from the
+    /// checkout, to the engine. Each field has a protocol default the engine
+    /// accepts without complaint, so a flag dropped while building the
+    /// submission (`--job`, `--secret`, `--no-merge`, …) still submits a run,
+    /// just the wrong one. The fake engine records the request body; the
+    /// checkout's `feature` branch is one commit past `main`, so the
+    /// changed-path and filter-branch derivations actually run.
+    #[tokio::test]
+    async fn run_submits_every_flag_and_derived_fact_to_the_engine() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("checkout");
+        let workflows = repo.join(".github/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let workflow_yaml = "name: ci\non: pull_request\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n";
+        let reusable_yaml = "on: workflow_call\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo lint\n";
+        std::fs::write(workflows.join("ci.yml"), workflow_yaml).unwrap();
+        std::fs::write(workflows.join("reusable.yml"), reusable_yaml).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "--no-verify", "-m", "base"]);
+        git(&["switch", "-q", "-c", "feature"]);
+        std::fs::write(repo.join("change.txt"), "feature\n").unwrap();
+        git(&["add", "change.txt"]);
+        git(&["commit", "-q", "--no-verify", "-m", "feature"]);
+        let payload = tmp.path().join("payload.json");
+        std::fs::write(&payload, r#"{"pull_request":{"number":7}}"#).unwrap();
+
+        let submitted = std::sync::Arc::new(std::sync::OnceLock::<serde_json::Value>::new());
+        let recorder = std::sync::Arc::clone(&submitted);
+        let app = axum::Router::new().route(
+            "/api/v1/runs",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                async move {
+                    let _ = recorder.set(body);
+                    axum::Json(serde_json::json!({
+                        "run_id": "11111111-1111-1111-1111-111111111111",
+                        "run_number": 1,
+                        "queued_jobs": 1,
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let previous_url = std::env::var_os("PRELOOP_URL");
+        unsafe { std::env::set_var("PRELOOP_URL", &base) };
+        let cwd_guard = CwdGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&repo).unwrap();
+        let result = run_workflow(RunArgs {
+            file: Some(std::path::PathBuf::from("ci.yml")),
+            job: Some("build".to_owned()),
+            event: Some("pull_request".to_owned()),
+            payload: Some(payload),
+            base: Some("main".to_owned()),
+            message: None,
+            debug: true,
+            no_debug: false,
+            preserve_on_failure: false,
+            secrets: vec!["TOKEN=s3cret".to_owned()],
+            strict_secrets: false,
+            detach: true,
+            push: false,
+            create_pr: false,
+            pr_draft: true,
+            no_merge: true,
+        })
+        .await;
+        drop(cwd_guard);
+        match previous_url {
+            Some(previous) => unsafe { std::env::set_var("PRELOOP_URL", previous) },
+            None => unsafe { std::env::remove_var("PRELOOP_URL") },
+        }
+        result.expect("the run is submitted");
+
+        let body = submitted.get().expect("the engine received a submission");
+        let expected = serde_json::json!({
+            "workflow_yaml": workflow_yaml,
+            "event": "pull_request",
+            "payload": {"pull_request": {"number": 7}},
+            "repository": "local/checkout",
+            "git_ref": "refs/heads/feature",
+            "workflow_path": ".github/workflows/ci.yml",
+            "secrets": {"TOKEN": "s3cret"},
+            "reusable_workflows": {".github/workflows/reusable.yml": reusable_yaml},
+            "selected_jobs": ["build"],
+            "base_ref": "main",
+            "activity_type": "synchronize",
+            "changed_paths": ["change.txt"],
+            "changed_paths_known": true,
+            "filter_branch": "main",
+            "no_merge": true,
+            "preserve_on_failure": true,
+            "debug_on_failure": true,
+        });
+        for (field, want) in expected.as_object().unwrap() {
+            assert_eq!(body.get(field), Some(want), "submission field `{field}`");
+        }
+    }
+
+    /// An engine with the warm pool switched off reports `on_demand` from its
+    /// first status snapshot; the snapshot default is `warm`, which would
+    /// advertise idle capacity that does not exist.
+    #[test]
+    fn on_demand_engine_does_not_advertise_a_warm_pool() {
+        use preloop_observability::status::PoolMode;
+        assert!(matches!(
+            initial_pool_snapshot(false).mode,
+            PoolMode::OnDemand
+        ));
+        assert!(matches!(initial_pool_snapshot(true).mode, PoolMode::Warm));
+    }
+
+    /// A throwaway repository on `main` with a fixed identity, one tracked
+    /// file `src.txt`, and a tracked `dist/app.js`.
+    fn submit_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("work");
+        std::fs::create_dir_all(repo.join("dist")).unwrap();
+        git_in(&repo, &[], &["init", "-q", "-b", "main"]).unwrap();
+        git_in(&repo, &[], &["config", "user.name", "Submit Test"]).unwrap();
+        git_in(&repo, &[], &["config", "user.email", "submit@example.test"]).unwrap();
+        git_in(&repo, &[], &["config", "commit.gpgsign", "false"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "original\n").unwrap();
+        std::fs::write(repo.join("dist/app.js"), "built\n").unwrap();
+        git_in(&repo, &[], &["add", "-A"]).unwrap();
+        git_in(&repo, &[], &["commit", "-q", "-m", "init"]).unwrap();
+        (tmp, repo)
+    }
+
+    /// `submit_repo` plus a bare `origin` that already holds `main`.
+    fn submit_repo_with_origin() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let (tmp, repo) = submit_repo();
+        let origin = tmp.path().join("origin.git");
+        git_in(
+            &repo,
+            &[],
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "--initial-branch=main",
+                origin.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        git_in(
+            &repo,
+            &[],
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .unwrap();
+        git_in(&repo, &[], &["push", "-q", "origin", "main"]).unwrap();
+        (tmp, repo, origin)
+    }
+
+    #[test]
+    fn submit_tree_keeps_a_tracked_file_an_ignore_rule_now_matches() {
+        let (_tmp, repo) = submit_repo();
+        // The dirty change ignores `dist/`, which HEAD still tracks: the
+        // developer still has `dist/app.js`, so the submit must too.
+        std::fs::write(repo.join(".gitignore"), "dist/\n*.log\n").unwrap();
+        std::fs::write(repo.join("build.log"), "untracked and ignored\n").unwrap();
+        std::fs::write(repo.join("notes.txt"), "untracked and not ignored\n").unwrap();
+
+        let tree = worktree_tree_in(&repo).unwrap();
+        let files = git_in(&repo, &[], &["ls-tree", "-r", "--name-only", &tree]).unwrap();
+        let files: Vec<&str> = files.lines().collect();
+
+        assert!(
+            files.contains(&"dist/app.js"),
+            "a tracked file must not vanish because an ignore rule now matches it: {files:?}"
+        );
+        assert!(files.contains(&".gitignore") && files.contains(&"notes.txt"));
+        assert!(
+            !files.contains(&"build.log"),
+            "an untracked, ignored file stays out of the submit: {files:?}"
+        );
+        assert_eq!(
+            git_in(&repo, &[], &["diff", "--cached", "--name-only"]).unwrap(),
+            "",
+            "the user's own index must never be touched"
+        );
+    }
+
+    #[test]
+    fn submit_tree_unchanged_sees_an_edit_that_leaves_git_status_identical() {
+        let (_tmp, repo) = submit_repo();
+        std::fs::write(repo.join("src.txt"), "first edit\n").unwrap();
+        let dirty = vec![" M src.txt".to_owned()];
+        let commit =
+            create_submit_commit_in(&repo, Some("wip"), None, &dirty, "refs/heads/feat/x", None)
+                .unwrap();
+        assert!(submit_tree_unchanged_in(&repo, &commit));
+
+        let status = git_in(&repo, &[], &["status", "--porcelain"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "second edit\n").unwrap();
+        assert_eq!(
+            git_in(&repo, &[], &["status", "--porcelain"]).unwrap(),
+            status,
+            "the premise: git status cannot tell these two states apart"
+        );
+        assert!(
+            !submit_tree_unchanged_in(&repo, &commit),
+            "a file edited again after submission must not count as unchanged"
+        );
+
+        // Putting the content back restores the match; moving HEAD never does.
+        std::fs::write(repo.join("src.txt"), "first edit\n").unwrap();
+        assert!(submit_tree_unchanged_in(&repo, &commit));
+        git_in(&repo, &[], &["commit", "-q", "-a", "-m", "move head"]).unwrap();
+        assert!(!submit_tree_unchanged_in(&repo, &commit));
+    }
+
+    #[test]
+    fn submit_bundle_uploads_only_the_submit_commit_and_base_tip() {
+        let (_tmp, repo, _origin) = submit_repo_with_origin();
+        // Things that must never leave the machine.
+        git_in(&repo, &[], &["branch", "private-branch"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "stashed work\n").unwrap();
+        git_in(&repo, &[], &["stash", "push", "-q"]).unwrap();
+        git_in(&repo, &[], &["checkout", "-q", "-b", "feat/x"]).unwrap();
+        std::fs::write(repo.join("src.txt"), "dirty\n").unwrap();
+
+        let commit = create_submit_commit_in(
+            &repo,
+            Some("wip"),
+            None,
+            &[" M src.txt".to_owned()],
+            "refs/heads/feat/x",
+            Some("main"),
+        )
+        .unwrap();
+
+        let listing = git_in(
+            &repo,
+            &[],
+            &["bundle", "list-heads", commit.bundle_path.to_str().unwrap()],
+        )
+        .unwrap();
+        let refs: Vec<(&str, &str)> = listing
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .collect();
+        let base = git_in(&repo, &[], &["rev-parse", "refs/remotes/origin/main"]).unwrap();
+        assert_eq!(refs.len(), 2, "exactly the head and the base: {refs:?}");
+        assert!(
+            refs.iter()
+                .any(|(sha, name)| *sha == commit.sha && name.ends_with("/head")),
+            "the submitted commit travels: {refs:?}"
+        );
+        assert!(
+            refs.iter()
+                .any(|(sha, name)| *sha == base && name.ends_with("/base/main")),
+            "the base tip travels under its branch name: {refs:?}"
+        );
+        // The bundle must not drag the stash or the private branch along as
+        // objects either: nothing it holds is reachable from those refs.
+        let stash = git_in(&repo, &[], &["rev-parse", "refs/stash"]).unwrap();
+        let private = git_in(&repo, &[], &["rev-parse", "refs/heads/private-branch"]).unwrap();
+        assert_ne!(stash, commit.sha);
+        assert_ne!(private, commit.sha);
+        let unpack = tempfile::tempdir().unwrap();
+        git_in(unpack.path(), &[], &["init", "-q", "--bare", "."]).unwrap();
+        git_in(
+            unpack.path(),
+            &[],
+            &[
+                "fetch",
+                "-q",
+                commit.bundle_path.to_str().unwrap(),
+                "+refs/preloop/*:refs/preloop/*",
+            ],
+        )
+        .unwrap();
+        assert!(
+            git_in(unpack.path(), &[], &["cat-file", "-e", &stash]).is_err(),
+            "the stash commit's objects must not be in the bundle"
+        );
+        // The repository keeps none of the bookkeeping refs.
+        assert_eq!(
+            git_in(&repo, &[], &["for-each-ref", "refs/preloop"]).unwrap(),
+            ""
+        );
+        let _ = std::fs::remove_file(&commit.bundle_path);
+    }
+
+    #[test]
+    fn submit_base_tip_prefers_the_fetched_remote_branch_over_a_stale_local_one() {
+        let (tmp, repo, origin) = submit_repo_with_origin();
+        let stale_local = git_in(&repo, &[], &["rev-parse", "refs/heads/main"]).unwrap();
+
+        // Someone else advances `main` on origin; this checkout's local `main`
+        // and remote-tracking `origin/main` both still point at the old tip.
+        let other = tmp.path().join("other");
+        git_in(
+            tmp.path(),
+            &[],
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        git_in(&other, &[], &["config", "user.name", "Other"]).unwrap();
+        git_in(&other, &[], &["config", "user.email", "other@example.test"]).unwrap();
+        git_in(&other, &[], &["config", "commit.gpgsign", "false"]).unwrap();
+        git_in(
+            &other,
+            &[],
+            &["commit", "-q", "--allow-empty", "-m", "base moved"],
+        )
+        .unwrap();
+        git_in(&other, &[], &["push", "-q", "origin", "main"]).unwrap();
+        let moved = git_in(&other, &[], &["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(
+            resolve_base_tip_in(&repo, "main").unwrap(),
+            moved,
+            "the merge must be built against the base as it is now"
+        );
+        assert_eq!(
+            git_in(&repo, &[], &["rev-parse", "refs/heads/main"]).unwrap(),
+            stale_local,
+            "fetching the base must not move the user's local branch"
+        );
+
+        // Offline: the last fetched tip still wins over the stale local branch.
+        git_in(
+            &other,
+            &[],
+            &["commit", "-q", "--allow-empty", "-m", "moved again"],
+        )
+        .unwrap();
+        git_in(&other, &[], &["push", "-q", "origin", "main"]).unwrap();
+        git_in(
+            &repo,
+            &[],
+            &["remote", "set-url", "origin", "/nonexistent/origin.git"],
+        )
+        .unwrap();
+        assert_eq!(resolve_base_tip_in(&repo, "main").unwrap(), moved);
+
+        let error = resolve_base_tip_in(&repo, "no-such-branch").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no-such-branch"),
+            "an unresolvable base fails loudly: {error:#}"
+        );
+    }
+
+    #[test]
+    fn submit_bundle_base_follows_the_branch_the_server_merges_against() {
+        let payload = serde_json::json!({"pull_request": {"base": {"ref": "release"}}});
+        // The payload wins even though `default_local_filter_branch` yields
+        // nothing for it: the server merges against `release`, so that is the
+        // tip the bundle must carry.
+        assert_eq!(
+            submit_base_branch(&payload, Some("main"), None).as_deref(),
+            Some("release")
+        );
+        let empty = serde_json::json!({});
+        assert_eq!(
+            submit_base_branch(&empty, Some("refs/heads/dev"), Some("main")).as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            submit_base_branch(&empty, None, Some("main")).as_deref(),
+            Some("main")
+        );
+        assert_eq!(submit_base_branch(&empty, None, None), None);
+    }
+
+    #[test]
+    fn submit_editor_opens_only_for_a_person_at_a_terminal() {
+        assert_eq!(
+            submit_editor(Some("vim".into()), true).as_deref(),
+            Some("vim")
+        );
+        assert_eq!(
+            submit_editor(Some("vim".into()), false),
+            None,
+            "a pipe or CI run must never hang on an editor"
+        );
+        assert_eq!(submit_editor(Some("  ".into()), true), None);
+        assert_eq!(submit_editor(None, true), None);
+    }
+
+    #[test]
+    fn submit_message_comes_from_the_editor_when_one_runs() {
+        let (tmp, repo) = submit_repo();
+        std::fs::write(repo.join("src.txt"), "dirty\n").unwrap();
+        let editor = tmp.path().join("editor.sh");
+        std::fs::write(&editor, "#!/bin/sh\nprintf 'edited subject\\n' > \"$1\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let dirty = [" M src.txt".to_owned()];
+
+        let edited = create_submit_commit_in(
+            &repo,
+            None,
+            Some(editor.to_str().unwrap()),
+            &dirty,
+            "refs/heads/feat/x",
+            None,
+        )
+        .unwrap();
+        let message = git_in(&repo, &[], &["log", "-1", "--format=%B", &edited.sha]).unwrap();
+        assert!(message.starts_with("edited subject"), "{message}");
+        assert!(message.contains(&format!("Preloop-Tested-Tree: {}", edited.tree)));
+
+        // Without an editor the generated message is used.
+        let generated =
+            create_submit_commit_in(&repo, None, None, &dirty, "refs/heads/feat/x", None).unwrap();
+        let message = git_in(&repo, &[], &["log", "-1", "--format=%B", &generated.sha]).unwrap();
+        assert!(
+            message.starts_with("wip(feat/x): 1 files in src.txt"),
+            "{message}"
+        );
+
+        // A failing editor aborts the submit instead of committing a stale message.
+        let failing = create_submit_commit_in(
+            &repo,
+            None,
+            Some("false"),
+            &dirty,
+            "refs/heads/feat/x",
+            None,
+        );
+        assert!(failing.is_err());
+        for commit in [&edited, &generated] {
+            let _ = std::fs::remove_file(&commit.bundle_path);
+        }
+    }
+
     #[test]
     fn cancel_parses() {
         let cli = parse(&["cancel"]).unwrap();
@@ -6351,16 +8119,6 @@ mod tests {
     }
 
     #[test]
-    fn loopback_detection_covers_names_and_addresses() {
-        assert!(url_is_loopback("http://127.0.0.1:9090"));
-        assert!(url_is_loopback("http://localhost:9090/"));
-        assert!(url_is_loopback("http://[::1]:9090"));
-        assert!(!url_is_loopback("http://192.168.8.174:9491"));
-        assert!(!url_is_loopback("https://preloop.preloop.dev"));
-        assert!(!url_is_loopback("not a url"));
-    }
-
-    #[test]
     fn mounted_socket_routes_only_loopback_advertised_origins() {
         assert_eq!(
             mounted_control_origin("http://127.0.0.1:9090/").as_deref(),
@@ -6380,8 +8138,7 @@ mod tests {
     /// the probe must still arrive without an `Authorization` header.
     #[tokio::test]
     async fn health_probe_sends_no_authorization_header() {
-        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _env_guard = ENV_LOCK.lock().await;
+        let _env_guard = crate::TEST_ENV_LOCK.lock().await;
         let saw_authorization = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_authorization_clone = std::sync::Arc::clone(&saw_authorization);
         let app = axum::Router::new().route(
@@ -6415,6 +8172,190 @@ mod tests {
         assert!(
             !saw_authorization.load(std::sync::atomic::Ordering::SeqCst),
             "the /healthz probe must not send an Authorization header"
+        );
+    }
+
+    /// The policy is probe-only (#658): an engine that answers is used, and a
+    /// silent endpoint refuses. There is no third outcome — no client command
+    /// starts an engine.
+    #[test]
+    fn a_reachable_engine_lets_the_command_proceed() {
+        assert!(engine_access(true, "http://127.0.0.1:9090").is_ok());
+    }
+
+    /// A command that names its own engine (`dap --url`) is probed there, not
+    /// at the default: the gate must not refuse the engine the command would
+    /// have talked to.
+    #[test]
+    fn a_command_endpoint_override_is_the_probed_endpoint() {
+        let dap = dap_client::DapArgs {
+            run_id: "run-42".to_owned(),
+            url: Some("http://127.0.0.1:19099".to_owned()),
+            token: None,
+        };
+        assert_eq!(
+            command_engine_url(&Command::Dap(dap)),
+            Some("http://127.0.0.1:19099")
+        );
+
+        let no_override = dap_client::DapArgs {
+            run_id: "run-42".to_owned(),
+            url: None,
+            token: None,
+        };
+        assert_eq!(command_engine_url(&Command::Dap(no_override)), None);
+        assert_eq!(command_engine_url(&Command::Version), None);
+    }
+
+    /// The refusal names the probed endpoint and both ways to start an engine,
+    /// and it carries the pre-push hook's fail-open marker. That marker is a
+    /// compatibility contract: without it the hook reads the non-zero exit as
+    /// "CI failed" and blocks the push over a run that never happened.
+    #[test]
+    fn an_unreachable_engine_refuses_with_the_marker_and_the_fix() {
+        let url = "http://127.0.0.1:19099";
+        let error = engine_access(false, url).unwrap_err();
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains(url), "{rendered}");
+        assert!(rendered.contains("no engine is running"), "{rendered}");
+        assert!(rendered.contains("preloop serve"), "{rendered}");
+        assert!(rendered.contains("preloop server install"), "{rendered}");
+        assert!(rendered.contains(ENGINE_UNREACHABLE_MARKER), "{rendered}");
+    }
+
+    /// `preloop serve` is the only command that starts an engine, so the
+    /// zero-config first run — the brand-new control database — must be part
+    /// of its path (`cmd_engine` calls this). A second preparation is a no-op:
+    /// an existing store is never rebuilt, and upgrading is `preloop store
+    /// migrate`.
+    #[test]
+    fn serve_prepares_a_fresh_home_and_leaves_an_existing_store_alone() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let previous_store = std::env::var_os(preloop_runner_server::store::STORE_URL_ENV);
+        unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) };
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("fresh-home");
+        std::fs::create_dir_all(&home).unwrap();
+        prepare_local_engine_home(&home, None).unwrap();
+        let db = home.join("state").join("preloop.db");
+        assert!(db.is_file(), "a fresh home must get a control database");
+        let created = std::fs::metadata(&db).unwrap();
+
+        prepare_local_engine_home(&home, None).unwrap();
+        let untouched = std::fs::metadata(&db).unwrap();
+        assert_eq!(
+            (created.len(), created.modified().unwrap()),
+            (untouched.len(), untouched.modified().unwrap()),
+            "an existing store must not be rewritten"
+        );
+
+        match previous_store {
+            Some(previous) => unsafe {
+                std::env::set_var(preloop_runner_server::store::STORE_URL_ENV, previous)
+            },
+            None => unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) },
+        }
+    }
+
+    /// `preloop serve --store` selects the store, and the first-run
+    /// preparation has to follow it: prepared against the state-dir default
+    /// instead, a fresh home would initialize a database the boot never opens
+    /// and then refuse the empty one it was pointed at.
+    #[test]
+    fn serve_prepares_the_store_it_was_pointed_at() {
+        let _env_guard = crate::TEST_ENV_LOCK.blocking_lock();
+        let previous_store = std::env::var_os(preloop_runner_server::store::STORE_URL_ENV);
+        // The explicit selection must win over the environment, exactly as it
+        // does for the boot.
+        unsafe {
+            std::env::set_var(
+                preloop_runner_server::store::STORE_URL_ENV,
+                "postgres://ignored",
+            )
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("fresh-home");
+        let custom = dir.path().join("custom.db");
+        std::fs::create_dir_all(&home).unwrap();
+        prepare_local_engine_home(&home, Some(&format!("sqlite://{}", custom.display()))).unwrap();
+
+        assert!(
+            custom.is_file(),
+            "the selected store must be the one initialized"
+        );
+        assert!(
+            !home.join("state").join("preloop.db").exists(),
+            "the state-dir default must stay untouched"
+        );
+
+        match previous_store {
+            Some(previous) => unsafe {
+                std::env::set_var(preloop_runner_server::store::STORE_URL_ENV, previous)
+            },
+            None => unsafe { std::env::remove_var(preloop_runner_server::store::STORE_URL_ENV) },
+        }
+    }
+
+    /// The probe's budget follows the endpoint class: loopback is probed
+    /// tightly, anything that crosses a network gets room for a slow round
+    /// trip. One constant for both would either hang the pre-push hook or
+    /// report a healthy remote engine as absent.
+    #[test]
+    fn probe_budget_matches_the_endpoint_class() {
+        for loopback in [
+            "http://127.0.0.1:9090",
+            "http://127.0.0.2:9090",
+            "http://localhost:9090",
+            "http://[::1]:9090",
+        ] {
+            assert_eq!(
+                probe_timeout(loopback),
+                LOOPBACK_PROBE_TIMEOUT,
+                "{loopback}"
+            );
+        }
+        for remote in [
+            "https://ci.example.test",
+            "http://10.0.0.5:9090",
+            "http://preloop.internal:9090",
+            // Not a URL at all: an unrecognizable endpoint is never the local
+            // engine, so it gets the forgiving budget rather than a fast
+            // refusal.
+            "not a url",
+        ] {
+            assert_eq!(probe_timeout(remote), REMOTE_PROBE_TIMEOUT, "{remote}");
+        }
+    }
+
+    /// A remote engine that answers `/healthz` slowly is reachable, not
+    /// absent: the same delayed answer fails the loopback budget and passes
+    /// the remote one. Failing before the fix, when every endpoint was probed
+    /// with the loopback budget.
+    #[tokio::test]
+    async fn a_slow_probe_answer_is_not_read_as_an_absent_engine() {
+        let app = axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(|| async {
+                tokio::time::sleep(Duration::from_millis(700)).await;
+                "ok"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = build_client();
+        assert!(
+            probe_engine_health_within(&client, &base, REMOTE_PROBE_TIMEOUT).await,
+            "a delayed answer within the remote budget is reachable"
+        );
+        assert!(
+            !probe_engine_health_within(&client, &base, LOOPBACK_PROBE_TIMEOUT).await,
+            "the loopback budget still refuses a stalled endpoint"
         );
     }
 }

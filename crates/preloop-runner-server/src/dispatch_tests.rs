@@ -21,6 +21,31 @@ use super::*;
 
 const TEST_API_TOKEN: &str = "dispatch-test-token";
 
+/// Upload budgets for in-process webhook deliveries.
+///
+/// The ingress gate charges elapsed wall time from admission, while a test
+/// client hands the router a body that is already in memory. The production
+/// ten-second ingest and three-second idle budgets therefore measure only how
+/// long a loaded machine took to schedule the handler — a delivery these
+/// tests expect to be accepted can spend them before the handler is polled
+/// once. Two minutes is twelve times the production ingest budget, so no
+/// loaded runner reaches it, while a delivery whose completion signal is
+/// genuinely lost still fails the test instead of hanging the suite. Tests
+/// that exercise the gate itself live in `routes` and keep the production
+/// values.
+const IN_PROCESS_UPLOAD_BUDGET: Duration = Duration::from_secs(120);
+
+/// The test-API router with upload budgets sized for an in-process client.
+fn webhook_test_router(state: AppState) -> Router {
+    crate::routes::app_with_test_api_and_upload_budgets(
+        state,
+        CancellationToken::new(),
+        TEST_API_TOKEN,
+        IN_PROCESS_UPLOAD_BUDGET,
+        IN_PROCESS_UPLOAD_BUDGET,
+    )
+}
+
 /// Workflow with declared workflow_dispatch inputs (string required, number
 /// with default, choice with options).
 const DISPATCH_WORKFLOW: &str = r#"
@@ -83,7 +108,7 @@ async fn dispatch_fixture_with_app(
         .await
         .unwrap();
     state.local_workspace = Some(ws);
-    let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     state.github_app = Some(crate::github_app::GitHubAppCredentials::for_tests(
         "424",
         key.clone(),
@@ -831,7 +856,7 @@ async fn dispatch_with_foreign_app_jwt_is_401() {
         dispatch_fixture_with_app(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
 
     // A JWT from an unrelated App's keypair.
-    let other_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let other_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let jwt = crate::github_app::sign_app_jwt("999", &other_key).unwrap();
 
     let (status, _) = post_json(
@@ -1002,13 +1027,65 @@ async fn unknown_token_fails_closed_when_github_is_unreachable() {
     assert!(recorded_runs(&state).await.is_empty());
 }
 
+/// An installed GitHub outage costs one probe, not one round trip per
+/// dispatch: with the unnamed-installation bucket open, a third-party token is
+/// refused before github.com is contacted at all, and the dispatch still fails
+/// closed (502), never anonymous.
+#[tokio::test]
+async fn open_breaker_refuses_a_third_party_dispatch_without_touching_github() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let calls = Arc::new(parking_lot::Mutex::new(0));
+    let mut permissions = serde_json::Map::new();
+    permissions.insert("actions".to_owned(), json!("write"));
+    let stub = installation_stub(
+        Arc::clone(&calls),
+        permissions,
+        "selected",
+        &["octocat/repo"],
+    );
+    let (base, handle) = spawn_github_stub(stub).await;
+    let _env = pin_api_base(&base).await;
+
+    // Three dependency failures on the bucket dispatch auth validates an
+    // unattributable installation token under: the token's own fingerprint,
+    // so parking it cannot refuse any other third-party tenant.
+    let breaker = state.github_breakers.breaker_for(
+        crate::github_breaker::GithubCredentialBucket::for_installation_token(
+            "ghs_third_party_token",
+        ),
+    );
+    for _ in 0..3 {
+        breaker.record_failure(
+            &crate::github_breaker::GithubFailureKind::Unavailable,
+            "502",
+        );
+    }
+    assert!(breaker.is_open());
+
+    let (status, body) = post_json(
+        &app,
+        "/repos/octocat/repo/dispatches",
+        r#"{"event_type": "deploy"}"#,
+        Some("ghs_third_party_token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body={body}");
+    assert_eq!(
+        *calls.lock(),
+        0,
+        "an open breaker must fail the dispatch before github.com is contacted"
+    );
+    assert!(recorded_runs(&state).await.is_empty());
+    handle.abort();
+}
+
 // ─── multi-App registry ────────────────────────────────────────────────
 
 /// Build a two-App registry: the default App (secret `legacy-secret`) plus a
 /// second App with its own secret and key.
 fn two_app_registry() -> (crate::github_app::GitHubApps, rsa::RsaPrivateKey) {
-    let default_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
-    let second_key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let default_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let second_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let mut second = crate::github_app::GitHubAppCredentials::for_tests(
         "525",
         second_key.clone(),
@@ -1099,7 +1176,7 @@ async fn webhook_signer_is_bound_to_the_claimed_repository() {
     state.webhook_secret = Some("legacy-secret".to_owned());
     let (registry, _) = two_app_registry();
     state.github_apps = Some(registry);
-    let app = app_with_test_api(state.clone(), CancellationToken::new(), TEST_API_TOKEN);
+    let app = webhook_test_router(state.clone());
 
     let ping = |repo: &str| json!({ "repository": { "full_name": repo } });
 
@@ -1135,6 +1212,65 @@ async fn webhook_signer_is_bound_to_the_claimed_repository() {
     assert_eq!(
         deliver_webhook(&app, "ping", &json!({}), "second-secret").await,
         StatusCode::ACCEPTED
+    );
+
+    handle.abort();
+}
+
+/// A secret registered to an App is bound to that App's installations even
+/// when the same value also sits in the legacy `webhook_secret` slot — the
+/// fresh-engine shape, where the registration handoff's secret lands in the
+/// primary slot. A payload it signs claiming a repository outside the App's
+/// coverage must be rejected, not accepted through the unbound legacy signer.
+#[tokio::test]
+async fn a_secret_an_app_claims_is_bound_to_its_installations() {
+    use axum::routing::get;
+
+    let stub = Router::new()
+        .route(
+            "/repos/org-a/repo/installation",
+            get(|headers: axum::http::HeaderMap| async move {
+                if extract_iss(&headers) == "424" {
+                    (StatusCode::OK, Json(json!({"id": 2, "app_id": 424})))
+                } else {
+                    (StatusCode::NOT_FOUND, Json(json!({"message": "Not Found"})))
+                }
+            }),
+        )
+        .route(
+            "/repos/org-b/other-repo/installation",
+            get(|_headers: axum::http::HeaderMap| async move {
+                (StatusCode::NOT_FOUND, Json(json!({"message": "Not Found"})))
+            }),
+        );
+    let (base, handle) = spawn_github_stub(stub).await;
+    let _env = pin_api_base(&base).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().join("state").to_path_buf())
+        .await
+        .unwrap();
+    let (mut registry, _) = two_app_registry();
+    // The fresh-engine shape: the default App's secret is registered on the
+    // App and is also the value in the legacy slot.
+    registry.apps[0].webhook_secret = Some("default-secret".to_owned());
+    state.webhook_secret = Some("default-secret".to_owned());
+    state.github_apps = Some(registry);
+    let app = webhook_test_router(state.clone());
+
+    let ping = |repo: &str| json!({ "repository": { "full_name": repo } });
+
+    // The default App's own installation → accepted.
+    assert_eq!(
+        deliver_webhook(&app, "ping", &ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    // Outside that App's coverage: the secret is the App's, so the claim is
+    // bound and rejected. The unbound legacy signer would have accepted it.
+    assert_eq!(
+        deliver_webhook(&app, "ping", &ping("org-b/other-repo"), "default-secret").await,
+        StatusCode::FORBIDDEN,
+        "a secret the App claims must be bound to the App's installations"
     );
 
     handle.abort();
@@ -1453,9 +1589,1187 @@ fn sign_test_jwt(app_id: &str, key: &rsa::RsaPrivateKey, iat: u64, exp: u64) -> 
     };
     let signing_input = format!("{}.{}", encode(&header), encode(&claims));
     let signature = SigningKey::<Sha256>::new(key.clone())
-        .sign_with_rng(&mut rand::thread_rng(), signing_input.as_bytes());
+        .sign_with_rng(&mut rsa::rand_core::OsRng, signing_input.as_bytes());
     format!(
         "{signing_input}.{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())
     )
+}
+
+// ─── Endpoints: re-run / cancel shims ──────────────────────────────────────
+
+/// The synthetic numeric id `dispatch` exposes for runs and jobs: SHA-256
+/// truncated to 8 LE bytes (kept in sync with `dispatch::stable_id`).
+fn stable_id(value: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+/// Dispatch one run through the compat surface and complete its `build` job
+/// through the internal test API; returns the new run id.
+async fn dispatched_completed_run(state: &AppState, app: &Router, job_status: &str) -> String {
+    let before: std::collections::BTreeSet<String> = recorded_runs(state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let (code, body) = post_json(
+        app,
+        "/repos/octocat/repo/actions/workflows/dispatch.yml/dispatches",
+        r#"{"inputs": {"greeting": "hi"}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "dispatch failed: {body}");
+    let run_id = recorded_runs(state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .find(|id| !before.contains(id))
+        .expect("dispatch created a run");
+    let (code, body) = post_json(
+        app,
+        "/internal/test/jobs/complete",
+        &json!({"run_id": run_id, "job_id": "build", "status": job_status, "outputs": {}})
+            .to_string(),
+        Some(TEST_API_TOKEN),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "job completion failed: {body}");
+    run_id
+}
+
+async fn run_by_id(state: &AppState, run_id: &str) -> crate::models::RunRecord {
+    recorded_runs(state)
+        .await
+        .into_iter()
+        .find(|(id, _)| id == run_id)
+        .map(|(_, run)| run)
+        .expect("run must exist")
+}
+
+/// POST without an Authorization header.
+async fn post_no_auth(app: &Router, uri: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn rerun_shim_starts_a_new_attempt_in_place() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    let runs = recorded_runs(&state).await;
+    assert_eq!(runs.len(), 1, "the shim re-runs the same run");
+    let run = run_by_id(&state, &run_id).await;
+    assert_eq!(run.run_attempt, 2);
+    assert!(
+        !run.status.is_terminal(),
+        "attempt 2 is live, got {:?}",
+        run.status
+    );
+}
+
+#[tokio::test]
+async fn rerun_shim_refuses_a_live_run_with_409() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let before: std::collections::BTreeSet<String> = recorded_runs(&state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let (code, _) = post_json(
+        &app,
+        "/repos/octocat/repo/actions/workflows/dispatch.yml/dispatches",
+        r#"{"inputs": {"greeting": "hi"}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    let run_id = recorded_runs(&state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .find(|id| !before.contains(id))
+        .expect("dispatch created a run");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn rerun_failed_shim_reruns_failed_jobs_and_409s_on_clean_runs() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "failure").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun-failed-jobs"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 2);
+
+    // A clean run has nothing failed: 409 with the GitHub-shaped message.
+    let clean_id = dispatched_completed_run(&state, &app, "success").await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{clean_id}/rerun-failed-jobs"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no failed"),
+        "the 409 must be GitHub-shaped: {body}"
+    );
+    assert_eq!(run_by_id(&state, &clean_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn rerun_job_shim_accepts_preloop_and_numeric_job_ids() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "failure").await;
+
+    // The raw preloop job id.
+    let (status, body) = post_json(
+        &app,
+        "/repos/octocat/repo/actions/jobs/build/rerun",
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 2);
+
+    // The synthetic numeric id, on a second run (numeric ids are unique per
+    // run, so the newest-terminal-run lookup is unambiguous).
+    let second_id = dispatched_completed_run(&state, &app, "failure").await;
+    let numeric = stable_id(&format!("{second_id}:build"));
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/jobs/{numeric}/rerun"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    assert_eq!(run_by_id(&state, &second_id).await.run_attempt, 2);
+
+    // An unknown job is 404.
+    let (status, body) = post_json(
+        &app,
+        "/repos/octocat/repo/actions/jobs/ghost/rerun",
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ghost"),
+        "the 404 must be GitHub-shaped: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rerun_shim_of_an_archived_run_409s_partial_modes_and_resubmits_all() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    // Push the settled run past the grace and archive it.
+    let parsed: preloop_gha_protocol::RunId = run_id.parse().unwrap();
+    state
+        .test_db_mutate(|tx| {
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_micros();
+            tx.set_run_completed_at_us(parsed, old).unwrap();
+        })
+        .await;
+    assert!(state.test_archive_finished_runs_once().await >= 1);
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun-failed-jobs"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("archived"),
+        "the 409 must name the archive: {body}"
+    );
+
+    // `all` resubmits the recorded submission as a new run.
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body={body}");
+    let runs = recorded_runs(&state).await;
+    assert_eq!(
+        runs.len(),
+        1,
+        "the archived original is not live; only the new run is"
+    );
+    assert_ne!(runs[0].0, run_id, "the archived full re-run is a new run");
+    assert_eq!(runs[0].1.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn cancel_shim_is_202_live_and_409_terminal() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let before: std::collections::BTreeSet<String> = recorded_runs(&state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let (code, _) = post_json(
+        &app,
+        "/repos/octocat/repo/actions/workflows/dispatch.yml/dispatches",
+        r#"{"inputs": {"greeting": "hi"}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    let run_id = recorded_runs(&state)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .find(|id| !before.contains(id))
+        .expect("dispatch created a run");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/cancel"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body={body}");
+    assert!(run_by_id(&state, &run_id).await.status.is_terminal());
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/cancel"),
+        "{}",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("completed"),
+        "the 409 must be GitHub-shaped: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rerun_shim_rejects_a_malformed_debug_flag_with_422() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        r#"{"enable_debug_logging": "yes"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("enable_debug_logging"),
+        "the 422 must name the field: {body}"
+    );
+    assert_eq!(
+        run_by_id(&state, &run_id).await.run_attempt,
+        1,
+        "a rejected body must not restart the run"
+    );
+}
+
+#[tokio::test]
+async fn rerun_shims_require_dispatch_auth() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    let uris = [
+        format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        format!("/repos/octocat/repo/actions/runs/{run_id}/rerun-failed-jobs"),
+        format!("/repos/octocat/repo/actions/runs/{run_id}/cancel"),
+        "/repos/octocat/repo/actions/jobs/build/rerun".to_owned(),
+    ];
+    for uri in &uris {
+        let (status, body) = post_no_auth(&app, uri).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+        assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+    }
+}
+
+#[tokio::test]
+async fn rerun_shims_reject_a_token_without_actions_write_with_403() {
+    let (state, app, _key, _temp) =
+        dispatch_fixture_with_app(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    record_ledger_token(
+        &state,
+        "ghs_read_only_rerun_token",
+        "octocat/repo",
+        &[("contents", "read")],
+    );
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    for uri in [
+        format!("/repos/octocat/repo/actions/runs/{run_id}/rerun"),
+        format!("/repos/octocat/repo/actions/runs/{run_id}/rerun-failed-jobs"),
+        format!("/repos/octocat/repo/actions/runs/{run_id}/cancel"),
+        "/repos/octocat/repo/actions/jobs/build/rerun".to_owned(),
+    ] {
+        let (status, body) = post_json(&app, &uri, "{}", Some("ghs_read_only_rerun_token")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+        assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+    }
+}
+
+#[tokio::test]
+async fn rerun_rejects_uuid_from_different_repository() {
+    // A run living under `octocat/repo` must not be reachable through a
+    // sibling repository's URL — the UUID would resolve cross-repo without
+    // the repository check.
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    // Try to rerun it via a different repository's endpoint with the same UUID
+    // Should return 404 since the UUID doesn't belong to the other repo
+    let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/rerun");
+    let (status, body) = post_json(&app, &uri, "{}", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "foreign UUID should be 404: {body}"
+    );
+
+    // The original run should not be rerequested
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn rerun_failed_rejects_uuid_from_different_repository() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "failure").await;
+
+    let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/rerun-failed-jobs");
+    let (status, body) = post_json(&app, &uri, "{}", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "foreign UUID should be 404: {body}"
+    );
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+#[tokio::test]
+async fn cancel_rejects_uuid_from_different_repository() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    let uri = format!("/repos/attacker/evil-repo/actions/runs/{run_id}/cancel");
+    let (status, body) = post_json(&app, &uri, "{}", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "foreign UUID should be 404: {body}"
+    );
+}
+
+/// The mirror image: a run owned by ANOTHER repository stays a 404 on the
+/// authorized repository's URL even though the caller (system token) covers
+/// both. This is the case the repository check exists for.
+#[tokio::test]
+async fn rerun_rejects_a_uuid_owned_by_another_repository() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let shared = state.shared();
+    let accepted = crate::submit_run_inner(
+        &shared,
+        WorkflowSubmission {
+            workflow_yaml:
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+                    .to_owned(),
+            event: "push".to_owned(),
+            repository: "victim/other".to_owned(),
+            sha: "f".repeat(40),
+            resolved_sha: Some("f".repeat(40)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    shared
+        .state
+        .test_db_mutate(|db| db.set_run_status(accepted.run_id, "completed", Some("success")))
+        .await
+        .unwrap();
+
+    for suffix in ["rerun", "rerun-failed-jobs", "cancel"] {
+        let uri = format!(
+            "/repos/octocat/repo/actions/runs/{}/{suffix}",
+            accepted.run_id
+        );
+        let (status, body) = post_json(&app, &uri, "{}", None).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{uri}: another repo's run UUID must be a 404: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rerun_accepts_empty_body() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/rerun");
+    let (status, body) = post_json(&app, &uri, "", None).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "empty body should be accepted: {body}"
+    );
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 2);
+}
+
+/// POST with a caller-chosen Content-Type (or none) and raw bytes.
+async fn post_raw(
+    app: &Router,
+    uri: &str,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(Method::POST).uri(uri).header(
+        header::AUTHORIZATION,
+        format!("Bearer {DEFAULT_PRELOOP_SYSTEM_TOKEN}"),
+    );
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    let request = builder.body(Body::from(body.to_vec())).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Malformed JSON is a GitHub-shaped 422 (`message` + `documentation_url`)
+/// even without a JSON Content-Type — the body is invalid for every type.
+#[tokio::test]
+async fn rerun_rejects_malformed_json_with_422() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/rerun");
+
+    for content_type in [Some("application/json"), None, Some("text/plain")] {
+        let (status, body) = post_raw(&app, &uri, b"{invalid json}", content_type).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "content-type {content_type:?}: {body}"
+        );
+        assert!(
+            body["message"].is_string(),
+            "the 422 must be GitHub-shaped: {body}"
+        );
+        assert!(
+            body["documentation_url"].is_string(),
+            "GitHub errors carry documentation_url: {body}"
+        );
+    }
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+}
+
+/// A well-formed JSON body that is not an object is a 422; a JSON `null`
+/// body is accepted as empty (github.com treats it like no body).
+#[tokio::test]
+async fn rerun_rejects_non_object_json_and_accepts_null() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/rerun");
+
+    for bad in ["\"text\"", "[1,2]", "42"] {
+        let (status, body) = post_json(&app, &uri, bad, None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{bad} must be a 422: {body}"
+        );
+    }
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 1);
+
+    let (status, body) = post_json(&app, &uri, "null", None).await;
+    assert_eq!(status, StatusCode::CREATED, "null body: {body}");
+    assert_eq!(run_by_id(&state, &run_id).await.run_attempt, 2);
+}
+
+/// The REST rerun caller is the rerun's `github.triggering_actor` (the
+/// system bearer resolves to `preloop-system`) while the run's submission
+/// actor stays the dispatch caller's.
+#[tokio::test]
+async fn rerun_shim_stamps_the_callers_triggering_actor() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    let actor_before = run_by_id(&state, &run_id).await.submission.actor.clone();
+
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/rerun");
+    let (status, body) = post_json(&app, &uri, "{}", None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let run = run_by_id(&state, &run_id).await;
+    assert_eq!(
+        run.github["triggering_actor"].as_str(),
+        Some("preloop-system"),
+        "the authenticated caller is the triggering actor: {}",
+        run.github
+    );
+    assert_eq!(
+        run.submission.actor, actor_before,
+        "the original actor is preserved for auth/history"
+    );
+}
+
+/// A run that archived between ref resolution and the cancel is answered
+/// like every terminal run: `409`, GitHub's "Cannot cancel a workflow run
+/// that is completed."
+#[tokio::test]
+async fn cancel_shim_409s_an_archived_run() {
+    let (state, app, _temp) = dispatch_fixture(&[("dispatch.yml", DISPATCH_WORKFLOW)]).await;
+    let run_id = dispatched_completed_run(&state, &app, "success").await;
+    let parsed: preloop_gha_protocol::RunId = run_id.parse().unwrap();
+    state
+        .test_db_mutate(|tx| {
+            let old = (chrono::Utc::now() - chrono::Duration::seconds(120)).timestamp_micros();
+            tx.set_run_completed_at_us(parsed, old).unwrap();
+        })
+        .await;
+    assert!(state.test_archive_finished_runs_once().await >= 1);
+
+    let uri = format!("/repos/octocat/repo/actions/runs/{run_id}/cancel");
+    let (status, body) = post_json(&app, &uri, "{}", None).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an archived run is terminal: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("completed"),
+        "the 409 must be GitHub-shaped: {body}"
+    );
+}
+
+// ─── webhook coverage cache and lifecycle invalidation ─────────────────
+
+/// Loopback GitHub API for `GET /repos/{owner}/{repo}/installation`, with
+/// per-repository answers and a barrier on the first request. Counts lookups
+/// per repository so cache hits, invalidation, and single-flight are observable
+/// without sleeping.
+struct WebhookCoverageStub {
+    base: String,
+    lookups: Arc<std::sync::atomic::AtomicUsize>,
+    by_repo: Arc<parking_lot::Mutex<std::collections::HashMap<String, usize>>>,
+    answers: Arc<parking_lot::Mutex<std::collections::HashMap<String, (u16, Value)>>>,
+    raw_answers: Arc<parking_lot::Mutex<std::collections::HashMap<String, (u16, String)>>>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl WebhookCoverageStub {
+    async fn start(block_first: bool) -> Self {
+        use axum::extract::Path;
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let by_repo: Arc<parking_lot::Mutex<std::collections::HashMap<String, usize>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let answers: Arc<parking_lot::Mutex<std::collections::HashMap<String, (u16, Value)>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let raw_answers: Arc<parking_lot::Mutex<std::collections::HashMap<String, (u16, String)>>> =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let served = Arc::clone(&lookups);
+        let repo_counts = Arc::clone(&by_repo);
+        let configured = Arc::clone(&answers);
+        let raw_configured = Arc::clone(&raw_answers);
+        let started = Arc::clone(&entered);
+        let resume = Arc::clone(&release);
+        let stub = Router::new().route(
+            "/repos/{owner}/{repo}/installation",
+            get(
+                move |Path((owner, repo)): Path<(String, String)>, _headers: HeaderMap| {
+                    let served = Arc::clone(&served);
+                    let repo_counts = Arc::clone(&repo_counts);
+                    let configured = Arc::clone(&configured);
+                    let raw_configured = Arc::clone(&raw_configured);
+                    let started = Arc::clone(&started);
+                    let resume = Arc::clone(&resume);
+                    async move {
+                        let key = format!("{owner}/{repo}").to_ascii_lowercase();
+                        let call = served.fetch_add(1, Ordering::SeqCst);
+                        *repo_counts.lock().entry(key.clone()).or_insert(0) += 1;
+                        let answer = configured
+                            .lock()
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| (404, json!({ "message": "Not Found" })));
+                        let raw = raw_configured.lock().get(&key).cloned();
+                        if block_first && call == 0 {
+                            started.notify_one();
+                            resume.notified().await;
+                        }
+                        match raw {
+                            Some((status, body)) => (
+                                axum::http::StatusCode::from_u16(status).expect("stub status code"),
+                                body,
+                            )
+                                .into_response(),
+                            None => {
+                                let status = axum::http::StatusCode::from_u16(answer.0)
+                                    .expect("stub status code");
+                                (status, Json(answer.1)).into_response()
+                            }
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+        Self {
+            base,
+            lookups,
+            by_repo,
+            answers,
+            raw_answers,
+            entered,
+            release,
+        }
+    }
+
+    fn set(&self, repository: &str, status: u16, body: Value) {
+        let key = repository.to_ascii_lowercase();
+        self.answers.lock().insert(key.clone(), (status, body));
+        self.raw_answers.lock().remove(&key);
+    }
+
+    fn set_raw(&self, repository: &str, status: u16, body: &str) {
+        let key = repository.to_ascii_lowercase();
+        self.raw_answers
+            .lock()
+            .insert(key.clone(), (status, body.to_owned()));
+        self.answers.lock().remove(&key);
+    }
+
+    fn lookups_for(&self, repository: &str) -> usize {
+        self.by_repo
+            .lock()
+            .get(&repository.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn total_lookups(&self) -> usize {
+        self.lookups.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+async fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if condition() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition was not reached"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Two registered Apps with distinct webhook secrets and exact-repository
+/// installation answers served by the loopback stub.
+async fn webhook_coverage_fixture() -> (tempfile::TempDir, AppState, Router) {
+    let temp = tempfile::tempdir().unwrap();
+    let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+    let (mut registry, _) = two_app_registry();
+    registry.apps[0].webhook_secret = Some("default-secret".to_owned());
+    state.webhook_secret = Some("legacy-secret".to_owned());
+    state.github_apps = Some(registry);
+    let app = webhook_test_router(state.clone());
+    (temp, state, app)
+}
+
+fn coverage_ping(repository: &str) -> Value {
+    json!({ "repository": { "full_name": repository } })
+}
+
+fn coverage_installation(app_id: u64) -> Value {
+    json!({ "id": 77, "app_id": app_id })
+}
+
+/// Only the App whose secret verifies a lifecycle payload may change its cached
+/// answers. Unsigned payloads and payloads claiming another `app_id` affect
+/// nothing; a valid removal invalidates the signer's answer immediately.
+#[tokio::test]
+async fn signed_lifecycle_events_invalidate_only_their_own_app_coverage() {
+    let (_temp, _state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(false).await;
+    let _env = pin_api_base(&stub.base).await;
+    stub.set("org-a/repo", 200, coverage_installation(424));
+
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(stub.lookups_for("org-a/repo"), 1);
+
+    let removal = json!({
+        "action": "removed",
+        "repositories_removed": [{ "full_name": "org-a/repo" }],
+    });
+    assert_eq!(
+        deliver_webhook(&app, "installation_repositories", &removal, "wrong-secret").await,
+        StatusCode::UNAUTHORIZED,
+        "an invalid signature must be rejected before any cache mutation"
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        1,
+        "an unsigned lifecycle payload must not invalidate the cache"
+    );
+
+    // App 525 is a different verified signer. Its lifecycle payload cannot
+    // invalidate App 424's answer, even when it claims app_id 424.
+    let foreign = json!({
+        "action": "deleted",
+        "installation": { "id": 9, "app_id": 424 },
+        "repositories_removed": [{ "full_name": "org-a/repo" }],
+    });
+    assert_eq!(
+        deliver_webhook(&app, "installation", &foreign, "second-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        1,
+        "another App's lifecycle event must not invalidate App 424's cache"
+    );
+
+    // The signer's own verified removal invalidates its answer.
+    assert_eq!(
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &removal,
+            "default-secret"
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        2,
+        "the next ordinary delivery re-confirms after invalidation"
+    );
+    // The signer reports the repository revoked; the next delivery must see
+    // the 404 immediately rather than reuse the re-confirmed positive.
+    assert_eq!(
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &removal,
+            "default-secret"
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    stub.set("org-a/repo", 404, json!({ "message": "Not Found" }));
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN,
+        "a revoked repository is denied immediately, not after the TTL"
+    );
+    assert_eq!(stub.lookups_for("org-a/repo"), 3);
+}
+
+/// Suspension and deletion clear the signer's answers before the ordinary gate,
+/// so the next delivery checks GitHub again. A 200 with `suspended_at` is not
+/// active coverage.
+#[tokio::test]
+async fn lifecycle_suspension_and_deletion_deny_the_next_delivery() {
+    let (_temp, _state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(false).await;
+    let _env = pin_api_base(&stub.base).await;
+    stub.set("org-a/repo", 200, coverage_installation(424));
+
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        deliver_webhook(
+            &app,
+            "installation",
+            &json!({ "action": "suspend", "installation": { "id": 7, "app_id": 424 } }),
+            "default-secret",
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    stub.set(
+        "org-a/repo",
+        200,
+        json!({
+            "id": 77,
+            "app_id": 424,
+            "suspended_at": "2026-10-20T00:00:00Z",
+        }),
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN,
+        "a suspended installation is not coverage"
+    );
+
+    assert_eq!(
+        deliver_webhook(
+            &app,
+            "installation",
+            &json!({ "action": "deleted", "installation": { "id": 7, "app_id": 424 } }),
+            "default-secret",
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    stub.set("org-a/repo", 404, json!({ "message": "Not Found" }));
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        3,
+        "each lifecycle event forced a fresh lookup"
+    );
+}
+
+/// A signed `installation_repositories` addition invalidates the affected
+/// answer, so the next ordinary delivery confirms current access.
+#[tokio::test]
+async fn adding_a_repository_invalidates_its_previous_answer() {
+    let (_temp, _state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(false).await;
+    let _env = pin_api_base(&stub.base).await;
+
+    // First delivery sees a definitive 404 and is denied; the 404 is not
+    // retained, so a later grant works without waiting for a TTL.
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(stub.lookups_for("org-a/repo"), 1);
+    stub.set("org-a/repo", 200, coverage_installation(424));
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(stub.lookups_for("org-a/repo"), 2);
+
+    assert_eq!(
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &json!({
+                "action": "added",
+                "repositories_added": [{ "full_name": "org-a/repo" }],
+            }),
+            "default-secret",
+        )
+        .await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        3,
+        "the addition invalidated the cached positive for the next ordinary delivery"
+    );
+}
+
+/// A positive lookup that began before a signed removal completes afterwards:
+/// it must neither repopulate the cache nor authorize its own delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_positive_after_invalidation_neither_repopulates_nor_authorizes() {
+    let (_temp, _state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(true).await;
+    let _env = pin_api_base(&stub.base).await;
+    stub.set("org-a/repo", 200, coverage_installation(424));
+
+    let app_for_slow = app.clone();
+    let slow = tokio::spawn(async move {
+        deliver_webhook(
+            &app_for_slow,
+            "ping",
+            &coverage_ping("org-a/repo"),
+            "default-secret",
+        )
+        .await
+    });
+    stub.wait_entered().await;
+
+    let removal = json!({
+        "action": "removed",
+        "repositories_removed": [{ "full_name": "org-a/repo" }],
+    });
+    let lifecycle = tokio::time::timeout(
+        Duration::from_secs(2),
+        deliver_webhook(
+            &app,
+            "installation_repositories",
+            &removal,
+            "default-secret",
+        ),
+    )
+    .await
+    .expect("the lifecycle request must not wait behind the blocked lookup");
+    assert_eq!(lifecycle, StatusCode::ACCEPTED);
+
+    stub.set("org-a/repo", 404, json!({ "message": "Not Found" }));
+    stub.release();
+    assert_eq!(
+        slow.await.unwrap(),
+        StatusCode::FORBIDDEN,
+        "a lookup begun before invalidation must not authorize its delivery"
+    );
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        2,
+        "the stale positive was not cached; the next delivery looked again"
+    );
+}
+
+/// Same-repository deliveries arriving together share one coverage lookup;
+/// an independent repository does not wait behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_webhook_deliveries_coalesce_by_repository() {
+    let (_temp, state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(true).await;
+    let _env = pin_api_base(&stub.base).await;
+    stub.set("org-a/repo", 200, coverage_installation(424));
+    stub.set("org-a/other", 200, coverage_installation(424));
+    let app_creds = state
+        .github_apps
+        .as_ref()
+        .expect("registry")
+        .app_by_id("424")
+        .expect("default App")
+        .clone();
+
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move {
+            deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await
+        }
+    });
+    stub.wait_entered().await;
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move {
+            deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await
+        }
+    });
+    wait_until(|| app_creds.coverage_flight_waiters("org-a/repo") >= 1).await;
+
+    let other = tokio::spawn({
+        let app = app.clone();
+        async move {
+            deliver_webhook(
+                &app,
+                "ping",
+                &coverage_ping("org-a/other"),
+                "default-secret",
+            )
+            .await
+        }
+    });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), other)
+            .await
+            .expect("an independent repository must not wait behind the blocked lookup")
+            .unwrap(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(stub.lookups_for("org-a/other"), 1);
+
+    stub.release();
+    assert_eq!(first.await.unwrap(), StatusCode::ACCEPTED);
+    assert_eq!(second.await.unwrap(), StatusCode::ACCEPTED);
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        1,
+        "the same-repository delivery shared the in-flight lookup"
+    );
+    assert_eq!(stub.total_lookups(), 2);
+}
+
+/// Malformed, foreign-App, and transient answers deny the delivery without
+/// teaching the cache; a healthy answer immediately after is accepted.
+#[tokio::test]
+async fn unusable_coverage_answers_are_retried_not_cached() {
+    let (_temp, _state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(false).await;
+    let _env = pin_api_base(&stub.base).await;
+
+    for (status, body) in [
+        (200, json!({ "id": 77, "app_id": 999 })),
+        (200, json!({ "id": 77 })),
+        (500, json!({ "message": "outage" })),
+        (429, json!({ "message": "rate limited" })),
+    ] {
+        stub.set("org-a/repo", status, body);
+        assert_eq!(
+            deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+            StatusCode::FORBIDDEN,
+            "{status} was not a valid positive, so the delivery fails closed"
+        );
+    }
+    stub.set_raw("org-a/repo", 200, r#"{"id": 77, "app_id": "#);
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::FORBIDDEN,
+        "invalid JSON is not a positive"
+    );
+    assert_eq!(stub.lookups_for("org-a/repo"), 5);
+    stub.set("org-a/repo", 200, coverage_installation(424));
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        stub.lookups_for("org-a/repo"),
+        6,
+        "none of the unusable answers was retained"
+    );
+}
+
+/// The verified signer is persisted with the delivery, and a legacy delivery
+/// records no App identity.
+#[tokio::test]
+async fn verified_signer_is_persisted_for_durable_processing() {
+    let (_temp, state, app) = webhook_coverage_fixture().await;
+    let stub = WebhookCoverageStub::start(false).await;
+    let _env = pin_api_base(&stub.base).await;
+    stub.set("org-a/repo", 200, coverage_installation(424));
+
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "default-secret").await,
+        StatusCode::ACCEPTED
+    );
+    let claimed = state.backend.claim_webhook_deliveries(1, 60).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].signer_app_id.as_deref(), Some("424"));
+
+    assert_eq!(
+        deliver_webhook(&app, "ping", &coverage_ping("org-a/repo"), "legacy-secret").await,
+        StatusCode::ACCEPTED
+    );
+    let claimed = state.backend.claim_webhook_deliveries(1, 60).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(
+        claimed[0].signer_app_id, None,
+        "the legacy shared secret has no App identity"
+    );
 }

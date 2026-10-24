@@ -1,4 +1,6 @@
 use super::*;
+use futures::StreamExt;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Deserialize)]
 pub struct CachePutRequest {
@@ -75,50 +77,6 @@ pub fn ref_scoped_namespace(repository: Option<String>, git_ref: Option<String>)
         (Some(repository), None) => repository,
         (None, _) => String::new(),
     }
-}
-
-/// Refuse a chunk that would push an in-flight upload past
-/// `max_bytes`. Split from `cache_upload` so tests can exercise the
-/// boundary with a small limit instead of allocating the production
-/// 512 MiB cap.
-pub fn ensure_cache_chunk_fits(
-    current_bytes: u64,
-    chunk_bytes: u64,
-    max_bytes: u64,
-) -> Result<(), ApiError> {
-    if current_bytes + chunk_bytes > max_bytes {
-        return Err(ApiError::payload_too_large(format!(
-            "cache upload exceeds the {} MiB per-upload cap",
-            max_bytes / (1024 * 1024)
-        )));
-    }
-    Ok(())
-}
-
-/// Refuse a chunk that would push a job's *aggregate* pending bytes
-/// past `max_bytes`. The per-upload cap alone still lets a job hold
-/// `MAX_PENDING_PER_JOB` × 512 MiB; this bounds the job's total. Split out
-/// so tests can exercise the boundary with a small limit instead of
-/// allocating the production 1 GiB budget.
-pub fn ensure_pending_cache_bytes_fit(
-    inner: &InnerState,
-    job_backend_id: &str,
-    chunk_bytes: u64,
-    max_bytes: u64,
-) -> Result<(), ApiError> {
-    let job_bytes: u64 = inner
-        .pending_caches
-        .values()
-        .filter(|pending| pending.job_backend_id == job_backend_id)
-        .map(|pending| pending.bytes.len() as u64)
-        .sum();
-    if job_bytes + chunk_bytes > max_bytes {
-        return Err(ApiError::payload_too_large(format!(
-            "job exceeds the {} MiB pending-cache byte budget",
-            max_bytes / (1024 * 1024)
-        )));
-    }
-    Ok(())
 }
 
 pub async fn cache_put(
@@ -201,6 +159,17 @@ pub async fn cache_reserve(
             "job is not live; writes are rejected for completed or unknown jobs",
         ));
     }
+    // Stage upload chunks to disk as they arrive instead of buffering the
+    // whole blob in memory: a 150 MB upload used to sit in server RAM for
+    // the reservation's lifetime. The staging file is
+    // consumed by `cache_commit` (moved into the entry directory) or
+    // deleted by the TTL sweeper when the reservation is abandoned.
+    // Created before the state lock: the parent directory is shared by all
+    // reservations, so no per-reservation I/O happens under the lock.
+    let staging_dir = shared.state.state_dir.join("cache-staging");
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .map_err(|error| ApiError::internal(format!("cache staging dir: {error}")))?;
     let mut inner = shared.state.inner.lock().await;
     // Bound in-flight legacy reservations per job, mirroring the v2
     // path's MAX_PENDING_PER_JOB. Without it a job could accumulate
@@ -217,8 +186,27 @@ pub async fn cache_reserve(
             )));
         }
     }
+    let job_quota = if job_backend_id.is_empty() {
+        None
+    } else {
+        Some(
+            inner
+                .pending_caches
+                .values()
+                .find(|pending| pending.job_backend_id == job_backend_id)
+                .and_then(|pending| pending.job_quota.clone())
+                .unwrap_or_else(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        MAX_PENDING_CACHE_BYTES_PER_JOB as usize,
+                    ))
+                }),
+        )
+    };
+    let upload_quota = Arc::new(tokio::sync::Semaphore::new(MAX_CACHE_UPLOAD_BYTES as usize));
+    let invalidated = Arc::new(std::sync::atomic::AtomicBool::new(false));
     inner.next_cache_id += 1;
     let cache_id = inner.next_cache_id;
+    let staging_path = staging_dir.join(format!("{cache_id}.part"));
     inner.pending_caches.insert(
         cache_id,
         PendingCache {
@@ -228,7 +216,12 @@ pub async fn cache_reserve(
             // key namespace.
             namespace: ref_scoped_namespace(repository, git_ref),
             version: request.version,
-            bytes: Vec::new(),
+            staging_path,
+            staging_len: 0,
+            upload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            upload_quota,
+            job_quota,
+            invalidated,
             job_backend_id,
             // Stamp the reservation so the TTL sweeper can free it if
             // the job never commits (previously abandoned reservations held
@@ -239,12 +232,140 @@ pub async fn cache_reserve(
     drop(inner);
     Ok(Json(CacheReserveResponse { cache_id }))
 }
+struct CacheUploadGuard {
+    cache_id: i64,
+    staging_path: std::path::PathBuf,
+    start_len: u64,
+    invalidated: Arc<std::sync::atomic::AtomicBool>,
+    staged: tokio::fs::File,
+    upload_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    job_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    finished: bool,
+}
+
+impl CacheUploadGuard {
+    fn reserve_chunk(
+        &mut self,
+        upload_quota: Arc<tokio::sync::Semaphore>,
+        job_quota: Option<Arc<tokio::sync::Semaphore>>,
+        bytes: usize,
+    ) -> Result<(), ApiError> {
+        let permits = u32::try_from(bytes)
+            .map_err(|_| ApiError::payload_too_large("cache upload frame is too large"))?;
+        let upload = match upload_quota.try_acquire_many_owned(permits) {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                return Err(ApiError::payload_too_large(
+                    "cache upload exceeds the per-upload cap",
+                ));
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(ApiError::internal("cache upload quota is closed"));
+            }
+        };
+        let Some(job_quota) = job_quota else {
+            if let Some(existing) = &mut self.upload_permit {
+                existing.merge(upload);
+            } else {
+                self.upload_permit = Some(upload);
+            }
+            return Ok(());
+        };
+        let job = match job_quota.try_acquire_many_owned(permits) {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                return Err(ApiError::payload_too_large(
+                    "job exceeds the pending-cache byte budget",
+                ));
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(ApiError::internal("pending-cache quota is closed"));
+            }
+        };
+        if let Some(existing) = &mut self.upload_permit {
+            existing.merge(upload);
+        } else {
+            self.upload_permit = Some(upload);
+        }
+        if let Some(existing) = &mut self.job_permit {
+            existing.merge(job);
+        } else {
+            self.job_permit = Some(job);
+        }
+        Ok(())
+    }
+
+    async fn rollback(&mut self) -> bool {
+        let result = match self.staged.set_len(self.start_len).await {
+            Ok(()) => self.staged.flush().await,
+            Err(error) => Err(error),
+        };
+        if result.is_ok() {
+            self.finished = true;
+            true
+        } else {
+            self.invalidated
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(permit) = self.upload_permit.take() {
+            permit.forget();
+        }
+        if let Some(permit) = self.job_permit.take() {
+            permit.forget();
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for CacheUploadGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.invalidated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let path = self.staging_path.clone();
+        let start_len = self.start_len;
+        let cache_id = self.cache_id;
+        tokio::spawn(async move {
+            let result = async {
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .await?;
+                file.set_len(start_len).await?;
+                file.flush().await
+            }
+            .await;
+            if let Err(error) = result {
+                warn!(
+                    cache_id,
+                    path = %path.display(),
+                    ?error,
+                    "cancelled cache upload rollback failed"
+                );
+            }
+        });
+    }
+}
+
+async fn cache_upload_rollback_error(guard: &mut CacheUploadGuard, error: ApiError) -> ApiError {
+    if guard.rollback().await {
+        error
+    } else {
+        ApiError::internal("cache upload rollback failed; reservation invalidated")
+    }
+}
 
 pub async fn cache_upload(
     State(shared): State<Arc<SharedState>>,
     headers: axum::http::HeaderMap,
     Path(cache_id): Path<i64>,
-    bytes: Bytes,
+    body: Body,
 ) -> Result<StatusCode, ApiError> {
     crate::events::trust_tier::ensure_cache_write_allowed(&shared.state, &headers).await?;
     let claims = auth::job_runtime_claims_from_headers(&shared.state, &headers);
@@ -260,54 +381,155 @@ pub async fn cache_upload(
         };
         auth::require_live_job(&shared.state, claims.job_id).await?;
     }
-    let mut inner = shared.state.inner.lock().await;
-    {
+
+    // Look up the reservation lock without waiting while `InnerState` is
+    // held. The second lookup after acquiring it closes the commit/reaper
+    // race where the reservation disappears while this request waits.
+    let upload_lock = {
+        let inner = shared.state.inner.lock().await;
         let pending = inner
             .pending_caches
             .get(&cache_id)
             .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
-        if !system && pending.job_backend_id != caller_job_id.unwrap_or_default() {
+        if !system && pending.job_backend_id != caller_job_id.as_deref().unwrap_or_default() {
             return Err(ApiError::forbidden(
                 "cache reservation belongs to another job",
             ));
         }
-        // Cap each in-flight upload's running total. Without this
-        // check a job could grow server RAM without bound by PATCHing
-        // chunks forever (~500 requests/GiB at the 2 MiB default body
-        // limit). The check runs before the vector grows so the refusal
-        // itself allocates nothing.
-        ensure_cache_chunk_fits(
-            pending.bytes.len() as u64,
-            bytes.len() as u64,
-            MAX_CACHE_UPLOAD_BYTES,
-        )?;
-        // Cap the job's *aggregate* pending bytes, not just each
-        // upload — MAX_PENDING_PER_JOB × MAX_CACHE_UPLOAD_BYTES would
-        // otherwise let one job hold ~16 GiB in reservations. The sum runs
-        // under the same lock as the append, so concurrent chunks cannot
-        // race past the budget.
-        if !pending.job_backend_id.is_empty() {
-            ensure_pending_cache_bytes_fit(
-                &inner,
-                &pending.job_backend_id,
-                bytes.len() as u64,
-                MAX_PENDING_CACHE_BYTES_PER_JOB,
-            )?;
+        pending.upload_lock.clone()
+    };
+    let _upload_guard = upload_lock.lock().await;
+    let (staging_path, start_len, invalidated) = {
+        let inner = shared.state.inner.lock().await;
+        let pending = inner
+            .pending_caches
+            .get(&cache_id)
+            .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
+        if !system && pending.job_backend_id != caller_job_id.as_deref().unwrap_or_default() {
+            return Err(ApiError::forbidden(
+                "cache reservation belongs to another job",
+            ));
         }
+        if pending
+            .invalidated
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ApiError::bad_request(
+                "cache upload reservation is invalidated",
+            ));
+        }
+        (
+            pending.staging_path.clone(),
+            pending.staging_len,
+            pending.invalidated.clone(),
+        )
+    };
+    let staged = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(&staging_path)
+        .await
+        .map_err(|error| ApiError::internal(format!("cache staging write: {error}")))?;
+    let actual_len = staged
+        .metadata()
+        .await
+        .map_err(|error| ApiError::internal(format!("cache staging stat: {error}")))?
+        .len();
+    if actual_len != start_len {
+        invalidated.store(true, std::sync::atomic::Ordering::SeqCst);
+        return Err(ApiError::internal(
+            "cache staging length disagrees with reservation",
+        ));
     }
-    let pending = inner
-        .pending_caches
-        .get_mut(&cache_id)
-        .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
-    pending.bytes.extend_from_slice(&bytes);
-    // Refresh the activity stamp: the TTL sweeper frees reservations idle
-    // past PENDING_UPLOAD_TTL, and an active chunked upload must not be
-    // reaped between PATCHes.
-    pending.created_unix = crate::memory_caps::now_unix();
-    // No write-through here on purpose: the in-flight payload is not durable
-    // state (see `MetaSnapshot`), and snapshotting per chunk was quadratic in
-    // cache size. The committed cache is persisted by `CacheStore` in
-    // `cache_commit`.
+    let mut guard = CacheUploadGuard {
+        cache_id,
+        staging_path,
+        start_len,
+        invalidated,
+        staged,
+        upload_permit: None,
+        job_permit: None,
+        finished: false,
+    };
+    let mut stream = body.into_data_stream();
+    let mut total = 0u64;
+    while let Some(next) = stream.next().await {
+        let chunk = next.map_err(|error| ApiError::internal(format!("cache upload body: {error}")));
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return Err(cache_upload_rollback_error(&mut guard, error).await);
+            }
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        let quotas = {
+            let inner = shared.state.inner.lock().await;
+            let pending = inner
+                .pending_caches
+                .get(&cache_id)
+                .ok_or_else(|| ApiError::not_found("cache reservation not found"));
+            match pending {
+                Ok(pending) => {
+                    if pending
+                        .invalidated
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        Err(ApiError::bad_request(
+                            "cache upload reservation is invalidated",
+                        ))
+                    } else {
+                        Ok((pending.upload_quota.clone(), pending.job_quota.clone()))
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let (upload_quota, job_quota) = match quotas {
+            Ok(quotas) => quotas,
+            Err(error) => {
+                return Err(cache_upload_rollback_error(&mut guard, error).await);
+            }
+        };
+        if let Err(error) = guard.reserve_chunk(upload_quota, job_quota, chunk.len()) {
+            return Err(cache_upload_rollback_error(&mut guard, error).await);
+        }
+        if let Err(error) = guard.staged.write_all(&chunk).await {
+            let error = ApiError::internal(format!("cache staging write: {error}"));
+            return Err(cache_upload_rollback_error(&mut guard, error).await);
+        }
+        total = total.saturating_add(chunk.len() as u64);
+    }
+    if let Err(error) = guard.staged.flush().await {
+        let error = ApiError::internal(format!("cache staging flush: {error}"));
+        return Err(cache_upload_rollback_error(&mut guard, error).await);
+    }
+
+    let promoted = {
+        let mut inner = shared.state.inner.lock().await;
+        if let Some(pending) = inner.pending_caches.get_mut(&cache_id) {
+            if pending
+                .invalidated
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(ApiError::bad_request(
+                    "cache upload reservation is invalidated",
+                ))
+            } else {
+                pending.staging_len = pending.staging_len.saturating_add(total);
+                pending.created_unix = crate::memory_caps::now_unix();
+                Ok(())
+            }
+        } else {
+            Err(ApiError::not_found("cache reservation not found"))
+        }
+    };
+    if let Err(error) = promoted {
+        return Err(cache_upload_rollback_error(&mut guard, error).await);
+    }
+    guard.finish();
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -322,6 +544,7 @@ pub async fn cache_commit(
     let caller_job_id = claims.as_ref().map(|claims| claims.job_id.to_string());
     let system = auth::system_bearer_authorized(&shared.state, &headers);
     // A stale job token must not commit uploads after its job
+    // completes. The system bearer manages the lifecycle itself and bypasses.
     if !system {
         let Some(claims) = claims else {
             return Err(ApiError::unauthorized(
@@ -330,13 +553,28 @@ pub async fn cache_commit(
         };
         auth::require_live_job(&shared.state, claims.job_id).await?;
     }
+
+    let upload_lock = {
+        let inner = shared.state.inner.lock().await;
+        let pending = inner
+            .pending_caches
+            .get(&cache_id)
+            .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
+        if !system && pending.job_backend_id != caller_job_id.as_deref().unwrap_or_default() {
+            return Err(ApiError::forbidden(
+                "cache reservation belongs to another job",
+            ));
+        }
+        pending.upload_lock.clone()
+    };
+    let _upload_guard = upload_lock.lock().await;
     let pending = {
         let mut inner = shared.state.inner.lock().await;
         let pending = inner
             .pending_caches
             .get(&cache_id)
             .ok_or_else(|| ApiError::not_found("cache reservation not found"))?;
-        if !system && pending.job_backend_id != caller_job_id.unwrap_or_default() {
+        if !system && pending.job_backend_id != caller_job_id.as_deref().unwrap_or_default() {
             return Err(ApiError::forbidden(
                 "cache reservation belongs to another job",
             ));
@@ -346,25 +584,48 @@ pub async fn cache_commit(
             .remove(&cache_id)
             .ok_or_else(|| ApiError::not_found("cache reservation not found"))?
     };
-
+    if let Some(job_quota) = &pending.job_quota {
+        job_quota.add_permits(pending.staging_len as usize);
+    }
+    if pending
+        .invalidated
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let _ = tokio::fs::remove_file(&pending.staging_path).await;
+        return Err(ApiError::bad_request(
+            "cache upload reservation was interrupted",
+        ));
+    }
     if let Some(size) = request.size {
-        let actual = pending.bytes.len() as u64;
+        let actual = pending.staging_len;
         if size != actual {
+            let _ = tokio::fs::remove_file(&pending.staging_path).await;
             return Err(ApiError::bad_request(format!(
                 "cache size mismatch: expected {size}, got {actual}"
             )));
         }
     }
-    let entry = shared
+    // Commit the staged file into the cache store without ever loading it
+    // into RAM: the store moves the file and enforces the LRU quota.
+    let entry = match shared
         .state
         .cache
-        .put_scoped(
+        .commit_file_scoped(
             &pending.namespace,
             &pending.key,
             &pending.version,
-            &pending.bytes,
+            &pending.staging_path,
         )
-        .await?;
+        .await
+    {
+        Ok(entry) => entry,
+        Err(error) => {
+            // The store consumed nothing on failure (duplicate key, I/O):
+            // the staging file is ours to clean up.
+            let _ = tokio::fs::remove_file(&pending.staging_path).await;
+            return Err(error.into());
+        }
+    };
     Ok(Json(CacheLookupResponse {
         hit: true,
         key: Some(entry.key),
@@ -460,7 +721,48 @@ pub async fn artifact_create(
         };
         auth::require_live_job(&shared.state, claims.job_id).await?;
     }
+    // A job token may only name its own run: without the binding, run A's
+    // live token could squat run B's artifact namespace through `:run_id`.
+    require_legacy_artifact_run_binding(&shared, &headers, run_id).await?;
     put_artifact(shared, run_id, request.name, request.file_name, Vec::new()).await
+}
+
+/// Bind the legacy `/_apis/pipelines/workflows/:run_id/artifacts` handlers
+/// to the caller's workflow run. The protocol-bearer gate accepts any valid
+/// job token, and the path's `:run_id` was never checked — so run A's live
+/// job token could create artifacts catalogued under run B (a cross-run
+/// squat), or list/read them. A job token may only touch the run its own job
+/// belongs to, resolved through its job request record. The system bearer
+/// manages the lifecycle itself and bypasses, mirroring the other legacy
+/// artifact checks; a request with no resolvable job claims cannot be
+/// attributed to a run and is rejected.
+async fn require_legacy_artifact_run_binding(
+    shared: &Arc<SharedState>,
+    headers: &axum::http::HeaderMap,
+    run_id: RunId,
+) -> Result<(), ApiError> {
+    if auth::system_bearer_authorized(&shared.state, headers) {
+        return Ok(());
+    }
+    let forbidden =
+        || ApiError::forbidden("artifact access requires a token for that workflow run");
+    let Some(claims) = auth::job_runtime_claims_from_headers(&shared.state, headers) else {
+        return Err(ApiError::unauthorized(
+            "job token required for artifact access",
+        ));
+    };
+    let record = shared
+        .state
+        .backend
+        .request(crate::control::backend::RequestKey::AgentJobId(
+            claims.job_id,
+        ))
+        .await
+        .map_err(|_| forbidden())?;
+    if record.run_id != run_id {
+        return Err(forbidden());
+    }
+    Ok(())
 }
 
 pub async fn put_artifact(
@@ -514,8 +816,10 @@ pub async fn artifact_get(
 
 pub async fn artifact_get_compat(
     State(shared): State<Arc<SharedState>>,
-    Path((_run_id, artifact_id)): Path<(RunId, String)>,
+    headers: axum::http::HeaderMap,
+    Path((run_id, artifact_id)): Path<(RunId, String)>,
 ) -> Result<Response, ApiError> {
+    require_legacy_artifact_run_binding(&shared, &headers, run_id).await?;
     read_artifact(shared, artifact_id).await
 }
 
@@ -555,8 +859,10 @@ pub async fn read_artifact(
 
 pub async fn artifact_list(
     State(shared): State<Arc<SharedState>>,
+    headers: axum::http::HeaderMap,
     Path(run_id): Path<RunId>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_legacy_artifact_run_binding(&shared, &headers, run_id).await?;
     // Catalog first (durable, includes imported artifacts), then in-memory
     // records this process has not catalogued; ids de-duplicate.
     let mut seen = std::collections::HashSet::new();
@@ -564,11 +870,12 @@ pub async fn artifact_list(
     if let Ok(catalog) = shared.state.backend.artifact_catalog(Some(run_id)).await {
         for row in catalog {
             seen.insert(row.public_id.clone());
+            // The server-side storage path is deliberately omitted: it is a
+            // filesystem location clients never need and must not learn.
             value.push(json!({
                 "id": row.public_id,
                 "run_id": row.run_id,
                 "name": row.name,
-                "path": row.storage_key,
                 "size": row.size_bytes,
             }));
         }
@@ -584,15 +891,14 @@ pub async fn artifact_list(
                 "run_id": artifact.run_id,
                 "name": artifact.name,
                 "file_name": artifact.file_name,
-                "path": artifact.path,
                 "size": artifact.size,
             }));
         }
     }
-    Json(json!({
+    Ok(Json(json!({
         "count": value.len(),
         "value": value,
-    }))
+    })))
 }
 
 pub fn parse_restore_keys(keys: Option<&str>) -> Vec<String> {

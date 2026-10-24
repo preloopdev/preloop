@@ -1,0 +1,6558 @@
+//! Typed SmolVM CLI lifecycle primitives, shared by the SmolVM driver and
+//! (downstream) other CLI-backed drivers.
+//!
+//! The SmolVM driver ([`super::SmolvmDriver`]) is built on these; the CI
+//! runner pool also uses them directly for host-local SmolVM concerns.
+
+use async_trait::async_trait;
+use preloop_observability::deadline;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+pub mod agent_rootfs;
+
+/// Default bound on captured exec output.
+pub const DEFAULT_CAPTURE_LIMIT: usize = 1024 * 1024;
+
+/// SmolVM runtime floor, compiled from `smolvm_min_version` in the workspace
+/// `versions.toml` by this crate's `build.rs`.
+///
+/// The first release that satisfies every runtime invariant preloop needs:
+/// packed-machine ownership preservation (v1.8.1), `machine fork
+/// --freeze-source` (v1.18.1), and the x86_64 virtio device budget (v1.23.0) —
+/// see [`X86_64_VIRTIO_DEVICE_CEILING`]. `preloop update --ensure-runtime`
+/// accepts any stable release >= this and installs the latest stable when the
+/// local runtime is below it or lacks the required socket capability.
+pub const SMOLVM_MIN_VERSION: &str = env!("PRELOOP_SMOLVM_MIN_VERSION");
+
+/// Virtio devices x86_64 libkrun can address, i.e. the MMIO IRQ lines 5..=23
+/// it allocates, one line per device.
+///
+/// The 20th device fails the boot with `build microVM: ... no more IRQs are
+/// available` (SmolVM 1.23.0 raised this from [`X86_64_VIRTIO_DEVICE_CEILING_BEFORE_1_23`];
+/// smolvm PR #1521). Measured on x86_64 Linux at SmolVM 1.30.1 with a device
+/// ladder: the ceiling is 19 devices.
+pub const X86_64_VIRTIO_DEVICE_CEILING: usize = 19;
+
+/// Virtio devices x86_64 libkrun could address before SmolVM 1.23.0, when the
+/// allocation still started at IRQ 5 with 7 lines of headroom for the
+/// platform.
+pub const X86_64_VIRTIO_DEVICE_CEILING_BEFORE_1_23: usize = 11;
+
+/// Devices SmolVM's launcher builds for a machine before any `--volume`,
+/// `--mount-socket` or extra `--disk` counts against the budget.
+///
+/// Measured at SmolVM 1.30.1 on x86_64 Linux for an image machine created with
+/// `--storage 1 --overlay 1`: 9 devices (the rootfs and layer virtiofs
+/// exports, the storage and overlay disks, vsock, net, console and their
+/// console/agent peers). A machine built from a `.smolmachine` pack carries
+/// its own launcher set; each additional device costs exactly one MMIO IRQ
+/// line.
+pub const SMOLVM_IMAGE_MACHINE_BASELINE_DEVICES: usize = 9;
+
+/// The virtio devices a [`MachineSpec`] declares on top of SmolVM's fixed
+/// launcher set.
+///
+/// `machine start` carries no device flags and SmolVM does not report the
+/// inventory it is about to boot with, so the only place preloop can count
+/// what a machine asked for is the spec it was created from. One device per
+/// `--volume` (virtiofs), per `--mount-socket` (virtio-vsock), and per extra
+/// `--disk`; [`MachineSpec`] cannot express an extra disk yet, so only the
+/// first two are counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DeclaredDevices {
+    /// `--volume` host mounts, one virtiofs device each.
+    pub volumes: usize,
+    /// `--mount-socket` host sockets, one vsock device each.
+    pub sockets: usize,
+}
+
+impl DeclaredDevices {
+    /// Devices this inventory adds to SmolVM's fixed launcher set.
+    pub fn total(&self) -> usize {
+        self.volumes + self.sockets
+    }
+}
+
+/// Whether `stderr` carries libkrun's IRQ-exhaustion signature.
+///
+/// Both spellings upstream reports are matched: libkrun's own text on the
+/// `machine start` path, and the `IrqsExhausted` variant the preloop log
+/// surfaces when the failure comes back through the launcher's structured
+/// error. Nothing else in a boot failure carries either string, so an
+/// unrelated `EINVAL` — a disk image another hypervisor still holds, a
+/// foreign-owned or corrupt image, a rejected device option — is not
+/// classified as a device-budget failure.
+pub fn is_irq_exhaustion(stderr: &str) -> bool {
+    stderr.contains("no more IRQs are available") || stderr.contains("IrqsExhausted")
+}
+
+/// The operator-facing explanation for a boot that ran out of virtio IRQ
+/// lines, with the raw SmolVM output appended.
+///
+/// Pure, so the wording and the classification are unit-testable without a
+/// provider: `declared` is `None` for a machine this engine process did not
+/// create (an adopted golden), and `smolvm_version` is `None` when the
+/// `smolvm --version` probe failed.
+pub fn irq_exhaustion_message(
+    machine: &str,
+    operation: &str,
+    declared: Option<DeclaredDevices>,
+    smolvm_version: Option<&str>,
+    stderr: &str,
+) -> String {
+    let version = match smolvm_version {
+        Some(version) => format!("`smolvm --version` on this host reports {version}"),
+        None => {
+            "the host's smolvm version could not be read (`smolvm --version` failed)".to_owned()
+        }
+    };
+    let inventory = match declared {
+        Some(declared) => format!(
+            "This machine's spec declared {} volume mount(s), {} socket mount(s) and no extra \
+             disk(s): {} device(s) on top of the {baseline}-device launcher set SmolVM builds for \
+             an image machine (rootfs and layer virtiofs, the `--storage` and `--overlay` disks, \
+             vsock, net, console), and each `--volume`, `--mount-socket` or extra `--disk` costs \
+             exactly one device.",
+            declared.volumes,
+            declared.sockets,
+            declared.total(),
+            baseline = SMOLVM_IMAGE_MACHINE_BASELINE_DEVICES,
+        ),
+        None => format!(
+            "The spec this machine was created from is not recorded in this process (an earlier \
+             engine run created or adopted it), so its device counts cannot be listed here. The \
+             budget it drew on is the {baseline}-device launcher set SmolVM builds for an image \
+             machine plus one device per `--volume`, `--mount-socket` or extra `--disk`.",
+            baseline = SMOLVM_IMAGE_MACHINE_BASELINE_DEVICES,
+        ),
+    };
+    format!(
+        "smolvm `{operation}` for `{machine}` failed: the machine needs more virtio devices than \
+         this host's SmolVM provides, so libkrun could not get an MMIO IRQ line for one of them. \
+         x86_64 libkrun allocates {ceiling} IRQ lines (5-23) to virtio devices on SmolVM >= 1.23.0 \
+         and {before} before that; the arm64/macOS ceiling has not been measured. {inventory} \
+         {version}. Upgrade SmolVM to >= {floor} (`preloop update --ensure-runtime`) or start this \
+         machine with fewer mounts; a host that exhausts its device budget cannot be fixed by \
+         restarting the pool.\nRaw smolvm output:\n{stderr}",
+        ceiling = X86_64_VIRTIO_DEVICE_CEILING,
+        before = X86_64_VIRTIO_DEVICE_CEILING_BEFORE_1_23,
+        floor = SMOLVM_MIN_VERSION,
+    )
+}
+
+/// A validated persistent SmolVM machine name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct MachineName(String);
+
+impl MachineName {
+    /// Validate and construct a machine name.
+    pub fn new(value: impl Into<String>) -> Result<Self, VmError> {
+        let value = value.into();
+        let valid = !value.is_empty()
+            && value.len() <= 63
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && value
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric);
+        if !valid {
+            return Err(VmError::InvalidMachineName(value));
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for MachineName {
+    type Error = VmError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<MachineName> for String {
+    fn from(value: MachineName) -> Self {
+        value.0
+    }
+}
+
+/// A host directory exposed to a guest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeMount {
+    /// Canonical host path.
+    pub host: PathBuf,
+    /// Absolute guest path.
+    pub guest: PathBuf,
+    /// Deny guest writes to the host directory.
+    pub read_only: bool,
+}
+
+/// A guest-local persistent directory on the machine's own disk.
+///
+/// smolvm's `--volume` takes two shapes: `host:guest[:ro]`, which is a
+/// virtiofs export of a host directory ([`VolumeMount`]), and a *bare guest
+/// path*, which smolvm turns into a directory on the machine's own storage
+/// disk rather than on its overlay root. The bare form is what a nested
+/// container runtime needs — overlayfs cannot back docker's `overlay2`
+/// driver, so `/var/lib/docker` on the overlay root degrades to
+/// `fuse-overlayfs` — and the directory persists across `stop`/`start` and
+/// into a branch, because the storage disk is copied copy-on-write.
+///
+/// A bare-path volume costs no virtio device: smolvm mounts it in the guest
+/// from a subdirectory of `/dev/vda` (measured at 1.30.1 on x86_64 Linux;
+/// `findmnt` reports `ext4 /dev/vda[/volumes/var-lib-docker-<hash>]`, not a
+/// virtiofs export), so it is deliberately absent from [`DeclaredDevices`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct GuestVolume(PathBuf);
+
+impl GuestVolume {
+    /// Validate and construct a guest-local volume path.
+    ///
+    /// The value is passed as one `--volume` argument, and smolvm decides the
+    /// volume's shape from its text: a `:` separates `host:guest[:ro]`. A
+    /// colon here would therefore turn a supposedly guest-local directory
+    /// into a host export, bypassing [`VolumeMount`]'s source and read-only
+    /// validation, so it is rejected. Control bytes (including NUL) are
+    /// rejected too: they cannot be represented in a command argument and
+    /// only ever come from a malformed override. Ordinary punctuation,
+    /// spaces, and non-ASCII path bytes are valid and stay valid.
+    pub fn new(value: impl Into<PathBuf>) -> Result<Self, VmError> {
+        let value = value.into();
+        if !value.is_absolute() {
+            return Err(VmError::InvalidSpec(format!(
+                "guest volume path must be absolute: {}",
+                value.display()
+            )));
+        }
+        let bytes = value.as_os_str().as_encoded_bytes();
+        if bytes.contains(&b':') {
+            return Err(VmError::InvalidSpec(format!(
+                "guest volume path must not contain `:` (smolvm reads it as host:guest): {}",
+                value.display()
+            )));
+        }
+        if bytes.iter().any(u8::is_ascii_control) {
+            return Err(VmError::InvalidSpec(format!(
+                "guest volume path must not contain control characters: {}",
+                value.display()
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    /// The guest path.
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for GuestVolume {
+    type Error = VmError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<GuestVolume> for String {
+    fn from(value: GuestVolume) -> Self {
+        value.0.to_string_lossy().into_owned()
+    }
+}
+
+/// Guest-local state directories the official runner pack gets by default.
+///
+/// These are the two paths docker and containerd must own to run their
+/// overlay-backed drivers. The default is opt-in per [`MachineRole`]: only
+/// [`MachineRole::OfficialPack`] uses it. The published official golden is
+/// built for this managed layout, with those paths created on the machine's
+/// own storage disk. A custom pack can carry state in them and a
+/// [`MachineRole::Builder`]'s writes there are not part of the pack at all, so
+/// neither gets the default. A guest-local volume starts empty: this default
+/// must never be used where existing state has to stay visible, and it does
+/// not migrate anything.
+pub const DEFAULT_GUEST_VOLUMES: [&str; 2] = ["/var/lib/docker", "/var/lib/containerd"];
+
+/// Host override for [`DEFAULT_GUEST_VOLUMES`]: a comma-separated list of
+/// absolute guest paths, applied to runtime pack machines that do not declare
+/// their own [`MachineSpec::guest_volumes`]. An empty value turns guest-local
+/// volumes off. Builders ignore it: their container state must stay in the
+/// overlay that `pack create` captures.
+pub const SMOLVM_GUEST_VOLUMES_ENV: &str = "PRELOOP_SMOLVM_GUEST_VOLUMES";
+
+/// Host override for the workload a runtime pack machine is started with, on
+/// top of whatever entrypoint/cmd the pack itself carries. Ignored by the
+/// golden builder, whose pack's own entrypoint is what it exports.
+///
+/// Unset: the role default — the managed [`DEFAULT_SMOLVM_WORKLOAD_INIT`] for
+/// an [`MachineRole::OfficialPack`], or the pack's own entrypoint/cmd for a
+/// [`MachineRole::CustomPack`]. Empty: the pack's own entrypoint/cmd runs,
+/// which is also the escape hatch for a golden whose image has no usable init.
+/// Any other value is the command, split on whitespace.
+pub const SMOLVM_WORKLOAD_INIT_ENV: &str = "PRELOOP_SMOLVM_WORKLOAD_INIT";
+
+/// Workload that runs a runtime pack machine's systemd, giving the guest the
+/// hosted runner's init: `systemctl`, `journald`, `systemd-resolved` and
+/// docker's `systemd` cgroup driver all depend on PID 1 being systemd.
+///
+/// This is the default for [`MachineRole::OfficialPack`] only. A
+/// [`MachineRole::CustomPack`] keeps its own entrypoint unless the operator
+/// names a command with [`SMOLVM_WORKLOAD_INIT_ENV`].
+///
+/// Applied as the `-- <COMMAND>` block of `machine create`, which overrides
+/// the pack's recorded entrypoint at launch. Measured at smolvm 1.30.1 on
+/// x86_64 Linux: `machine create --from <pack> --name t1 -- /sbin/init`
+/// then `machine start` leaves `ps -o pid,args -p 1` at `1 systemd /sbin/init`,
+/// `systemctl is-system-running` at `running`, and a
+/// `machine branch --freeze-source` child inherits it.
+pub const DEFAULT_SMOLVM_WORKLOAD_INIT: &str = "/sbin/init";
+
+/// systemd-resolved's stub listener address, the resolver a systemd guest
+/// should be pointed at so container DNS sees `/etc/hosts` names and
+/// systemd-resolved's synthesized `.localhost` names.
+///
+/// This is the *guest-side* resolver file's content, not necessarily the
+/// `--dns` flag: under smolvm's virtio-net backend the agent overwrites
+/// `/etc/resolv.conf` with the network gateway whatever `--dns` says, so the
+/// golden bake has to install this file (see [`resolved_guest_dns`]).
+pub const SYSTEMD_RESOLVED_STUB_DNS: &str = "127.0.0.53";
+
+/// Host Unix socket exposed at a fixed guest path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocketMount {
+    /// Host socket path.
+    pub host: PathBuf,
+    /// Absolute guest socket path.
+    pub guest: PathBuf,
+}
+
+/// Explicit VM egress policy. Networking is disabled unless selected here.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NetworkPolicy {
+    /// No guest networking.
+    #[default]
+    Disabled,
+    /// Unrestricted outbound networking.
+    Unrestricted,
+    /// Full outbound networking with the egress hard-floor enabled: loopback,
+    /// RFC 1918, link-local / cloud metadata, CGNAT, and IPv6 private ranges
+    /// are denied. Enforced by the chosen backend with
+    /// `SMOLVM_EGRESS_FLOOR=strict` in the provider; see
+    /// [`public_only_net_backend`] for which backend that is per platform.
+    PublicOnly,
+    /// Restrict outbound traffic to these host names and CIDRs.
+    Restricted {
+        /// DNS host names allowed for egress.
+        hosts: Vec<String>,
+        /// IP address ranges allowed for egress.
+        cidrs: Vec<String>,
+    },
+}
+
+/// The smolvm network backend used for the egress-only policy.
+///
+/// virtio-net carries the host-side egress floor, which TSI cannot provide
+/// (TSI has no host network stack), so PublicOnly needs it. The official
+/// SmolVM release pinned by `preloop update` bundles a NET=1 libkrun that
+/// exports `krun_add_net_unixstream`. `PRELOOP_SMOLVM_NET_BACKEND=tsi|virtio-net`
+/// overrides the choice for setups that need a different backend.
+fn public_only_net_backend(lookup: impl Fn(&str) -> Option<String>) -> &'static str {
+    match lookup("PRELOOP_SMOLVM_NET_BACKEND").as_deref() {
+        Some("tsi") => "tsi",
+        _ => "virtio-net",
+    }
+}
+
+/// Where a guest environment value is resolved from, at launch time.
+///
+/// SmolVM never persists the value itself, only this reference, so a secret
+/// stays out of the machine record and out of any packed artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SecretSource {
+    /// Read from a host environment variable of this name.
+    HostEnv(String),
+    /// Read from this absolute host file.
+    HostFile(PathBuf),
+}
+
+/// What a machine is for, and where its root filesystem came from.
+///
+/// The provider used to infer "pack-based" from the image path alone and apply
+/// the runtime defaults to every such machine. That conflated three very
+/// different cases: the official runner layout (whose container-state
+/// directories are disposable), an arbitrary operator pack (whose preloaded
+/// images live in exactly those directories), and a one-shot builder (whose
+/// root filesystem is about to be packed, so state on the storage disk is not
+/// captured). The caller states the role explicitly instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachineRole {
+    /// Booted from an OCI image and not treated as a pack: no pack launch
+    /// defaults. This is what image machines and non-pack backends use.
+    #[default]
+    Image,
+    /// A one-shot machine whose root filesystem is packed into a golden.
+    ///
+    /// The builder's container state must stay in the overlay that `pack
+    /// create` captures: a guest-local volume lives on the storage disk, which
+    /// is not part of the pack, so mounting one would hide the source state
+    /// and drop it from the artifact. No default guest volumes or workload
+    /// override apply; an explicit [`MachineSpec::guest_volumes`] or
+    /// [`MachineSpec::workload_init`] is still honoured.
+    Builder,
+    /// A final runtime machine created from the official runner pack. The
+    /// published golden is built for Preloop's managed layout, so this is the
+    /// one role that opts into [`DEFAULT_GUEST_VOLUMES`] and
+    /// [`DEFAULT_SMOLVM_WORKLOAD_INIT`]. The guest-local directories start
+    /// empty; do not use this role for a pack whose state there must survive.
+    OfficialPack,
+    /// A final runtime machine created from an operator-supplied pack (or a
+    /// pack baked from a custom image). Its container state and init were
+    /// packed for a reason: no default guest-local volume may be mounted over
+    /// them, and the pack's own entrypoint/cmd runs unless the operator names
+    /// a workload. Opt in explicitly with [`MachineSpec::guest_volumes`],
+    /// [`MachineSpec::workload_init`], [`SMOLVM_GUEST_VOLUMES_ENV`], or
+    /// [`SMOLVM_WORKLOAD_INIT_ENV`].
+    CustomPack,
+}
+
+/// Persistent VM configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineSpec {
+    /// Machine identifier.
+    pub name: MachineName,
+    /// Immutable OCI image or `.smolmachine` artifact.
+    pub image: String,
+    /// Virtual CPU count.
+    pub cpus: u16,
+    /// Guest memory in MiB.
+    pub memory_mib: u32,
+    /// Persistent storage in GiB.
+    pub storage_gib: u32,
+    /// Root overlay size in GiB. `None` keeps the provider default.
+    pub overlay_gib: Option<u32>,
+    /// Guest network policy.
+    pub network: NetworkPolicy,
+    /// Narrowly scoped host mounts.
+    pub volumes: Vec<VolumeMount>,
+    /// Narrowly scoped host Unix sockets.
+    pub sockets: Vec<SocketMount>,
+    /// Guest DNS resolver, passed through as smolvm's `--dns`.
+    ///
+    /// smolvm's registry client resolves through the guest, and defaults to
+    /// the public resolvers (8.8.8.8/1.1.1.1) — unreachable on networks that
+    /// filter them (many LANs). Override from the host when the guest must
+    /// pull images on such networks.
+    #[serde(default)]
+    pub dns: Option<String>,
+    /// Enable Rosetta 2 x86_64 translation on Apple Silicon.
+    #[serde(default)]
+    pub rosetta: bool,
+    /// What this machine is for: image, pack builder, or a runtime pack from
+    /// the official or a custom source. See [`MachineRole`].
+    #[serde(default)]
+    pub role: MachineRole,
+    /// Guest-local persistent directories on the machine's own disk.
+    ///
+    /// Passed through as smolvm's bare-path `--volume` form, alongside (never
+    /// instead of) [`MachineSpec::volumes`]. `None` leaves the choice to the
+    /// role's provider default ([`DEFAULT_GUEST_VOLUMES`] only for
+    /// [`MachineRole::OfficialPack`]); `Some([])` explicitly disables guest
+    /// volumes, and `Some(list)` asks for exactly that list.
+    #[serde(default)]
+    pub guest_volumes: Option<Vec<GuestVolume>>,
+    /// Workload a *runtime pack* machine runs, overriding the pack's own
+    /// entrypoint/cmd.
+    ///
+    /// `None` means "whatever the provider's default is": for smolvm, the
+    /// [`SMOLVM_WORKLOAD_INIT_ENV`] switch and then the role default — the
+    /// managed [`DEFAULT_SMOLVM_WORKLOAD_INIT`] for an official pack, the
+    /// pack's own entrypoint for a custom pack. `Some([])` explicitly leaves
+    /// the pack's own entrypoint/cmd in place. Ignored for image machines,
+    /// whose workload handling (the keep-alive fallback for an image with no
+    /// usable startup command) is unchanged.
+    #[serde(default)]
+    pub workload_init: Option<Vec<String>>,
+}
+
+impl MachineSpec {
+    /// The devices this spec adds to SmolVM's fixed launcher set.
+    ///
+    /// Counted from the spec because `machine start` carries no device flags:
+    /// see [`DeclaredDevices`]. Guest-local volumes cost no device, so they
+    /// are not part of the count.
+    pub fn declared_devices(&self) -> DeclaredDevices {
+        DeclaredDevices {
+            volumes: self.volumes.len(),
+            sockets: self.sockets.len(),
+        }
+    }
+
+    /// The guest-local volumes this machine's create command carries.
+    ///
+    /// `explicit` is [`MachineSpec::guest_volumes`]: `Some([])` disables guest
+    /// volumes and `Some(list)` names them exactly. When it is `None`, the
+    /// role decides:
+    ///
+    /// * [`MachineRole::OfficialPack`] takes `configured` (the
+    ///   [`SMOLVM_GUEST_VOLUMES_ENV`] value, where an empty value disables)
+    ///   or [`DEFAULT_GUEST_VOLUMES`];
+    /// * [`MachineRole::CustomPack`] takes the same configured override, but
+    ///   defaults to none so an operator's packed container state stays
+    ///   visible;
+    /// * [`MachineRole::Builder`] and [`MachineRole::Image`] get none, and
+    ///   ignore the host override: a builder's storage-disk writes are not
+    ///   captured by `pack create`.
+    pub fn resolve_guest_volumes(
+        explicit: Option<&[GuestVolume]>,
+        configured: Option<&str>,
+        role: MachineRole,
+    ) -> Result<Vec<GuestVolume>, VmError> {
+        if let Some(explicit) = explicit {
+            return Ok(explicit.to_vec());
+        }
+        let runtime_pack = matches!(role, MachineRole::OfficialPack | MachineRole::CustomPack);
+        if !runtime_pack {
+            return Ok(Vec::new());
+        }
+        if let Some(configured) = configured {
+            // An override, including an empty one (which turns the guest-local
+            // volumes off): parsed as the same comma-separated guest paths.
+            let list = configured.trim();
+            return if list.is_empty() {
+                Ok(Vec::new())
+            } else {
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(GuestVolume::new)
+                    .collect()
+            };
+        }
+        if role == MachineRole::OfficialPack {
+            return DEFAULT_GUEST_VOLUMES
+                .iter()
+                .copied()
+                .map(GuestVolume::new)
+                .collect();
+        }
+        Ok(Vec::new())
+    }
+
+    /// The workload command a pack-based machine is created with.
+    ///
+    /// `explicit` is [`MachineSpec::workload_init`]: `Some([])` explicitly
+    /// leaves the pack's own entrypoint/cmd in place, and a non-empty command
+    /// wins. With `None`, the role decides:
+    ///
+    /// * [`MachineRole::OfficialPack`] uses `configured` (the
+    ///   [`SMOLVM_WORKLOAD_INIT_ENV`] value, where an empty value disables) or
+    ///   the managed [`DEFAULT_SMOLVM_WORKLOAD_INIT`];
+    /// * [`MachineRole::CustomPack`] keeps the pack's own entrypoint/cmd
+    ///   unless `configured` names a command: a custom pack's init is part of
+    ///   the source the operator chose, not something Preloop replaces;
+    /// * [`MachineRole::Builder`] and [`MachineRole::Image`] only get what was
+    ///   asked for explicitly (the builder is never given an ambient default).
+    pub fn resolve_workload_init(
+        explicit: Option<&[String]>,
+        configured: Option<&str>,
+        role: MachineRole,
+    ) -> Option<Vec<String>> {
+        let parse = |value: &str| {
+            let command: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
+            (!command.is_empty()).then_some(command)
+        };
+        // An image machine's workload handling is the separate keep-alive
+        // path; this override never applies to it.
+        if role == MachineRole::Image {
+            return None;
+        }
+        if let Some(command) = explicit {
+            return (!command.is_empty()).then(|| command.to_vec());
+        }
+        match role {
+            MachineRole::Image => None,
+            MachineRole::Builder => None,
+            MachineRole::OfficialPack => parse(configured.unwrap_or(DEFAULT_SMOLVM_WORKLOAD_INIT)),
+            MachineRole::CustomPack => configured.and_then(parse),
+        }
+    }
+}
+
+/// Whether a pack machine's resolved workload starts systemd as PID 1.
+///
+/// The implicit resolver stub is only useful when the guest actually runs
+/// systemd: `systemd-resolved` is started by the systemd instance that owns
+/// PID 1. The check is the program's file name — the managed default is
+/// `/sbin/init`, and an operator naming the binary explicitly uses `systemd`
+/// (for example `/lib/systemd/systemd --system`). Any other command, such as
+/// `["/bin/sh", "-c", "sleep infinity"]` or one that starts systemd
+/// indirectly, keeps the resolver smolvm would otherwise configure: the stub
+/// is only emitted when systemd is certain to answer on it.
+fn workload_init_is_systemd(workload: Option<&[String]>) -> bool {
+    workload
+        .and_then(|command| command.first())
+        .and_then(|program| Path::new(program).file_name())
+        .and_then(|program| program.to_str())
+        .is_some_and(|program| matches!(program, "init" | "systemd"))
+}
+
+/// The `--dns` resolver a machine is launched with.
+///
+/// An explicit [`MachineSpec::dns`] always wins, and a machine with no
+/// networking never gains a resolver (`--dns` implies `--net` in smolvm).
+/// Otherwise, once a machine runs systemd as PID 1 its resolver should be
+/// systemd-resolved's stub, because that is what gives containers the hosted
+/// runner's view: `systemd-resolved` answers `/etc/hosts` names and
+/// synthesizes `.localhost`, so a user-defined network's embedded resolver
+/// (127.0.0.11 forwarding to the host's `/etc/resolv.conf` nameserver) reaches
+/// them. `systemd_workload` is that condition, resolved by
+/// [`workload_init_is_systemd`]: a custom workload that does not start systemd
+/// gets no stub, because nothing would listen on it.
+///
+/// This flag only reaches the guest on smolvm's TSI backend. With virtio-net
+/// the host overwrites the guest resolver with the network gateway whatever
+/// `--dns` says — measured at smolvm 1.30.1 on x86_64 Linux:
+/// `machine create --net --net-backend virtio-net --dns 127.0.0.53` boots with
+/// `SMOLVM_NETWORK_DNS=100.96.0.1` and `/etc/resolv.conf` `nameserver
+/// 100.96.0.1`. For virtio-net the stub is therefore installed from inside the
+/// guest (preloop's per-machine init rewrite, or the golden bake) and this
+/// function returns `None`.
+pub fn resolved_guest_dns(
+    spec_dns: Option<&str>,
+    network_enabled: bool,
+    backend: &str,
+    systemd_workload: bool,
+) -> Option<String> {
+    if let Some(dns) = spec_dns.map(str::trim).filter(|dns| !dns.is_empty()) {
+        return Some(dns.to_owned());
+    }
+    let want_stub = network_enabled && systemd_workload && backend == "tsi";
+    want_stub.then(|| SYSTEMD_RESOLVED_STUB_DNS.to_owned())
+}
+
+/// Observable VM state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MachineState {
+    /// Machine exists and is running.
+    Running,
+    /// Machine exists and is stopped.
+    Stopped,
+    /// No machine with this name exists.
+    Missing,
+    /// SmolVM returned an unrecognized state.
+    Unknown,
+}
+
+/// Captured process result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecOutput {
+    /// Guest command exit status.
+    pub exit_code: i32,
+    /// Bounded standard output.
+    pub stdout: Vec<u8>,
+    /// Bounded standard error.
+    pub stderr: Vec<u8>,
+    /// Whether either captured stream exceeded the configured bound.
+    pub truncated: bool,
+}
+
+/// One streaming guest output fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputChunk {
+    /// Standard output bytes.
+    Stdout(Vec<u8>),
+    /// Standard error bytes.
+    Stderr(Vec<u8>),
+}
+
+/// VM lifecycle failure.
+#[derive(Debug, Error)]
+pub enum VmError {
+    /// Invalid machine name.
+    #[error("invalid machine name `{0}`")]
+    InvalidMachineName(String),
+    /// Invalid VM configuration.
+    #[error("invalid VM configuration: {0}")]
+    InvalidSpec(String),
+    /// Failed to launch SmolVM.
+    #[error("failed to launch `{program}`: {source}")]
+    Launch {
+        /// Program path.
+        program: String,
+        /// Operating-system error.
+        source: std::io::Error,
+    },
+    /// Failed to prepare the SmolVM runtime directories.
+    #[error("failed to prepare SmolVM runtime directories: {source}")]
+    RuntimeIo {
+        /// Operating-system error.
+        source: std::io::Error,
+    },
+    /// SmolVM rejected an operation.
+    #[error("smolvm {operation} failed with exit code {exit_code}: {message}")]
+    Command {
+        /// Logical operation.
+        operation: &'static str,
+        /// Process exit code.
+        exit_code: i32,
+        /// Bounded diagnostic.
+        message: String,
+    },
+    /// A plain-fork golden already has a live copy-on-write clone.
+    ///
+    /// SmolVM 1.7.4's `machine fork` does not retain a checkpoint for reuse.
+    /// Invoking it again against the paused base can invalidate storage still
+    /// used by the first clone, so callers must use an independent image.
+    #[error("fork base `{golden}` already has live clone `{clone}`")]
+    ForkBaseBusy {
+        /// Forkable base that cannot safely serve another clone yet.
+        golden: String,
+        /// Existing clone whose storage still depends on the base.
+        clone: String,
+    },
+    /// Invalid SmolVM JSON output.
+    #[error("invalid smolvm response: {0}")]
+    Protocol(String),
+    /// A provider call did not answer within its deadline and was killed.
+    ///
+    /// Distinct from [`Self::Command`], which carries a real exit status: this
+    /// means nothing came back at all. The message names the dependency and the
+    /// deadline, so an operator can tell a hang (no answer) from a failure (a
+    /// wrong answer) and knows the runtime — or the daemon behind it — is what
+    /// needs looking at.
+    #[error(
+        "`{program}` did not finish {operation} within {deadline:?} and was killed; \
+         the VM runtime stopped answering — check that it runs (`{program} --version`) \
+         and that its daemon is healthy before retrying"
+    )]
+    TimedOut {
+        /// Logical operation that ran out of time (`exec`, `create`, ...).
+        operation: &'static str,
+        /// Program that was killed.
+        program: String,
+        /// Deadline that expired.
+        deadline: Duration,
+    },
+    /// The host ran out of MMIO IRQ lines for the machine's virtio devices.
+    ///
+    /// libkrun allocates one IRQ line per virtio device and fails the whole
+    /// boot once they are gone, reporting only `build microVM: ... no more
+    /// IRQs are available`. On the host that reads exactly like the other
+    /// `EINVAL` start failures (a disk image another hypervisor still holds, a
+    /// corrupt or foreign-owned image), so the pool restarts forever without
+    /// naming the real cause or a remedy. This variant is produced only when
+    /// the stderr carries that signature ([`is_irq_exhaustion`]) and carries
+    /// the counted device inventory, the `smolvm --version` reading, and the
+    /// ceilings with the raw output in [`Self::message`].
+    #[error("{message}")]
+    IrqExhausted {
+        /// Machine that failed to start.
+        machine: String,
+        /// Logical operation that failed (`start`, `start_forkable`).
+        operation: &'static str,
+        /// Devices the machine's spec declared, when this process created it.
+        declared: Option<DeclaredDevices>,
+        /// What the resolved `smolvm` reported for `--version`, when readable.
+        smolvm_version: Option<String>,
+        /// Operator-facing explanation, raw SmolVM stderr appended.
+        message: String,
+    },
+    /// The guest agent stopped answering while a command was streaming.
+    ///
+    /// A wedged guest never closes its exec stream, so without this the
+    /// caller would wait on it forever.
+    #[error("guest `{machine}` stopped answering after {probes} consecutive liveness probes")]
+    GuestUnresponsive {
+        /// Machine whose agent stopped answering.
+        machine: String,
+        /// Consecutive probes that failed or timed out.
+        probes: u32,
+    },
+    /// The resolved SmolVM predates generic socket forwarding.
+    ///
+    /// `--mount-socket` (added upstream in the 2026-07 socket-forwarding
+    /// work) generalizes the old docker-only bridge into a host→guest
+    /// mount, which is what preloop needs to hand the control socket to
+    /// the guest. Older binaries only accept `--docker-socket` (guest→host,
+    /// docker specific), which cannot carry that mount. `smolvm --version`
+    /// reports the wrapper's version, not the binary's, so the capability
+    /// probe (help text) is the reliable check.
+    #[error(
+        "the resolved smolvm (`{binary}`) does not support `machine create --mount-socket`, \
+         which preloop needs to mount the control socket into the guest; check which smolvm \
+         the engine resolves (PATH) and update it from \
+         https://github.com/smol-machines/smolvm/releases"
+    )]
+    UnsupportedSocketMount {
+        /// Program path.
+        binary: String,
+    },
+    /// An operator-set SmolVM sandbox override has a value upstream would
+    /// silently treat as "control off". Preloop fails closed instead of
+    /// forwarding an unrecognized mode that would boot VMs unconfined.
+    #[error(
+        "invalid {variable} value `{value}` for the VM sandbox (expected {expected}); \
+         refusing to run VMs with an unvalidated override — remove the variable or set a \
+         supported mode"
+    )]
+    InvalidSandboxEnv {
+        /// The environment variable carrying the override.
+        variable: &'static str,
+        /// The offending value.
+        value: String,
+        /// Modes upstream accepts.
+        expected: &'static str,
+    },
+    /// The guest agent Preloop would export to smolvm cannot serve the
+    /// resolved binary (see [`agent_rootfs`]).
+    ///
+    /// Booting from it means every machine is unstoppable: smolvm refuses
+    /// `machine stop` with "running guest agent does not support safe
+    /// shutdown; VM left unchanged" and the runner pool retries forever, so
+    /// failing the boot with the diagnosis up front is the only useful
+    /// outcome.
+    #[error("{report}")]
+    GuestAgentMismatch {
+        /// One-read diagnosis: both rootfs paths, both agent hashes, the
+        /// host version, and the remedy.
+        report: String,
+    },
+}
+
+/// What a backend can express, so the orchestrator can pick a strategy
+/// instead of assuming SmolVM's.
+///
+/// Every field defaults to what SmolVM does, so an existing provider needs no
+/// change and a new backend only declares what it *cannot* do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    /// Host directories can be mounted into a guest and stay live.
+    ///
+    /// `false` means a read-only [`MachineSpec::volumes`] entry is delivered as an
+    /// immutable snapshot of the directory, with no live view, and a writable entry
+    /// is refused. That suits read-mostly mounts like the runner bundle, and is
+    /// wrong for anything the host mutates while the guest runs.
+    pub live_host_volumes: bool,
+    /// Host Unix sockets can be forwarded into a guest.
+    ///
+    /// `false` forces the guest control plane onto TCP.
+    pub socket_mounts: bool,
+    /// [`VmProvider::pack`] produces a host file usable as a base image.
+    ///
+    /// `false` means packs live inside the backend (snapshot backends), so
+    /// the pool must not try to build, download, or relocate artifact files.
+    pub file_packs: bool,
+    /// A clone inherits filesystem writes the golden made *after* it booted.
+    ///
+    /// SmolVM's forkable snapshot does not: the pool reinstalls the baseline
+    /// into each fork. A snapshot-based backend captures the golden's live
+    /// filesystem instead.
+    pub fork_inherits_guest_writes: bool,
+    /// A suspended guest retains its live runner, processes, and filesystem
+    /// state when resumed. Backends without this must not auto-suspend a live
+    /// debug session.
+    pub preserves_runtime_state_on_suspend: bool,
+    /// A fork base may mount read-only volumes, and its clones inherit them.
+    ///
+    /// `false` means a sandbox that mounts a read-only volume cannot be
+    /// snapshotted (AgentENV refuses it), so the fork base must boot without one
+    /// and each clone mounts its volumes at start through
+    /// [`VmProvider::fork_with_volumes`]. That also keeps a changed read-only
+    /// volume from forcing the fork base to be rebuilt.
+    pub fork_bases_may_mount_read_only_volumes: bool,
+    /// The runner bundle already carries the Node externals tree, so callers
+    /// should mount only the bundle and link the runner root's externals path
+    /// into it. This avoids a second AgentENV volume mount at `/home/runner`.
+    pub runner_bundle_carries_externals: bool,
+}
+
+impl Default for ProviderCapabilities {
+    fn default() -> Self {
+        Self {
+            live_host_volumes: true,
+            socket_mounts: true,
+            file_packs: true,
+            fork_inherits_guest_writes: false,
+            preserves_runtime_state_on_suspend: false,
+            fork_bases_may_mount_read_only_volumes: true,
+            runner_bundle_carries_externals: false,
+        }
+    }
+}
+
+/// Provider contract consumed by the Preloop orchestrator.
+#[async_trait]
+pub trait VmProvider: Send + Sync {
+    /// What this backend can express. Defaults to SmolVM's behaviour.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
+    /// Start the background maintenance this backend owns, if any.
+    ///
+    /// Called once when an engine starts, before any runner needs a machine: a
+    /// backend whose maintenance is otherwise armed lazily by the work it does
+    /// (AgentENV arms its idle-volume collection on the first volume it needs)
+    /// would on an idle engine — one that only resumes machines it already has —
+    /// never run it at all. Must be cheap and must not block; a provider without
+    /// background work keeps the default no-op.
+    fn start_maintenance(&self) {}
+    /// Create a persistent machine.
+    async fn create(&self, spec: &MachineSpec) -> Result<(), VmError>;
+    /// Start an existing machine.
+    async fn start(&self, name: &MachineName) -> Result<(), VmError>;
+    /// Start an existing machine as a forkable base (CoW memory + disks).
+    async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError>;
+    /// Fork a running forkable machine into a new clone with CoW memory and disks.
+    async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError>;
+    /// Fork a clone, attaching `volumes` when the backend cannot carry
+    /// read-only volumes through its fork-base snapshot. Backends whose
+    /// snapshots already carry the mounts use the default implementation.
+    async fn fork_with_volumes(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        _volumes: &[VolumeMount],
+    ) -> Result<(), VmError> {
+        self.fork(golden, clone).await
+    }
+    /// Remove `pack/` build intermediates from a machine's data directory once
+    /// its finished disk exists (issue #295).
+    ///
+    /// smolvm's pack export leaves ~29 GB of intermediates (`storage.ext4`,
+    /// `layers/*.tar`) beside the finished `storage.raw`, and a fork copies
+    /// the golden's whole data directory — so every runner inherits a copy.
+    /// Providers without pack intermediates keep the default no-op.
+    async fn prune_pack_intermediates(&self, name: &MachineName) -> Result<bool, VmError> {
+        let _ = name;
+        Ok(false)
+    }
+    /// Remove `pack/` intermediates left by a `create` that failed before the
+    /// machine registered.
+    ///
+    /// A `machine create --from` that dies mid-extraction (the ENOSPC path a
+    /// full host produces) leaves its data dir — and the multi-GB `pack/`
+    /// inside it — owned by no registry row. `machine data-dir` cannot resolve
+    /// it, `delete` is a no-op on it, and the orphan sweep waits out a grace
+    /// window before claiming it, so retries stack the residue. Unlike
+    /// [`VmProvider::prune_pack_intermediates`], this path must not require a
+    /// finished `storage.raw`: the disk is exactly what a failed unpack never
+    /// wrote. Returns how many pack trees were removed. Providers without
+    /// host-visible data dirs keep the default no-op.
+    async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+        Ok(0)
+    }
+    /// Remove machine data directories the provider's registry no longer
+    /// knows about.
+    ///
+    /// smolvm's delete can drop the registry row while the data dir survives
+    /// (the "directory not empty" / "database is locked" races `delete`
+    /// retries bound but cannot eliminate), and a crashed engine leaves dirs
+    /// no `list()` can reach. Such orphans are invisible to every other
+    /// cleanup path and leak whole VM disks. Providers without
+    /// host-visible data dirs keep the default no-op.
+    async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
+        Ok(0)
+    }
+    /// Stop an existing machine.
+    async fn stop(&self, name: &MachineName) -> Result<(), VmError>;
+    /// Delete a machine and its mutable overlay.
+    async fn delete(&self, name: &MachineName) -> Result<(), VmError>;
+    /// Read current machine state.
+    async fn status(&self, name: &MachineName) -> Result<MachineState, VmError>;
+    /// List persistent machines.
+    async fn list(&self) -> Result<Vec<MachineName>, VmError>;
+    /// Execute a guest command and return bounded output.
+    async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError>;
+    /// Execute with guest environment values resolved from the host at launch.
+    async fn exec_with_secret_env(
+        &self,
+        name: &MachineName,
+        argv: &[String],
+        secrets: &[(String, SecretSource)],
+    ) -> Result<ExecOutput, VmError>;
+    /// Re-arm a spent fork base so it can serve forks again.
+    ///
+    /// Atomic with forking: takes the same per-golden exclusion `fork` uses,
+    /// so a concurrent fork can neither observe the golden mid-re-arm nor
+    /// create a clone between the live-clone check and the golden being
+    /// stopped. Removes a partial clone left by the failed fork (when
+    /// `partial` is given) — only if that cleanup succeeds, because an
+    /// untracked clone would otherwise share the resumed base's disks — then
+    /// verifies no live clone still depends on the golden, and only then
+    /// stops and restarts it forkable.
+    ///
+    /// Returns `Ok(true)` when the golden can serve forks again, `Ok(false)`
+    /// when it cannot (a live clone exists, or the partial clone could not be
+    /// removed), and `Err` on operational failure. The default implementation
+    /// never re-arms, so providers without the machinery conservatively fall
+    /// back to direct creation.
+    async fn rearm_fork_base(
+        &self,
+        _golden: &MachineName,
+        _partial: Option<&MachineName>,
+    ) -> Result<bool, VmError> {
+        Ok(false)
+    }
+    /// Execute while forwarding output fragments to the caller.
+    async fn exec_stream(
+        &self,
+        name: &MachineName,
+        argv: &[String],
+        output: mpsc::Sender<OutputChunk>,
+    ) -> Result<i32, VmError>;
+    /// Copy a file or directory using SmolVM's host/guest path syntax.
+    async fn copy(&self, source: &str, destination: &str) -> Result<(), VmError>;
+    /// Pack a configured machine into a reusable immutable artifact.
+    async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError>;
+}
+
+/// Delegate through a box so a backend can be chosen at runtime.
+///
+/// The pool is generic over its provider for zero-cost static dispatch, but
+/// the CLI picks the driver at runtime, so one
+/// `Box<dyn VmProvider>` keeps that choice out of the pool's type parameter
+/// without an enum that has to be extended for every future backend. The
+/// virtual call is irrelevant next to booting a VM.
+#[async_trait]
+impl<T: VmProvider + ?Sized> VmProvider for Box<T> {
+    fn capabilities(&self) -> ProviderCapabilities {
+        (**self).capabilities()
+    }
+    fn start_maintenance(&self) {
+        (**self).start_maintenance()
+    }
+    async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
+        (**self).create(spec).await
+    }
+    async fn start(&self, name: &MachineName) -> Result<(), VmError> {
+        (**self).start(name).await
+    }
+    async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
+        (**self).start_forkable(name).await
+    }
+    async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
+        (**self).fork(golden, clone).await
+    }
+    async fn fork_with_volumes(
+        &self,
+        golden: &MachineName,
+        clone: &MachineName,
+        volumes: &[VolumeMount],
+    ) -> Result<(), VmError> {
+        (**self).fork_with_volumes(golden, clone, volumes).await
+    }
+    async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
+        (**self).stop(name).await
+    }
+    async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
+        (**self).delete(name).await
+    }
+    async fn status(&self, name: &MachineName) -> Result<MachineState, VmError> {
+        (**self).status(name).await
+    }
+    async fn list(&self) -> Result<Vec<MachineName>, VmError> {
+        (**self).list().await
+    }
+    async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
+        (**self).sweep_orphaned_data_dirs().await
+    }
+    async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+        (**self).prune_failed_unpack_residue().await
+    }
+    async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
+        (**self).exec(name, argv).await
+    }
+    async fn exec_with_secret_env(
+        &self,
+        name: &MachineName,
+        argv: &[String],
+        secrets: &[(String, SecretSource)],
+    ) -> Result<ExecOutput, VmError> {
+        (**self).exec_with_secret_env(name, argv, secrets).await
+    }
+    async fn rearm_fork_base(
+        &self,
+        golden: &MachineName,
+        partial: Option<&MachineName>,
+    ) -> Result<bool, VmError> {
+        (**self).rearm_fork_base(golden, partial).await
+    }
+    async fn exec_stream(
+        &self,
+        name: &MachineName,
+        argv: &[String],
+        output: mpsc::Sender<OutputChunk>,
+    ) -> Result<i32, VmError> {
+        (**self).exec_stream(name, argv, output).await
+    }
+    async fn copy(&self, source: &str, destination: &str) -> Result<(), VmError> {
+        (**self).copy(source, destination).await
+    }
+    async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
+        (**self).pack(name, output).await
+    }
+}
+
+/// CLI-backed SmolVM provider.
+///
+/// SmolVM's `machine exec` (non-streaming) drops the connection after a
+/// short client-side read timeout unless an explicit `--timeout` extends
+/// it, and it buffers all output until the command exits. Provisioning
+/// steps (toolchain installs, `configure`) routinely run
+/// minutes with little output, so a generous timeout is mandatory there;
+/// streaming execs (the runner itself) are unaffected.
+const EXEC_TIMEOUT: &str = "30m";
+
+/// Deadline for a provider call that only reads local state: `smolvm
+/// --version`, `machine create --help`, `machine status`, `machine ls`,
+/// `machine data-dir`.
+///
+/// A healthy runtime answers all of these in milliseconds — they read a local
+/// registry or print help text — so this is headroom for a loaded host, not a
+/// budget to spend. Nothing legitimate runs for 30 s here, and everything
+/// queued behind the call (the provider's lifecycle lock included) needs the
+/// hang turned into an error instead of an indefinite wait.
+const PROBE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Deadline for a provider call that changes local state without building,
+/// booting, or transferring a machine: `machine stop`/`delete`/`update`,
+/// `machine pause`/`resume`, guest directory preparation, secret upload.
+///
+/// The slowest of these removes a machine's data directory — tens of GiB of
+/// unlinked files, seconds on a healthy host — and the delete path retries it.
+/// Five minutes keeps that work safe while a wedged runtime still releases the
+/// caller, and any lock it holds, in five minutes instead of hours.
+const CONTROL_DEADLINE: Duration = Duration::from_secs(5 * 60);
+
+/// Deadline for a call that builds, boots, clones, or transfers a machine:
+/// `machine create`, `machine start`, `machine fork`, `machine cp`.
+///
+/// Every one of these is legitimately slow: a macOS cold boot alone takes
+/// minutes while the guest unpacks its layers, a fork copies a multi-GiB
+/// copy-on-write disk, and a transfer moves a whole image in one call. Thirty
+/// minutes is deliberately far above any duration observed in production: it is
+/// the point at which "slow" has become "wedged", not a scheduling budget.
+const BOOT_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// Deadline for exporting a whole machine: `smolvm pack create`.
+///
+/// `pack create` re-pulls the base image inside its own export VM and flushes
+/// tens of GiB of layers through a staging directory, so it is the longest
+/// legitimate operation in the provider. The orchestrator already allows a
+/// golden download an hour (`GOLDEN_DOWNLOAD_TIMEOUT`); the export gets the
+/// same, and no more.
+const PACK_DEADLINE: Duration = Duration::from_secs(60 * 60);
+
+/// Deadline for one guest command run through `smolvm machine exec`: a ten
+/// minute margin over [`EXEC_TIMEOUT`] (30 minutes).
+///
+/// SmolVM enforces its own `--timeout` client-side, but the wait must be
+/// bounded independently: a runtime that ignores its own timeout, or a
+/// `_boot-vm` that never returns from the exec, would otherwise pin the caller
+/// (and, for provisioning steps, the caller's whole slot) forever. Streaming
+/// execs ([`VmProvider::exec_stream`], the runner itself) are deliberately not
+/// covered — their duration is the job's.
+const EXEC_DEADLINE: Duration = Duration::from_secs(40 * 60);
+
+/// Bytes retained from each host tool's streams by [`run_host_tool`].
+///
+/// `ps ax` on a large CI host and a mount table are well under this; the shared
+/// runner keeps draining past the cap, so a runaway tool is truncated rather
+/// than buffered without limit and cannot block on a full pipe. The cap bounds
+/// memory only: `run_host_tool` reports whether it bit, and the tools whose
+/// output is read as a complete table refuse a truncated capture rather than
+/// sweeping from half an inventory (see [`complete_inventory`]).
+const HOST_TOOL_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Child-wait deadlines for the external VM runtime, one per class of work.
+///
+/// Each provider kills the child at its deadline (see [`deadline`]) and returns
+/// [`VmError::TimedOut`], which names the dependency and the deadline so an
+/// operator can tell a hang from a failure. Production uses [`Default`]; tests
+/// shrink every tier with [`SmolVmProvider::with_deadlines`].
+#[derive(Debug, Clone, Copy)]
+pub struct WaitDeadlines {
+    /// [`PROBE_DEADLINE`]: reads that answer from local state.
+    pub probe: Duration,
+    /// [`CONTROL_DEADLINE`]: local state changes that boot nothing.
+    pub control: Duration,
+    /// [`BOOT_DEADLINE`]: build, boot, clone, or transfer a machine.
+    pub boot: Duration,
+    /// [`PACK_DEADLINE`]: export a whole machine.
+    pub pack: Duration,
+    /// [`EXEC_DEADLINE`]: one guest command.
+    pub exec: Duration,
+}
+
+impl Default for WaitDeadlines {
+    fn default() -> Self {
+        Self {
+            probe: PROBE_DEADLINE,
+            control: CONTROL_DEADLINE,
+            boot: BOOT_DEADLINE,
+            pack: PACK_DEADLINE,
+            exec: EXEC_DEADLINE,
+        }
+    }
+}
+
+/// `smolvm` CLI driver of the typed lifecycle primitives.
+#[derive(Debug, Clone)]
+pub struct SmolVmProvider {
+    binary: PathBuf,
+    capture_limit: usize,
+    /// Proxy forwarded to smolvm's separate export VM during `pack create`.
+    pack_proxy: Option<String>,
+    /// Hosts and CIDRs that the pack export VM should bypass the proxy for.
+    pack_no_proxy: Option<String>,
+    /// Serializes operations that build or replace a machine's base against
+    /// everything else. See [`SmolVmProvider::exclusive`].
+    lifecycle_lock: Arc<tokio::sync::RwLock<()>>,
+    /// One in-flight `machine fork` per golden. See [`SmolVmProvider::fork`].
+    fork_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Machines forked from a golden, by clone name, while they still exist.
+    ///
+    /// A golden is a copy-on-write base: once paused it must outlive every
+    /// clone, and starting it again would corrupt them. This census is how the
+    /// orchestrator knows a spent fork base may be safely re-armed.
+    forked_machines: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
+    /// Whether the resolved binary's `machine create` accepts
+    /// `--mount-socket`, probed once per provider.
+    socket_mount_supported: Arc<tokio::sync::OnceCell<bool>>,
+    /// Devices each machine's `create` declared, so a start that runs out of
+    /// MMIO IRQ lines can name the inventory it was asked to boot.
+    ///
+    /// `machine start` carries no device flags, and SmolVM reports only the
+    /// count it is about to use — never what the caller asked for — so the
+    /// spec passed to [`VmProvider::create`] is the only source for the
+    /// breakdown. Per provider instance: a machine an earlier engine
+    /// generation created (an adopted golden) has no entry, and the
+    /// diagnostic says so instead of guessing.
+    declared_devices: Arc<tokio::sync::Mutex<HashMap<String, DeclaredDevices>>>,
+    /// What the resolved binary reports for `--version`, probed at most once
+    /// and only on a diagnostic path.
+    reported_version: Arc<tokio::sync::OnceCell<Option<String>>>,
+    /// Where this provider reads host environment overrides from (the sandbox
+    /// modes and the network backend). Production is always the process
+    /// environment; unit tests substitute a pure lookup so the policy can be
+    /// exercised without mutating global state.
+    env_lookup: EnvLookup,
+    /// Child-wait deadlines. Production is [`WaitDeadlines::default`]; tests
+    /// shrink them through [`SmolVmProvider::with_deadlines`] so a fake runtime
+    /// that never exits is proved to be killed in milliseconds.
+    deadlines: WaitDeadlines,
+}
+
+impl Default for SmolVmProvider {
+    fn default() -> Self {
+        Self::from_environment("smolvm")
+    }
+}
+
+impl SmolVmProvider {
+    /// Construct a provider and resolve pack-export proxy settings.
+    ///
+    /// Preloop-specific variables take precedence over the conventional proxy
+    /// variables inherited by the process.
+    pub fn from_environment(binary: impl Into<PathBuf>) -> Self {
+        Self::new(binary).with_pack_network(
+            first_nonempty_env(&[
+                "PRELOOP_RUNNER_PACK_PROXY",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ]),
+            first_nonempty_env(&["PRELOOP_RUNNER_PACK_NO_PROXY", "NO_PROXY", "no_proxy"]),
+        )
+    }
+}
+
+fn first_nonempty_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+impl SmolVmProvider {
+    /// Construct a provider using an explicit SmolVM executable.
+    pub fn new(binary: impl Into<PathBuf>) -> Self {
+        Self {
+            binary: binary.into(),
+            capture_limit: DEFAULT_CAPTURE_LIMIT,
+            pack_proxy: None,
+            pack_no_proxy: None,
+            lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
+            fork_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            forked_machines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            socket_mount_supported: Arc::new(tokio::sync::OnceCell::new()),
+            declared_devices: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            reported_version: Arc::new(tokio::sync::OnceCell::new()),
+            env_lookup: process_env,
+            deadlines: WaitDeadlines::default(),
+        }
+    }
+
+    /// True when both handles guard the same lifecycle: an adapter and the
+    /// driver it points at must share one lock and fork census, never hold
+    /// separate ones.
+    pub fn shares_lifecycle_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lifecycle_lock, &other.lifecycle_lock)
+            && Arc::ptr_eq(&self.forked_machines, &other.forked_machines)
+    }
+
+    /// Override the child-wait deadlines (see [`WaitDeadlines`]).
+    ///
+    /// Every runtime call kills its child at the matching deadline, so this is
+    /// the seam tests use to watch a hang end in milliseconds instead of
+    /// half an hour. Production never calls it.
+    pub fn with_deadlines(mut self, deadlines: WaitDeadlines) -> Self {
+        self.deadlines = deadlines;
+        self
+    }
+
+    /// Override the maximum bytes retained from each process stream.
+    pub fn with_capture_limit(mut self, bytes: usize) -> Self {
+        self.capture_limit = bytes.max(1024);
+        self
+    }
+
+    /// Configure networking for smolvm's separate registry export VM.
+    ///
+    /// The export VM re-pulls the base image while flattening a machine, so
+    /// its network path can differ from the VM Preloop already provisioned.
+    pub fn with_pack_network(mut self, proxy: Option<String>, no_proxy: Option<String>) -> Self {
+        self.pack_proxy = proxy.filter(|value| !value.trim().is_empty());
+        self.pack_no_proxy = no_proxy.filter(|value| !value.trim().is_empty());
+        self
+    }
+
+    /// Substitute the host-environment lookup this provider reads.
+    ///
+    /// Test seam for the Linux override tests: integration tests compile the
+    /// library without `cfg(test)`, so this is unconditionally available on
+    /// Linux. In production nothing constructs a provider with anything but
+    /// [`process_env`], so the seam cannot redirect a real deployment.
+    #[cfg(target_os = "linux")]
+    pub fn with_env_lookup(mut self, lookup: EnvLookup) -> Self {
+        self.env_lookup = lookup;
+        self
+    }
+
+    fn command(&self) -> Command {
+        Command::new(&self.binary)
+    }
+
+    /// A command ready to run against the resolved SmolVM binary with the
+    /// sandbox environment applied. Every operation goes through here, so
+    /// the sandbox reaches any command that can spawn or restart SmolVM's
+    /// `_boot-vm` subprocess — create, start, start_forkable, fork, exec,
+    /// pack — not just machine creation.
+    ///
+    /// The guest-agent rootfs guard runs first: a command that could boot a
+    /// guest from an agent the resolved binary cannot stop is refused before
+    /// it starts, once per provider, instead of failing hours later inside
+    /// the pool's retry loop (see [`agent_rootfs`]).
+    fn sandboxed_command(&self) -> Result<Command, VmError> {
+        if let Some(report) = self.agent_mismatch() {
+            return Err(VmError::GuestAgentMismatch { report });
+        }
+        let mut command = self.command();
+        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary))?;
+        apply_sandbox_env(&mut command, self.env_lookup)?;
+        Ok(command)
+    }
+
+    /// The guest-agent guard verdict: the one-read refusal report when the
+    /// agent Preloop would export cannot serve this binary.
+    ///
+    /// The guard reads and hashes whole rootfs trees (and may run `smolvm
+    /// --version`), so [`agent_rootfs::check_cached`] reuses its verdict while
+    /// the binary and the candidate rootfs trees are unchanged — a repair or a
+    /// replacement is picked up without restarting the engine.
+    fn agent_mismatch(&self) -> Option<String> {
+        agent_rootfs::check_cached(&agent_rootfs::Runtime::from_env(), &self.binary)
+            .err()
+            .and_then(|error| match error {
+                VmError::GuestAgentMismatch { report } => Some(report),
+                _ => None,
+            })
+    }
+
+    /// Append the guest-agent context to SmolVM's "this guest cannot be
+    /// stopped" failure.
+    ///
+    /// The message alone ("running guest agent does not support safe
+    /// shutdown; VM left unchanged; update the guest agent before retrying")
+    /// names neither the rootfs Preloop pinned nor the agent that actually
+    /// booted, which is what an operator needs to repair the install. Both are
+    /// gathered here: the rootfs the engine exports, and the version the
+    /// guest logged at boot into the machine's console log. Every failure that
+    /// is not a shutdown refusal passes through untouched.
+    async fn diagnose_shutdown_refusal(&self, name: &MachineName, error: VmError) -> VmError {
+        let VmError::Command {
+            operation,
+            exit_code,
+            message,
+        } = error
+        else {
+            return error;
+        };
+        if !is_shutdown_refusal(&message) {
+            return VmError::Command {
+                operation,
+                exit_code,
+                message,
+            };
+        }
+        let mut details = vec![format!("resolved smolvm {}", self.binary.display())];
+        if let Some(rootfs) = agent_rootfs::resolve_exported_rootfs(
+            &agent_rootfs::Runtime::from_env(),
+            Some(&self.binary),
+        ) {
+            details.push(format!(
+                "guest-agent rootfs {} ({})",
+                rootfs.display(),
+                agent_rootfs::AgentRootfs::inspect(&rootfs).describe()
+            ));
+        }
+        match self.machine_data_dir_direct(name).await {
+            Ok(dir) => {
+                let console = dir.join(agent_rootfs::CONSOLE_LOG);
+                let version = std::fs::read_to_string(&console)
+                    .ok()
+                    .and_then(|text| agent_rootfs::agent_boot_version(&text));
+                details.push(format!(
+                    "guest agent boot version {} (console log {})",
+                    version.as_deref().unwrap_or("unknown"),
+                    console.display()
+                ));
+            }
+            Err(error) => details.push(format!("machine data dir unknown: {error}")),
+        }
+        VmError::Command {
+            operation,
+            exit_code,
+            message: format!(
+                "{message} [guest-agent diagnostics: {}; run `preloop update --ensure-runtime` to \
+                 reinstall the guest agent that matches the resolved smolvm]",
+                details.join("; ")
+            ),
+        }
+    }
+
+    /// A command for an operation that can never boot or restart `_boot-vm`
+    /// (status, list, stop, delete): the validated sandbox policy when it
+    /// resolves, otherwise the sandbox variables stripped.
+    ///
+    /// Fail-closed validation must not extend here. A single operator typo
+    /// in `SMOLVM_SECCOMP`/`SMOLVM_LANDLOCK` is recoverable *because* the
+    /// pool can still be enumerated and torn down; hard-failing `status`,
+    /// `list`, `stop`, and `delete` on the same typo would make the very
+    /// operations needed to fix it unusable. The variables are still never
+    /// forwarded unvalidated: on an invalid override they are removed, so a
+    /// recovery command runs without sandbox variables (no VMM is spawned
+    /// here, so nothing boots unconfined) rather than with garbage.
+    fn recovery_command(&self) -> Result<Command, VmError> {
+        let mut command = self.command();
+        apply_smolvm_runtime_env_async(&mut command, Some(&self.binary))?;
+        match sandbox_env_with(self.env_lookup) {
+            Ok(sandbox) => {
+                for key in sandbox.remove {
+                    command.env_remove(key);
+                }
+                for (key, value) in sandbox.set {
+                    command.env(key, value);
+                }
+            }
+            Err(_) => {
+                command.env_remove("SMOLVM_SECCOMP");
+                command.env_remove("SMOLVM_LANDLOCK");
+                command.env_remove("SMOLVM_CGROUP_ROOT");
+            }
+        }
+        Ok(command)
+    }
+
+    /// Run an operation that can never boot or restart a VMM, using
+    /// [`Self::recovery_command`] so a bad sandbox override cannot wedge the
+    /// recovery paths. Mirrors [`Self::checked`]'s plumbing, including the
+    /// deadline: recovery operations are the ones an operator reaches for when
+    /// the runtime is already misbehaving, so they must be the last to hang.
+    async fn recovery(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        deadline: Duration,
+    ) -> Result<ExecOutput, VmError> {
+        let mut command = self.recovery_command()?;
+        command.args(args);
+        let result = run_runtime_command(
+            operation,
+            &self.binary,
+            command,
+            self.capture_limit,
+            deadline,
+        )
+        .await?;
+        if result.exit_code != 0 {
+            let message = String::from_utf8_lossy(&result.stderr).trim().to_owned();
+            return Err(VmError::Command {
+                operation,
+                exit_code: result.exit_code,
+                message,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Whether `machine create` accepts `--mount-socket`, probed from the
+    /// binary's own help text and cached. SmolVM's wrapper scripts can
+    /// report a recent `--version` while resolving to an old binary, so the
+    /// flag's presence is the reliable capability check.
+    ///
+    /// An invalid sandbox override is reported as such instead of being
+    /// folded into a `false` answer: the caller caches the probe result for
+    /// the provider's lifetime, and a rejected environment says nothing
+    /// about the binary's capabilities.
+    ///
+    /// A probe that runs out of time is an error, not a `false`, for the same
+    /// reason: caching "this binary cannot mount sockets" because smolvm
+    /// happened to be wedged would disable the capability for the process's
+    /// whole life. [`tokio::sync::OnceCell::get_or_try_init`] only stores the
+    /// `Ok` answer, so the next caller re-probes.
+    async fn supports_mount_socket(&self) -> Result<bool, VmError> {
+        let mut command = self.sandboxed_command()?;
+        command.args(["machine", "create", "--help"]);
+        let output = match run_runtime_command(
+            "machine create --help",
+            &self.binary,
+            command,
+            self.capture_limit,
+            self.deadlines.probe,
+        )
+        .await
+        {
+            Ok(output) => output,
+            // Any other plumbing failure (the binary could not run at all)
+            // still answers `false`: it is the binary that failed, which is
+            // what the probe reports on.
+            Err(error @ VmError::TimedOut { .. }) => return Err(error),
+            Err(_) => return Ok(false),
+        };
+        Ok(output.exit_code == 0
+            && String::from_utf8_lossy(&output.stdout).contains("--mount-socket"))
+    }
+
+    /// What the resolved binary reports for `--version`, probed once.
+    ///
+    /// Used for diagnostics only. SmolVM's wrapper scripts can report a newer
+    /// version than the binary they exec (see [`VmError::UnsupportedSocketMount`]),
+    /// so callers quote this as the *reported* version rather than trusting it
+    /// for a capability decision. The probe runs through
+    /// [`Self::recovery_command`]: it can never boot a VMM, and it must still
+    /// answer while a bad sandbox override is being diagnosed.
+    /// A probe that runs out of time is not cached: the cell is the
+    /// process-wide answer to "what does this binary report", and `None`
+    /// because smolvm was momentarily wedged would be wrong for the rest of the
+    /// process's life (and would hide the recovered answer from a later
+    /// diagnostic). [`tokio::sync::OnceCell::get_or_try_init`] stores only the
+    /// `Ok` answer, so a timeout leaves it to be asked again; the caller still
+    /// gets `None` now.
+    async fn reported_version(&self) -> Option<String> {
+        self.reported_version
+            .get_or_try_init(|| async {
+                let Ok(mut command) = self.recovery_command() else {
+                    return Ok(None);
+                };
+                command.arg("--version");
+                let output = match run_runtime_command(
+                    "--version",
+                    &self.binary,
+                    command,
+                    self.capture_limit,
+                    self.deadlines.probe,
+                )
+                .await
+                {
+                    Ok(output) => output,
+                    // A probe that ran out of time must not be cached as "no
+                    // version" (see above): propagate it so the cell stays
+                    // uninitialized and the next diagnostic asks again.
+                    Err(error @ VmError::TimedOut { .. }) => return Err(error),
+                    Err(_) => return Ok(None),
+                };
+                let text = String::from_utf8_lossy(&output.stdout);
+                Ok::<Option<String>, VmError>(
+                    text.lines()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty())
+                        .map(str::to_owned),
+                )
+            })
+            .await
+            .ok()
+            .cloned()
+            .flatten()
+    }
+
+    /// Record the devices a `create` asked SmolVM to build.
+    async fn note_declared_devices(&self, name: &MachineName, declared: DeclaredDevices) {
+        self.declared_devices
+            .lock()
+            .await
+            .insert(name.as_str().to_owned(), declared);
+    }
+
+    /// Reinterpret a boot failure as the device-budget exhaustion it is.
+    ///
+    /// Anything that does not carry libkrun's IRQ-exhaustion signature is
+    /// returned unchanged: a corrupt image, a disk another hypervisor still
+    /// holds, and a rejected device option all surface as `EINVAL` and must
+    /// keep their own message.
+    async fn explain_boot_failure(
+        &self,
+        name: &MachineName,
+        operation: &'static str,
+        error: VmError,
+    ) -> VmError {
+        let VmError::Command { message, .. } = &error else {
+            return error;
+        };
+        if !is_irq_exhaustion(message) {
+            return error;
+        }
+        let declared = self
+            .declared_devices
+            .lock()
+            .await
+            .get(name.as_str())
+            .copied();
+        let smolvm_version = self.reported_version().await;
+        VmError::IrqExhausted {
+            machine: name.as_str().to_owned(),
+            operation,
+            declared,
+            smolvm_version: smolvm_version.clone(),
+            message: irq_exhaustion_message(
+                name.as_str(),
+                operation,
+                declared,
+                smolvm_version.as_deref(),
+                message,
+            ),
+        }
+    }
+
+    /// Durably save RAM and disk, then stop (`smolvm machine pause`).
+    pub async fn pause_machine(&self, name: &MachineName) -> Result<(), VmError> {
+        self.checked(
+            "pause",
+            &[
+                "machine".into(),
+                "pause".into(),
+                "--name".into(),
+                name.as_str().into(),
+            ],
+            self.deadlines.control,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Resume a paused machine (`smolvm machine resume`).
+    pub async fn resume_machine(&self, name: &MachineName) -> Result<(), VmError> {
+        self.checked(
+            "resume",
+            &[
+                "machine".into(),
+                "resume".into(),
+                "--name".into(),
+                name.as_str().into(),
+            ],
+            self.deadlines.control,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn checked(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        deadline: Duration,
+    ) -> Result<ExecOutput, VmError> {
+        self.checked_with_network(operation, args, None, None, deadline)
+            .await
+    }
+
+    async fn checked_with_network(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        network: Option<&NetworkPolicy>,
+        staging_dir: Option<&Path>,
+        deadline: Duration,
+    ) -> Result<ExecOutput, VmError> {
+        let mut command = self.sandboxed_command()?;
+        match network {
+            Some(NetworkPolicy::PublicOnly) => {
+                command.env("SMOLVM_EGRESS_FLOOR", "strict");
+            }
+            Some(_) => {
+                command.env_remove("SMOLVM_EGRESS_FLOOR");
+            }
+            None => {}
+        }
+        if let Some(staging_dir) = staging_dir {
+            command.env("SMOLVM_PACK_STAGING", staging_dir);
+            // smolvm-pack uses tempfile::tempdir() while assembling the
+            // archive. Keep that scratch space beside the output instead of
+            // falling back to a small host /tmp tmpfs.
+            command.env("TMPDIR", staging_dir);
+            // Pack export streams multi-GiB flattened layers; the general 4 GiB
+            // file-transfer cap would abort a large golden pack.
+            command.env("SMOLVM_FILE_TRANSFER_MAX_BYTES", "64GiB");
+        }
+        command.args(args);
+        let result = run_runtime_command(
+            operation,
+            &self.binary,
+            command,
+            self.capture_limit,
+            deadline,
+        )
+        .await?;
+        if result.exit_code != 0 {
+            let message = String::from_utf8_lossy(&result.stderr).trim().to_owned();
+            return Err(VmError::Command {
+                operation,
+                exit_code: result.exit_code,
+                message,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Run an operation that constructs or replaces a machine's base image,
+    /// excluding every other lifecycle operation for its duration.
+    async fn exclusive(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        deadline: Duration,
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.write().await;
+        self.checked(operation, args, deadline).await
+    }
+
+    async fn exclusive_with_staging(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        staging_dir: &Path,
+        deadline: Duration,
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.write().await;
+        self.checked_with_network(operation, args, None, Some(staging_dir), deadline)
+            .await
+    }
+
+    async fn exclusive_with_network(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        network: &NetworkPolicy,
+        deadline: Duration,
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.write().await;
+        self.checked_with_network(operation, args, Some(network), None, deadline)
+            .await
+    }
+
+    /// Run an operation that only touches one already-defined machine.
+    ///
+    /// These run concurrently with each other: a pool replenishing several
+    /// slots at once issues a delete and a fork per slot, and serializing them
+    /// made the whole refill wait one VM operation at a time. They stay
+    /// excluded from base construction, so a golden cannot be replaced
+    /// underneath a fork.
+    ///
+    /// Forks additionally serialize per golden: see [`SmolVmProvider::fork`]
+    /// for the checkpoint invariant that requires it.
+    ///
+    /// The deadline is what keeps the read side honest: a runtime that never
+    /// answers would otherwise hold the read guard forever, and every queued
+    /// writer — a whole pool replenishment — behind it.
+    async fn concurrent(
+        &self,
+        operation: &'static str,
+        args: &[String],
+        deadline: Duration,
+    ) -> Result<ExecOutput, VmError> {
+        let _guard = self.lifecycle_lock.read().await;
+        self.checked(operation, args, deadline).await
+    }
+
+    /// The mutex guarding forks from one golden, created on first use.
+    ///
+    /// Keyed by name rather than held on the golden record because a provider
+    /// outlives any single golden and forks arrive from independent slot tasks.
+    async fn fork_lock(&self, golden: &MachineName) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.fork_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(golden.as_str().to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// Resolve a machine's on-disk data directory via `smolvm machine data-dir`.
+    ///
+    /// The directory is hash-derived, not name-derived, so it must be asked
+    /// of smolvm rather than reconstructed from the platform cache layout.
+    async fn machine_data_dir(&self, name: &MachineName) -> Result<PathBuf, VmError> {
+        let _guard = self.lifecycle_lock.read().await;
+        self.machine_data_dir_direct(name).await
+    }
+
+    /// [`Self::machine_data_dir`] without the lifecycle lock.
+    ///
+    /// The orphan sweep holds the read side across its whole
+    /// snapshot-and-scan to exclude `machine create` (see
+    /// [`VmProvider::sweep_orphaned_data_dirs`]), so it must not re-acquire
+    /// the lock per machine: a writer queued behind the sweep would block a
+    /// nested read forever.
+    ///
+    /// `data-dir` goes through [`Self::recovery`], not [`Self::checked`]:
+    /// it cannot boot a VMM, and the delete-escalation path consults it
+    /// exactly when recovery must still work despite a bad operator sandbox
+    /// override (`SMOLVM_SECCOMP`/`SMOLVM_LANDLOCK`) that `checked` refuses.
+    async fn machine_data_dir_direct(&self, name: &MachineName) -> Result<PathBuf, VmError> {
+        let output = self
+            .recovery(
+                "data-dir",
+                &[
+                    "machine".into(),
+                    "data-dir".into(),
+                    "--name".into(),
+                    name.as_str().into(),
+                ],
+                self.deadlines.probe,
+            )
+            .await?;
+        let dir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if dir.is_empty() {
+            return Err(VmError::Protocol(format!(
+                "smolvm machine data-dir for `{}` returned empty output",
+                name.as_str()
+            )));
+        }
+        Ok(PathBuf::from(dir))
+    }
+}
+
+/// Best-effort recursive byte sum of a directory tree (metadata only).
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Do not follow symlinks: count the link itself, never its target.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+/// Remove `<data_dir>/pack` build intermediates left by smolvm's pack export
+/// (issue #295: `storage.ext4` + `layers/*.tar`, ~29 GB beside the finished
+/// `storage.raw`, copied into every fork).
+///
+/// Only removes when the finished disk (`storage.raw`) exists beside it, and
+/// only when `pack` is a real directory strictly inside `data_dir` — a
+/// symlink (even one pointing inside) is never followed. Returns true when a
+/// pack directory was removed.
+fn prune_pack_dir(data_dir: &Path) -> Result<bool, VmError> {
+    if !data_dir.join("storage.raw").is_file() {
+        return Ok(false);
+    }
+    prune_pack_dir_in(data_dir)
+}
+
+/// [`prune_pack_dir`] without the `storage.raw` requirement: a `create` that
+/// failed mid-extraction never wrote the disk, and that residue is exactly
+/// what [`VmProvider::prune_failed_unpack_residue`] exists to reclaim. The
+/// same real-directory, strictly-inside checks still apply.
+fn prune_pack_dir_in(data_dir: &Path) -> Result<bool, VmError> {
+    let pack = data_dir.join("pack");
+    // Refuse symlinks outright: the removal must never follow a link.
+    if std::fs::symlink_metadata(&pack)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let canonical_dir = data_dir
+        .canonicalize()
+        .map_err(|source| VmError::RuntimeIo { source })?;
+    let canonical_pack = match pack.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(false),
+    };
+    if !canonical_pack.is_dir()
+        || canonical_pack == canonical_dir
+        || !canonical_pack.starts_with(&canonical_dir)
+    {
+        return Ok(false);
+    }
+    let bytes = dir_size_bytes(&canonical_pack);
+    std::fs::remove_dir_all(&canonical_pack).map_err(|source| VmError::RuntimeIo { source })?;
+    info!(
+        machine_dir = %canonical_dir.display(),
+        reclaimed_bytes = bytes,
+        "removed pack/ build intermediates beside finished disk"
+    );
+    Ok(true)
+}
+
+/// Remove `pack/` intermediates inside machine data dirs no registry row
+/// owns — the residue a `machine create --from` leaves when it dies before
+/// registration.
+///
+/// Caller holds the lifecycle write lock, so no `create` can be mid-flight
+/// while this scans: `create` holds the write side for its whole run, which
+/// also means a young unregistered dir found here belongs to an already-dead
+/// create, not one in progress (the orphan sweep's grace window exists for
+/// the lock-free fork case; this runs after a returned failure). No `age`
+/// check, no `storage.raw` check — the disk is what the failed unpack never
+/// wrote — and only real directories under a canonicalized root match: a
+/// hex-named symlink could point anywhere, `known_dirs` are compared by
+/// canonical path, and [`prune_pack_dir_in`] still refuses symlink `pack/`
+/// entries.
+/// Returns how many pack trees were removed.
+fn prune_unregistered_pack_dirs(
+    roots: &[PathBuf],
+    known_dirs: &std::collections::BTreeSet<PathBuf>,
+) -> Result<usize, VmError> {
+    let mut pruned = 0usize;
+    // `data-dir` answers with whatever path SmolVM resolved, which need not
+    // byte-match a scanned root (`/tmp` vs `/private/tmp` on macOS): compare
+    // on canonical spellings so a registered dir never reads as residue.
+    let known: std::collections::BTreeSet<PathBuf> = known_dirs
+        .iter()
+        .map(|dir| dir.canonicalize().unwrap_or_else(|_| dir.clone()))
+        .collect();
+    for root in roots {
+        let Ok(root_canonical) = root.canonicalize() else {
+            warn!(root = %root.display(), "pack-residue scan root does not resolve");
+            continue;
+        };
+        let entries = match std::fs::read_dir(&root_canonical) {
+            Ok(entries) => entries,
+            Err(error) => {
+                warn!(
+                    root = %root_canonical.display(),
+                    %error,
+                    "pack-residue scan could not read this root; residue there survives"
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                warn!("pack-residue scan skipped an unreadable directory entry");
+                continue;
+            };
+            let path = entry.path();
+            // A symlinked machine dir could point outside the root: only real
+            // directories are machine data dirs.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !is_machine_data_dir_name(&entry.file_name()) || !meta.is_dir() {
+                continue;
+            }
+            let canonical = match path.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(_) => continue,
+            };
+            if !canonical.starts_with(&root_canonical) || known.contains(&canonical) {
+                continue;
+            }
+            match prune_pack_dir_in(&canonical) {
+                Ok(true) => pruned += 1,
+                Ok(false) => {}
+                Err(error) => warn!(
+                    machine_dir = %canonical.display(),
+                    %error,
+                    "failed to prune pack/ intermediates from unregistered machine dir"
+                ),
+            }
+        }
+    }
+    Ok(pruned)
+}
+
+#[async_trait]
+impl VmProvider for SmolVmProvider {
+    async fn create(&self, spec: &MachineSpec) -> Result<(), VmError> {
+        validate_spec(spec)?;
+        let mut args = vec![
+            "machine".into(),
+            "create".into(),
+            "--name".into(),
+            spec.name.as_str().into(),
+        ];
+        let is_pack = is_pack_image(&spec.image);
+        if is_pack {
+            args.extend(["--from".into(), spec.image.clone()]);
+        } else {
+            args.extend(["--image".into(), spec.image.clone()]);
+        }
+        // A runtime pack gets its workload from here (the systemd-as-PID-1
+        // switch); an image machine's workload handling stays below, untouched,
+        // and a builder only runs an explicitly requested command.
+        let workload_init = MachineSpec::resolve_workload_init(
+            spec.workload_init.as_deref(),
+            (self.env_lookup)(SMOLVM_WORKLOAD_INIT_ENV).as_deref(),
+            spec.role,
+        );
+        args.extend([
+            "--cpus".into(),
+            spec.cpus.to_string(),
+            "--mem".into(),
+            spec.memory_mib.to_string(),
+            "--storage".into(),
+            spec.storage_gib.to_string(),
+        ]);
+        if let Some(overlay_gib) = spec.overlay_gib {
+            args.extend(["--overlay".into(), overlay_gib.to_string()]);
+        }
+        match &spec.network {
+            NetworkPolicy::Disabled => {}
+            NetworkPolicy::Unrestricted => args.push("--net".into()),
+            NetworkPolicy::PublicOnly => {
+                args.extend([
+                    "--net".into(),
+                    "--net-backend".into(),
+                    public_only_net_backend(self.env_lookup).into(),
+                ]);
+            }
+            NetworkPolicy::Restricted { hosts, cidrs } => {
+                for host in hosts {
+                    args.extend(["--allow-host".into(), host.clone()]);
+                }
+                for cidr in cidrs {
+                    args.extend(["--allow-cidr".into(), cidr.clone()]);
+                }
+            }
+        }
+        if let Some(dns) = resolved_guest_dns(
+            spec.dns.as_deref(),
+            !matches!(spec.network, NetworkPolicy::Disabled),
+            match spec.network {
+                NetworkPolicy::PublicOnly => public_only_net_backend(self.env_lookup),
+                _ => "tsi",
+            },
+            workload_init_is_systemd(workload_init.as_deref()),
+        ) {
+            args.extend(["--dns".into(), dns]);
+        }
+        for mount in &spec.volumes {
+            let mut value = format!("{}:{}", mount.host.display(), mount.guest.display());
+            if mount.read_only {
+                value.push_str(":ro");
+            }
+            args.extend(["--volume".into(), value]);
+        }
+        // Guest-local volumes ride the same `--volume` flag in its bare-path
+        // form: the directory then lives on the machine's own disk instead of
+        // its overlay root, which is what an overlay2-backed dockerd needs.
+        for volume in MachineSpec::resolve_guest_volumes(
+            spec.guest_volumes.as_deref(),
+            (self.env_lookup)(SMOLVM_GUEST_VOLUMES_ENV).as_deref(),
+            spec.role,
+        )? {
+            args.extend(["--volume".into(), volume.as_path().display().to_string()]);
+        }
+        if !spec.sockets.is_empty()
+            && !*self
+                .socket_mount_supported
+                .get_or_try_init(|| self.supports_mount_socket())
+                .await?
+        {
+            return Err(VmError::UnsupportedSocketMount {
+                binary: self.binary.display().to_string(),
+            });
+        }
+        for mount in &spec.sockets {
+            args.extend([
+                "--mount-socket".into(),
+                format!("{}:{}", mount.host.display(), mount.guest.display()),
+            ]);
+        }
+        if !is_pack {
+            // Everything this provider does runs through `machine exec`, so
+            // pin a harmless keep-alive workload when the image declares no
+            // usable startup command. Without it, machines whose record
+            // carries no entrypoint/cmd (bare archives, the official runner
+            // image's `bash` CMD) fail to start with libkrun's EINVAL once
+            // the memory ceiling is raised. Images that declare a real
+            // CMD/entrypoint keep their own workload — overriding it changes
+            // runtime behavior. The workload must be the LAST positional
+            // block: `machine create` treats everything after `--` as the
+            // workload, so any flags appended later would be swallowed.
+            if !image_has_startup_command(&spec.image) {
+                args.extend([
+                    "--".into(),
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "sleep infinity".into(),
+                ]);
+            }
+        } else if let Some(workload) = &workload_init {
+            // The pack's own entrypoint/cmd is overridden at launch with
+            // systemd, so the guest becomes a systemd host: `systemctl`,
+            // `journald`, `systemd-resolved` and docker's `systemd` cgroup
+            // driver all need PID 1 to be systemd. Nothing is baked into the
+            // pack — `machine create --from <pack> -- /sbin/init` was measured
+            // to leave `ps -p 1` at `/sbin/init` while the same pack without
+            // the block still boots its recorded entrypoint. Same positional
+            // rule as above: this block is last.
+            args.push("--".into());
+            args.extend(workload.iter().cloned());
+        }
+        self.exclusive_with_network("create", &args, &spec.network, self.deadlines.boot)
+            .await?;
+        // Recorded after a successful create: the spec is the only place the
+        // device inventory a `start` failure has to explain is still known.
+        self.note_declared_devices(&spec.name, spec.declared_devices())
+            .await;
+        if spec.rosetta {
+            let update_args = vec![
+                "machine".into(),
+                "update".into(),
+                "--name".into(),
+                spec.name.as_str().into(),
+                "--rosetta".into(),
+            ];
+            if let Err(error) = self
+                .exclusive("update", &update_args, self.deadlines.control)
+                .await
+            {
+                let _ = self
+                    .concurrent(
+                        "delete",
+                        &[
+                            "machine".into(),
+                            "delete".into(),
+                            "--name".into(),
+                            spec.name.as_str().into(),
+                            "-f".into(),
+                        ],
+                        self.deadlines.control,
+                    )
+                    .await;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Starting an already-defined machine constructs no base image, so it
+    /// runs alongside forks. Holding the write lock here stalled the whole
+    /// pool: a direct-created runner's cold boot (minutes on macOS while the
+    /// guest unpacks its layers) blocked every fork until it finished.
+    ///
+    /// A boot that runs out of virtio IRQ lines comes back as
+    /// [`VmError::IrqExhausted`] instead of the bare `EINVAL` smolvm prints:
+    /// see [`SmolVmProvider::explain_boot_failure`].
+    async fn start(&self, name: &MachineName) -> Result<(), VmError> {
+        match self
+            .concurrent(
+                "start",
+                &[
+                    "machine".into(),
+                    "start".into(),
+                    "--name".into(),
+                    name.as_str().into(),
+                ],
+                self.deadlines.boot,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.explain_boot_failure(name, "start", error).await),
+        }
+    }
+
+    async fn start_forkable(&self, name: &MachineName) -> Result<(), VmError> {
+        match self
+            .exclusive(
+                "start_forkable",
+                &[
+                    "machine".into(),
+                    "start".into(),
+                    "--name".into(),
+                    name.as_str().into(),
+                    "--forkable".into(),
+                ],
+                self.deadlines.boot,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self
+                .explain_boot_failure(name, "start_forkable", error)
+                .await),
+        }
+    }
+
+    /// Fork one clone from a golden, one fork per golden at a time.
+    ///
+    /// `--freeze-source` (SmolVM ≥1.18.1, upstream PR #1376) keeps the golden
+    /// frozen as a reusable branch base: the first fork freezes the base and
+    /// publishes a retained checkpoint, and later forks restore from that
+    /// checkpoint instead of re-freezing or resuming the source onto new CoW
+    /// layers. Live forking — the upstream default on Linux and macOS —
+    /// resumes the source per fork, accumulating qcow2 backing layers until
+    /// MAX_FORK_LINEAGE_DEPTH (32) wedges the pool, and on macOS
+    /// re-checkpoints the source on every fork. Two forks racing the same
+    /// golden break the invariant — the loser issues a second FORK against an
+    /// already-paused VM, and that failure's rollback resumes the base and
+    /// deletes the retained checkpoint. Every later fork then fails with
+    /// `golden '<name>' is already paused; a valid retained checkpoint is
+    /// required`, so the pool cannot produce another runner until the golden is
+    /// rebuilt from scratch: queued jobs stall indefinitely, in exchange for
+    /// the few hundred milliseconds a concurrent refill saves. SmolVM's own
+    /// fork-pool controller serializes on the golden for the same reason.
+    ///
+    /// Different goldens still fork concurrently, and forks remain excluded
+    /// from base construction, so a golden cannot be replaced underneath one.
+    async fn fork(&self, golden: &MachineName, clone: &MachineName) -> Result<(), VmError> {
+        let fork_lock = self.fork_lock(golden).await;
+        let _fork_guard = fork_lock.lock().await;
+        let result = self
+            .concurrent(
+                "fork",
+                &[
+                    "machine".into(),
+                    "fork".into(),
+                    "--golden".into(),
+                    golden.as_str().into(),
+                    "--name".into(),
+                    clone.as_str().into(),
+                    "--freeze-source".into(),
+                ],
+                self.deadlines.boot,
+            )
+            .await;
+        if result.is_ok() {
+            self.forked_machines
+                .lock()
+                .await
+                .insert(clone.as_str().to_owned(), golden.as_str().to_owned());
+            // Issue #295: smolvm's fork copies the golden's whole data dir,
+            // pack/ build intermediates included. Prune the clone's copy;
+            // never fail provisioning over best-effort disk hygiene.
+            if let Err(error) = self.prune_pack_intermediates(clone).await {
+                warn!(
+                    clone = clone.as_str(),
+                    %error,
+                    "failed to prune pack/ intermediates from forked machine"
+                );
+            }
+        }
+        result.map(|_| ())
+    }
+
+    async fn prune_pack_intermediates(&self, name: &MachineName) -> Result<bool, VmError> {
+        let data_dir = self.machine_data_dir(name).await?;
+        // Removing ~29 GB of intermediates is metadata-heavy; keep it off the
+        // async runtime.
+        tokio::task::spawn_blocking(move || prune_pack_dir(&data_dir))
+            .await
+            .map_err(|error| VmError::Protocol(format!("pack prune task failed: {error}")))?
+    }
+
+    async fn prune_failed_unpack_residue(&self) -> Result<usize, VmError> {
+        // The write side, not the read side: this runs after a `create`
+        // returned an error, and the lock guarantees no *other* create is
+        // mid-extraction while the scan decides which unregistered dirs hold
+        // its `pack/` residue. `machine data-dir` cannot resolve an
+        // unregistered machine, so the name's dir is found by exclusion:
+        // every 16-hex machine dir the registry does not own.
+        let _lifecycle = self.lifecycle_lock.write().await;
+        let registered = self.list().await?;
+        let mut known_dirs = std::collections::BTreeSet::new();
+        let mut roots = std::collections::BTreeSet::new();
+        for name in &registered {
+            let dir = self.machine_data_dir_direct(name).await?;
+            if let Some(parent) = dir.parent() {
+                roots.insert(parent.to_path_buf());
+            }
+            known_dirs.insert(dir);
+        }
+        if let Some(root) = machine_data_root() {
+            roots.insert(root);
+        }
+        let roots: Vec<PathBuf> = roots.into_iter().collect();
+        tokio::task::spawn_blocking(move || prune_unregistered_pack_dirs(&roots, &known_dirs))
+            .await
+            .map_err(|error| VmError::Protocol(format!("failed-unpack prune failed: {error}")))?
+    }
+
+    async fn sweep_orphaned_data_dirs(&self) -> Result<usize, VmError> {
+        // Hold the lifecycle read lock across the registry snapshot *and* the
+        // filesystem scan. `machine create` and `machine pack` hold the write
+        // side for their whole run, so no create can be executing — or create
+        // its data dir before the registry row lands — while the scan decides
+        // what is an orphan; without that exclusion the sweep deleted a live
+        // create's unregistered dir out from under it, and the same tick's
+        // `RemovedDataDir` hypervisor purge then killed the create (issue
+        // #371). Forks run concurrently with other lifecycle operations by
+        // design; a fork clone's dir is created fresh, so the grace window
+        // covers it until its registry row lands.
+        let _lifecycle = self.lifecycle_lock.read().await;
+        let registered = self.list().await?;
+        let mut known_dirs = std::collections::BTreeSet::new();
+        let mut roots = std::collections::BTreeSet::new();
+        for name in &registered {
+            let dir = self.machine_data_dir_direct(name).await?;
+            if let Some(parent) = dir.parent() {
+                roots.insert(parent.to_path_buf());
+            }
+            known_dirs.insert(dir);
+        }
+        // Conventional roots cover the empty-registry case: with no machines
+        // left, registered data dirs cannot reveal where orphans live.
+        // Only scan the root belonging to the active registry configuration.
+        if let Some(root) = machine_data_root() {
+            roots.insert(root);
+        }
+        let roots: Vec<PathBuf> = roots.into_iter().collect();
+        tokio::task::spawn_blocking(move || {
+            sweep_orphaned_dirs(&roots, &known_dirs, ORPHAN_DIR_GRACE)
+        })
+        .await
+        .map_err(|error| VmError::Protocol(format!("orphan sweep task failed: {error}")))?
+    }
+
+    async fn stop(&self, name: &MachineName) -> Result<(), VmError> {
+        let result = self
+            .recovery(
+                "stop",
+                &[
+                    "machine".into(),
+                    "stop".into(),
+                    "--name".into(),
+                    name.as_str().into(),
+                ],
+                self.deadlines.control,
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.diagnose_shutdown_refusal(name, error).await),
+        }
+    }
+
+    async fn delete(&self, name: &MachineName) -> Result<(), VmError> {
+        let args = [
+            "machine".into(),
+            "delete".into(),
+            "--name".into(),
+            name.as_str().into(),
+            "-f".into(),
+        ];
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            match self.recovery("delete", &args, self.deadlines.control).await {
+                Ok(_) => break Ok(()),
+                // Delete is idempotent. SmolVM may remove its registry entry
+                // before a retry observes the partially cleaned directory.
+                Err(VmError::Command { message, .. })
+                    if message.to_ascii_lowercase().contains("not found") =>
+                {
+                    break Ok(());
+                }
+
+                // SmolVM 1.7.7 can race its final agent/log writes with the
+                // recursive data-directory removal. The same force-delete
+                // succeeds once those writers exit.
+                Err(VmError::Command { ref message, .. })
+                    if attempts < 3
+                        && message.to_ascii_lowercase().contains("directory not empty") =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                // The machine registry is a single SQLite database; concurrent
+                // create/fork/delete from the pool contends on it. A delete
+                // that hits the lock leaves the machine leaked — and a leaked
+                // clone is what blocks the golden's re-arm. Retry the same
+                // bounded way; the lock clears once the competing operation
+                // commits.
+                Err(VmError::Command { ref message, .. })
+                    if attempts < 3
+                        && message.to_ascii_lowercase().contains("database is locked") =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        // A refused `delete -f` (`guest did not confirm filesystem
+        // synchronization; left the VM alive for retry`) leaves the detached
+        // `_boot-vm` hypervisor running, pinning the machine's storage fds —
+        // on macOS also its `pack/layers-cs` mount. The guest cannot be
+        // asked again, so SIGKILL the hypervisor for this machine's own data
+        // directory and retry the delete once; smolvm can then finish the
+        // removal. A kill that finds nothing is harmless, so any persistent
+        // delete failure takes this path.
+        let result = match result {
+            Err(delete_error) => {
+                let data_dir = self.machine_data_dir(name).await.ok();
+                let killed = match data_dir {
+                    Some(dir) => {
+                        // `ps` and `kill` are synchronous host tools; keep them
+                        // off the worker, and each is bounded inside.
+                        match tokio::task::spawn_blocking(move || kill_vm_processes_in(&dir)).await
+                        {
+                            Ok(outcome) => outcome.unwrap_or_else(|error| {
+                                warn!(%error, "hypervisor scan before forced delete failed");
+                                0
+                            }),
+                            Err(error) => {
+                                warn!(%error, "hypervisor scan task failed before forced delete");
+                                0
+                            }
+                        }
+                    }
+                    None => 0,
+                };
+                if killed == 0 {
+                    Err(delete_error)
+                } else {
+                    info!(
+                        machine = name.as_str(),
+                        killed, "killed hypervisor left alive by refused delete; retrying"
+                    );
+                    let retried = match self.recovery("delete", &args, self.deadlines.control).await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(VmError::Command { message, .. })
+                            if message.to_ascii_lowercase().contains("not found") =>
+                        {
+                            Ok(())
+                        }
+                        Err(retry_error) => Err(retry_error),
+                    };
+                    if retried.is_ok() {
+                        // The dead hypervisor can leave the layer store
+                        // mounted under the now-removed data directory.
+                        // The sweep shells out to `mount`, `ps`, and `hdiutil`
+                        // synchronously (its CLI caller runs it from `Drop`,
+                        // where no runtime exists), so run it on a blocking
+                        // thread: each call is bounded, and a wedged `hdiutil`
+                        // must not hold a worker either.
+                        match tokio::task::spawn_blocking(detach_orphaned_layer_mounts).await {
+                            Ok(Ok(detached)) if detached > 0 => {
+                                info!(detached, "detached layer mounts after forced delete")
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                warn!(%error, "layer-mount detach after forced delete failed")
+                            }
+                            Err(error) => {
+                                warn!(%error, "layer-mount detach task failed after forced delete")
+                            }
+                        }
+                    }
+                    retried
+                }
+            }
+            ok => ok,
+        };
+        if let Err(error) = result {
+            return Err(self.diagnose_shutdown_refusal(name, error).await);
+        }
+        let mut forked = self.forked_machines.lock().await;
+        forked.remove(name.as_str());
+        // Deleting a golden must evict every clone forked from it. Without
+        // this, a rebaked or recreated golden name would report live
+        // clones forever, silently disabling the re-arm recovery.
+        forked.retain(|_, owner| owner != name.as_str());
+        // The device ledger is diagnostics for a machine that exists: a
+        // deleted name must not keep its inventory (or its memory) around,
+        // and a later machine created under the same name records its own.
+        self.declared_devices.lock().await.remove(name.as_str());
+        Ok(())
+    }
+
+    async fn status(&self, name: &MachineName) -> Result<MachineState, VmError> {
+        let args = [
+            "machine".into(),
+            "status".into(),
+            "--name".into(),
+            name.as_str().into(),
+        ];
+        match self.recovery("status", &args, self.deadlines.probe).await {
+            Ok(output) => {
+                let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+                Ok(if text.contains("running") {
+                    MachineState::Running
+                } else if text.contains("stopped") {
+                    MachineState::Stopped
+                } else {
+                    MachineState::Unknown
+                })
+            }
+            Err(VmError::Command { message, .. })
+                if message.to_ascii_lowercase().contains("not found") =>
+            {
+                Ok(MachineState::Missing)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn list(&self) -> Result<Vec<MachineName>, VmError> {
+        let output = self
+            .recovery(
+                "list",
+                &["machine".into(), "ls".into(), "--json".into()],
+                self.deadlines.probe,
+            )
+            .await?;
+        let values: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| VmError::Protocol(error.to_string()))?;
+        values
+            .as_array()
+            .ok_or_else(|| VmError::Protocol("machine list was not an array".into()))?
+            .iter()
+            .filter_map(|value| value.get("name").and_then(serde_json::Value::as_str))
+            .map(|name| MachineName::new(name.to_owned()))
+            .collect()
+    }
+
+    async fn exec(&self, name: &MachineName, argv: &[String]) -> Result<ExecOutput, VmError> {
+        if argv.is_empty() {
+            return Err(VmError::InvalidSpec("guest command is empty".into()));
+        }
+        let mut args = vec![
+            "machine".into(),
+            "exec".into(),
+            "--name".into(),
+            name.as_str().into(),
+            "--timeout".into(),
+            EXEC_TIMEOUT.into(),
+            "--".into(),
+        ];
+        args.extend_from_slice(argv);
+        self.checked("exec", &args, self.deadlines.exec).await
+    }
+
+    async fn exec_with_secret_env(
+        &self,
+        name: &MachineName,
+        argv: &[String],
+        secrets: &[(String, SecretSource)],
+    ) -> Result<ExecOutput, VmError> {
+        if argv.is_empty() {
+            return Err(VmError::InvalidSpec("guest command is empty".into()));
+        }
+        let mut args = vec![
+            "machine".into(),
+            "exec".into(),
+            "--name".into(),
+            name.as_str().into(),
+            "--timeout".into(),
+            EXEC_TIMEOUT.into(),
+        ];
+        for (guest, source) in secrets {
+            if !is_env_identifier(guest) {
+                return Err(VmError::InvalidSpec(
+                    "secret environment names must be non-empty ASCII identifiers".into(),
+                ));
+            }
+            match source {
+                SecretSource::HostEnv(host) => {
+                    if !is_env_identifier(host) {
+                        return Err(VmError::InvalidSpec(
+                            "secret environment names must be non-empty ASCII identifiers".into(),
+                        ));
+                    }
+                    args.extend(["--secret-env".into(), format!("{guest}={host}")]);
+                }
+                SecretSource::HostFile(path) => {
+                    // SmolVM resolves the path itself; a relative one would be
+                    // read against its working directory, not the caller's.
+                    if !path.is_absolute() {
+                        return Err(VmError::InvalidSpec(
+                            "secret file paths must be absolute".into(),
+                        ));
+                    }
+                    args.extend([
+                        "--secret-file".into(),
+                        format!("{guest}={}", path.display()),
+                    ]);
+                }
+            }
+        }
+        args.push("--".into());
+        args.extend_from_slice(argv);
+        self.checked("exec", &args, self.deadlines.exec).await
+    }
+
+    async fn exec_stream(
+        &self,
+        name: &MachineName,
+        argv: &[String],
+        output: mpsc::Sender<OutputChunk>,
+    ) -> Result<i32, VmError> {
+        if argv.is_empty() {
+            return Err(VmError::InvalidSpec("guest command is empty".into()));
+        }
+        let mut command = self.sandboxed_command()?;
+        command
+            .args(["machine", "exec", "--stream", "--name", name.as_str(), "--"])
+            .args(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|source| VmError::Launch {
+            program: self.binary.display().to_string(),
+            source,
+        })?;
+        stream_output(&mut child, output)
+            .await
+            .map_err(|source| VmError::Launch {
+                program: self.binary.display().to_string(),
+                source,
+            })
+    }
+
+    async fn copy(&self, source: &str, destination: &str) -> Result<(), VmError> {
+        if source.is_empty() || destination.is_empty() {
+            return Err(VmError::InvalidSpec("copy paths cannot be empty".into()));
+        }
+        self.checked(
+            "copy",
+            &[
+                "machine".into(),
+                "cp".into(),
+                source.into(),
+                destination.into(),
+            ],
+            self.deadlines.boot,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn pack(&self, name: &MachineName, output: &Path) -> Result<(), VmError> {
+        if !output.is_absolute() {
+            return Err(VmError::InvalidSpec(
+                "pack output path must be absolute".into(),
+            ));
+        }
+        let staging_dir = output.parent().expect("absolute output has a parent");
+        // smolvm 1.7.2 rejects `-o <name>.smolmachine` and writes the packed
+        // VM data as `<output>.smolmachine` alongside an ELF launcher stub at
+        // `<output>`. Strip the extension so the output path names the stub
+        // and the caller picks up the `<output>.smolmachine` sidecar.
+        let output = if output.extension().is_some_and(|ext| ext == "smolmachine") {
+            output.with_extension("")
+        } else {
+            output.to_path_buf()
+        };
+        let mut args = vec![
+            "pack".into(),
+            "create".into(),
+            "--from-vm".into(),
+            name.as_str().into(),
+        ];
+        if let Some(proxy) = &self.pack_proxy {
+            args.extend(["--proxy".into(), proxy.clone()]);
+        }
+        if let Some(no_proxy) = &self.pack_no_proxy {
+            args.extend(["--no-proxy".into(), no_proxy.clone()]);
+        }
+        // Stage beside the output, not in smolvm's cache dir.
+        //
+        // `pack create` re-pulls the base inside its own export VM and
+        // flushes the extracted layers, the merged layer, the agent rootfs
+        // and an ext4 template to the staging dir: tens of GiB for a
+        // runner-scale image. The default is the smolvm cache dir, which on
+        // CI hosts sits on the small root filesystem — the golden bake died
+        // there with `flushing extracted layers to disk failed (out of
+        // space?)` while the output directory had room to spare. TMPDIR
+        // below does not cover it; smolvm honours `--staging-dir` only.
+        args.extend(["--staging-dir".into(), staging_dir.display().to_string()]);
+        args.extend(["-o".into(), output.display().to_string()]);
+        self.exclusive_with_staging("pack", &args, staging_dir, self.deadlines.pack)
+            .await
+            .map(|_| ())
+    }
+
+    async fn rearm_fork_base(
+        &self,
+        golden: &MachineName,
+        partial: Option<&MachineName>,
+    ) -> Result<bool, VmError> {
+        let fork_lock = self.fork_lock(golden).await;
+        let _fork_guard = fork_lock.lock().await;
+        if let Some(partial) = partial {
+            match self.delete(partial).await {
+                Ok(()) => {}
+                // A failed fork that never registered its clone leaves
+                // nothing to remove; "not found" positively establishes the
+                // clone is gone, which is all the cleanup contract needs.
+                Err(VmError::Command { message, .. })
+                    if message.to_ascii_lowercase().contains("not found") => {}
+                Err(error) => return Err(error),
+            }
+        }
+        {
+            let forked = self.forked_machines.lock().await;
+            if forked.values().any(|owner| owner == golden.as_str()) {
+                return Ok(false);
+            }
+        }
+        match self
+            .concurrent(
+                "stop",
+                &[
+                    "machine".into(),
+                    "stop".into(),
+                    "--name".into(),
+                    golden.as_str().into(),
+                ],
+                self.deadlines.control,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(VmError::Command { message, .. })
+                if message.contains("stop or delete the clones first") =>
+            {
+                // SmolVM's registry knows live clones this process's
+                // in-memory map does not: they may belong to a live lease in
+                // another process or service. Never delete machines this
+                // process cannot prove it owns; fail closed and let the
+                // caller decide.
+                let clones = extract_dependent_clones(&message);
+                warn!(
+                    golden = golden.as_str(),
+                    clones = clones.join(", "),
+                    "re-arm blocked by dependent clones; refusing to delete them"
+                );
+                return Err(VmError::InvalidSpec(format!(
+                    "fork base `{}` still has dependent clones ({}); refusing to delete machines \
+                     this process does not own",
+                    golden.as_str(),
+                    clones.join(", ")
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+        self.concurrent(
+            "start",
+            &[
+                "machine".into(),
+                "start".into(),
+                "--name".into(),
+                golden.as_str().into(),
+                "--forkable".into(),
+            ],
+            self.deadlines.boot,
+        )
+        .await?;
+        Ok(true)
+    }
+}
+
+/// Grace window covering the fork-before-register gap: `machine fork` runs
+/// concurrently with the sweep by design, and smolvm writes the clone's data
+/// dir before the registry row commits, so a brand-new dir is not yet
+/// provably orphaned. It cannot cover a packed create (extraction runs for
+/// minutes longer than this); creates are excluded by the lifecycle lock
+/// instead, for the whole sweep.
+const ORPHAN_DIR_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether `name` is a SmolVM machine data dir: the first 16 lowercase hex
+/// chars of the SHA-256 of the machine name (`vm_dir_hash`). SmolVM keeps its
+/// own node-wide state beside them under `_`-prefixed names — the shared
+/// content-addressed pack store (`_shared/`) every packed machine's
+/// `.pack-shared` lease points into, the restore base (`_restore-base/`) —
+/// precisely so they can never collide with a machine dir (#371).
+fn is_machine_data_dir_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.len() == 16
+            && name
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// Delete machine data dirs under `roots` that are not in `known_dirs` and
+/// are older than `grace`. Only machine data dirs are candidates: anything
+/// else is SmolVM's own state, and deleting the shared pack store left every
+/// packed machine's lease dangling, so forks failed and the direct-create
+/// fallback re-extracted the whole pack per runner (#371).
+///
+/// The caller holds the lifecycle read lock, so no `machine create` or
+/// `machine pack` is running while this scans; `grace` covers `fork` clones
+/// and any other brand-new dir whose registry row has not landed yet.
+/// Synchronous: the sweep runs inside `spawn_blocking` because a leaked VM
+/// dir can be gigabytes of metadata.
+fn sweep_orphaned_dirs(
+    roots: &[PathBuf],
+    known_dirs: &std::collections::BTreeSet<PathBuf>,
+    grace: std::time::Duration,
+) -> Result<usize, VmError> {
+    let mut swept = 0usize;
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_machine_data_dir_name(&entry.file_name())
+                || known_dirs.contains(&path)
+                || !path.is_dir()
+            {
+                continue;
+            }
+            let old_enough = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= grace);
+            if !old_enough {
+                continue;
+            }
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    swept += 1;
+                    info!(path = %path.display(), "removed orphaned machine data dir");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to remove orphaned machine data dir"
+                ),
+            }
+        }
+    }
+    Ok(swept)
+}
+
+/// Clone machine names SmolVM names in its "stop or delete the clones first"
+/// refusal, e.g. `is the fork base for 2 live clone(s) (clone-a, clone-b)`.
+///
+/// The names are the only authoritative list of what still depends on the
+/// frozen base — the pool's own map can be empty after a restart even though
+/// SmolVM's registry kept the clones.
+fn extract_dependent_clones(message: &str) -> Vec<String> {
+    let Some(open) = message.find("live clone(s) (") else {
+        return Vec::new();
+    };
+    let rest = &message[open + "live clone(s) (".len()..];
+    let Some(close) = rest.find(')') else {
+        return Vec::new();
+    };
+    rest[..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether a name is usable as a shell environment variable identifier.
+/// Whether `name` is a valid POSIX environment variable name.
+pub fn is_env_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+// ---------------------------------------------------------------------------
+// VM sandbox environment (seccomp / Landlock / per-VM cgroup)
+// ---------------------------------------------------------------------------
+//
+// SmolVM's `_boot-vm` always hardens the process (no_new_privs, non-dumpable,
+// core limit zero), but its seccomp syscall allowlist and Landlock filesystem
+// confinement are opt-in knobs: `smolvm serve` defaults `SMOLVM_SECCOMP` and
+// `SMOLVM_LANDLOCK` to `enforce`, while the standalone `machine ...` commands
+// Preloop drives do not. Preloop therefore applies the same defaults itself,
+// on Linux, for every invocation that can boot or restart a VM.
+//
+// The upstream convention is preserved: a value the operator already set in
+// the environment wins over the default — exactly what `serve` documents
+// ("a pre-set SMOLVM_SECCOMP env var takes precedence"). Unlike upstream,
+// Preloop validates the pre-set value instead of forwarding garbage: smolvm
+// treats any unrecognized mode as "off", so forwarding a typo would silently
+// boot VMs unconfined. An unrecognized override is a hard error.
+//
+// On non-Linux hosts both controls are no-ops upstream (Landlock is a Linux
+// LSM; the seccomp filter installs only on Linux), so nothing is injected and
+// macOS behavior is unchanged.
+//
+// The per-VM cgroup root is separate, because claiming one *writes* to the
+// cgroup hierarchy. Only a supervisor may do that, and only once, through
+// [`init_vm_cgroup_delegation`]; every other process (the CLI's `shell`,
+// `machine exec`, `machine cp`) resolves the root read-only and simply goes
+// without caps when there is no usable delegation already in place.
+
+/// How the sandbox policy resolves an operator override. Production passes
+/// [`process_env`]; unit tests pass a pure map so the policy is exercised
+/// without mutating process-global state.
+type EnvLookup = fn(&str) -> Option<String>;
+
+/// The process environment — the production [`EnvLookup`].
+fn process_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// The cgroup v2 root passed to `_boot-vm` as `SMOLVM_CGROUP_ROOT`, resolved
+/// at most once per process. Whichever path runs first wins, so a supervisor
+/// that called [`init_vm_cgroup_delegation`] keeps the delegated root it
+/// established, and every other process observes only what already exists.
+///
+/// `OnceLock`, not `LazyLock`: the initializer is precisely what differs
+/// between the two paths, so it cannot be fixed at the declaration.
+#[cfg(target_os = "linux")]
+static CGROUP_ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Claim the cgroup v2 delegation the per-VM resource caps need.
+///
+/// Call this exactly once, from the supervisor (`preloop serve`) at startup,
+/// before the async runtime spawns the VM pool — it mirrors what `smolvm
+/// serve` does through its own `setup_cgroup_delegation_root`. It is the only
+/// entry point allowed to mutate the cgroup hierarchy: it may create a
+/// `preloop-supervisor` leaf, move this process into it, and enable
+/// `cpu`/`memory`/`pids` distribution on the parent.
+///
+/// That write is what makes the caps exist. systemd's `Delegate=cpu memory
+/// pids` chowns the unit's subtree to the service user and lists the
+/// controllers in `cgroup.controllers`, but leaves `cgroup.subtree_control`
+/// **empty**; a `vm-<pid>` leaf created under it then has no `cpu.max`,
+/// `memory.max` or `pids.max` at all. Enabling the controllers ourselves is
+/// what turns a delegated subtree into one that can actually cap VMs.
+///
+/// Best-effort: any failure leaves the process without a cgroup root, so VMs
+/// boot uncapped rather than not at all. No-op off Linux.
+pub fn init_vm_cgroup_delegation() {
+    #[cfg(target_os = "linux")]
+    {
+        CGROUP_ROOT.get_or_init(delegated_cgroup_root_mutating);
+    }
+}
+
+/// The Linux VM-sandbox environment for a pending SmolVM invocation.
+///
+/// This is the single source of the sandbox policy: the provider applies it
+/// to every command it builds, and the CLI applies it to its direct
+/// `machine exec/cp/shell` calls, which can implicitly boot or restart a
+/// stopped machine. Returns `(variable, value)` pairs plus removals;
+/// non-Linux hosts get an empty list (both controls are no-ops upstream
+/// there).
+///
+/// - Seccomp: default `enforce`; a pre-set operator value
+///   (`enforce`/`audit`/`off`) wins — upstream precedence — but only modes
+///   SmolVM honors pass; anything else is an error rather than the silent
+///   "off" upstream would treat it as.
+/// - Landlock: default `enforce`; pre-set `enforce`/`off` wins, validated.
+/// - Per-VM cgroup: `SMOLVM_CGROUP_ROOT` names whichever root this process
+///   resolved first. In a supervisor that called
+///   [`init_vm_cgroup_delegation`] that is the root it established, writes
+///   included. In every other process it is read-only: the variable is set
+///   only when this process already sits in a cgroup v2 subtree that has
+///   `cpu`/`memory`/`pids` enabled in its `cgroup.subtree_control` and can
+///   host child leaves, and is otherwise **removed from the child
+///   environment** — Preloop is authoritative for all three variables, so an
+///   inherited value (from the operator's environment or a parent service)
+///   never reaches `_boot-vm` with a root we did not validate.
+pub fn smolvm_sandbox_env() -> Result<SandboxEnv, VmError> {
+    sandbox_env_with(process_env)
+}
+
+/// [`smolvm_sandbox_env`] over an explicit environment lookup.
+fn sandbox_env_with(lookup: EnvLookup) -> Result<SandboxEnv, VmError> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut env = sandbox_env_from(lookup)?;
+        // Authoritative: if this process resolved no usable cgroup root, an
+        // inherited SMOLVM_CGROUP_ROOT must be stripped, not merely left unset
+        // (the child would inherit it and _boot-vm would place itself in a
+        // cgroup we never validated).
+        let mut remove = Vec::new();
+        if let Some(root) = CGROUP_ROOT.get_or_init(read_only_cgroup_root) {
+            env.push(("SMOLVM_CGROUP_ROOT".to_owned(), root.display().to_string()));
+        } else {
+            remove.push("SMOLVM_CGROUP_ROOT");
+        }
+        Ok(SandboxEnv { set: env, remove })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = lookup;
+        Ok(SandboxEnv::default())
+    }
+}
+
+/// The sandbox policy as command-environment operations.
+#[derive(Default)]
+pub struct SandboxEnv {
+    /// Variables to set on the child command.
+    pub set: Vec<(String, String)>,
+    /// Variables to strip from the child command's inherited environment.
+    pub remove: Vec<&'static str>,
+}
+
+/// The seccomp/Landlock half of the sandbox policy, over an environment
+/// lookup: defaults to `enforce`, honors a validated operator override, and
+/// rejects any value upstream would silently read as "control off".
+#[cfg(any(target_os = "linux", test))]
+fn sandbox_env_from(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, VmError> {
+    fn invalid(variable: &'static str, value: String, expected: &'static str) -> VmError {
+        VmError::InvalidSandboxEnv {
+            variable,
+            value,
+            expected,
+        }
+    }
+
+    let mut env = Vec::with_capacity(3);
+    match lookup("SMOLVM_SECCOMP") {
+        Some(value) if matches!(value.as_str(), "enforce" | "audit" | "off") => {
+            env.push(("SMOLVM_SECCOMP".to_owned(), value));
+        }
+        Some(value) => {
+            return Err(invalid("SMOLVM_SECCOMP", value, "enforce, audit, or off"));
+        }
+        None => env.push(("SMOLVM_SECCOMP".to_owned(), "enforce".to_owned())),
+    }
+    match lookup("SMOLVM_LANDLOCK") {
+        Some(value) if matches!(value.as_str(), "enforce" | "off") => {
+            env.push(("SMOLVM_LANDLOCK".to_owned(), value));
+        }
+        Some(value) => {
+            return Err(invalid("SMOLVM_LANDLOCK", value, "enforce or off"));
+        }
+        None => env.push(("SMOLVM_LANDLOCK".to_owned(), "enforce".to_owned())),
+    }
+    Ok(env)
+}
+
+/// Apply [`smolvm_sandbox_env`] to a synchronous command (the CLI's direct
+/// `smolvm machine exec/cp/shell` spawns).
+pub fn apply_smolvm_sandbox_env(command: &mut std::process::Command) -> Result<(), VmError> {
+    let sandbox = smolvm_sandbox_env()?;
+    for key in sandbox.remove {
+        command.env_remove(key);
+    }
+    for (key, value) in sandbox.set {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+/// Preloop home the helper isolates SmolVM into: the explicit `PRELOOP_HOME`,
+/// else `<HOME>/.preloop` (the CLI's `preloop_home()` default), else the
+/// bare `.preloop` relative directory.
+/// The Preloop home this process uses (`PRELOOP_HOME`, else `~/.preloop`).
+pub fn effective_preloop_home() -> Option<PathBuf> {
+    std::env::var_os("PRELOOP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".preloop")))
+}
+
+/// Directory SmolVM keeps per-machine data dirs under for the active registry
+/// configuration. On macOS SmolVM derives it from `HOME`
+/// (`<isolated smolvm-home>/Library/Caches/smolvm/vms`) and ignores
+/// `SMOLVM_DATA_DIR` — see `smolvm_runtime_env`, which is why the isolated home
+/// is pushed unconditionally on that platform. Everywhere else
+/// `$SMOLVM_DATA_DIR/vms` wins over the isolated home's `smolvm/vms`.
+/// This is where golden and job-VM disks land, so it is the filesystem
+/// disk-space checks must measure.
+#[cfg(target_os = "macos")]
+pub fn machine_data_root() -> Option<PathBuf> {
+    Some(effective_preloop_home()?.join("smolvm-home/Library/Caches/smolvm/vms"))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn machine_data_root() -> Option<PathBuf> {
+    if let Some(data_dir) = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from) {
+        return Some(data_dir.join("vms"));
+    }
+    effective_preloop_home().map(|home| home.join("smolvm/vms"))
+}
+
+/// Bytes available to an unprivileged writer on the filesystem holding
+/// `path`, measured at its nearest existing ancestor (the target directory may
+/// not exist yet). Uses POSIX `df -Pk`, which every supported host ships, so
+/// no FFI dependency is needed for a `statvfs` call. The tool is killed at
+/// [`PROBE_DEADLINE`]: a wedged mount (a stale network filesystem) must make
+/// the measurement fail, not hang the caller that was only asking for a number.
+pub fn filesystem_available_bytes(path: &Path) -> Result<u64, VmError> {
+    let mut probe = path;
+    while !probe.exists() {
+        probe = probe.parent().ok_or_else(|| {
+            VmError::Protocol(format!("no existing ancestor for {}", path.display()))
+        })?;
+    }
+    let probe_arg = probe.display().to_string();
+    let output = match run_host_tool("df", "df", &["-Pk", &probe_arg], PROBE_DEADLINE) {
+        Ok(output) => output,
+        // The deadline answer names the tool and the deadline; keep it.
+        Err(error @ VmError::TimedOut { .. }) => return Err(error),
+        Err(error) => {
+            return Err(VmError::Protocol(format!("df failed to start: {error}")));
+        }
+    };
+    if !output.success {
+        return Err(VmError::Protocol(format!(
+            "df -Pk {} exited with {}",
+            probe.display(),
+            output.exit_code
+        )));
+    }
+    parse_df_available_kib(&String::from_utf8_lossy(&output.stdout))
+        .map(|kib| kib.saturating_mul(1024))
+        .ok_or_else(|| VmError::Protocol(format!("unparseable df output for {}", probe.display())))
+}
+
+/// `Available` column (KiB) from `df -Pk` output. Located as the field just
+/// before the `Capacity` percentage rather than by fixed index, so a
+/// filesystem or mount name containing spaces cannot shift it.
+fn parse_df_available_kib(output: &str) -> Option<u64> {
+    let line = output.lines().nth(1)?;
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let capacity = fields.iter().position(|field| {
+        field
+            .strip_suffix('%')
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+    })?;
+    fields.get(capacity.checked_sub(1)?)?.parse().ok()
+}
+
+/// Candidate locations for the SmolVM guest agent rootfs, in probe order.
+///
+/// SmolVM keeps its data directory — and the agent rootfs inside it — at the
+/// platform default (`~/Library/Application Support/smolvm` on macOS,
+/// `~/.local/share/smolvm` on Linux) or wherever `SMOLVM_DATA_DIR` points.
+/// Preloop derives its own registry dir from the effective Preloop home and
+/// may isolate the child's `HOME` on macOS, so the REAL host locations must
+/// be probed explicitly or a standard install's agent rootfs is never found
+/// (the isolated HOME sends smolvm to an empty directory).
+///
+/// `binary` adds the rootfs that ships next to the resolved smolvm, which is
+/// the only copy guaranteed to match it. On Linux it leads (see
+/// [`agent_rootfs::resolve_exported_rootfs`]) so a stale data-dir copy can
+/// never override the agent that shipped with the binary; elsewhere it is
+/// appended, keeping the layouts the platform installers established.
+fn agent_rootfs_candidates(
+    host_home: Option<&Path>,
+    data_dir: Option<&Path>,
+    binary: Option<&Path>,
+) -> Vec<PathBuf> {
+    let shipped = binary.and_then(agent_rootfs::shipped_rootfs);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "linux")]
+    if let Some(shipped) = &shipped {
+        push_unique(&mut candidates, shipped.clone());
+    }
+    if let Some(data_dir) = data_dir {
+        push_unique(&mut candidates, data_dir.join("agent-rootfs"));
+    }
+    if let Some(home) = host_home {
+        #[cfg(target_os = "macos")]
+        {
+            push_unique(
+                &mut candidates,
+                home.join("Library/Application Support/smolvm/agent-rootfs"),
+            );
+            push_unique(&mut candidates, home.join(".smolvm/agent-rootfs"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            push_unique(
+                &mut candidates,
+                home.join(".local/share/smolvm/agent-rootfs"),
+            );
+            push_unique(&mut candidates, home.join(".smolvm/agent-rootfs"));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(shipped) = shipped {
+        push_unique(&mut candidates, shipped);
+    }
+    candidates
+}
+
+fn push_unique(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if !candidates.contains(&path) {
+        candidates.push(path);
+    }
+}
+
+/// Executable name libkrun's hypervisor shows up as in `ps`.
+const BOOT_VM_PROCESS: &str = "_boot-vm";
+/// Boot config `_boot-vm`'s argv names inside its machine data directory.
+///
+/// smolvm consumes the file while booting — a running machine's directory no
+/// longer contains it — but the path stays in argv for the life of the
+/// process and names the machine's data directory, which is the durable
+/// evidence of whether that machine still exists.
+const BOOT_CONFIG_FILE: &str = "boot-config.json";
+
+/// What a hypervisor's `ps` argv says about its machine data directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineDataState {
+    /// The data directory the argv names still exists, so the machine is
+    /// live: registered, running a job, a golden fork base, or still being
+    /// created.
+    Present,
+    /// The data directory is gone: it was removed from under the hypervisor,
+    /// which still holds that machine's storage descriptors open.
+    Removed,
+    /// No token names a boot config, so nothing can be concluded. Treated as
+    /// live: the mid-flight purge only kills what it can positively identify
+    /// as orphaned, because the other answer is to kill a running machine.
+    Unknown,
+}
+
+/// The [`machine_data_root`] in both the configured and the canonical form.
+///
+/// Everything that identifies this home's machines — `_boot-vm` argv, the
+/// mount table — is matched against a *complete path prefix* of one of these
+/// roots, never as a substring: `/tmp` and `/private/tmp` name the same
+/// directory on macOS, an argv carries whichever the caller passed, and
+/// `mount` prints the canonical one, while a neighboring home whose name
+/// merely shares a prefix (`/homes/smolvm` vs `/homes/smolvm-vm-other`) must
+/// never be claimed as ours.
+fn machine_data_roots() -> Vec<PathBuf> {
+    let Some(root) = machine_data_root() else {
+        return Vec::new();
+    };
+    let mut roots = vec![root.clone()];
+    if let Ok(canonical) = root.canonicalize()
+        && canonical != root
+    {
+        roots.push(canonical);
+    }
+    roots
+}
+
+/// Machine data directory one token's argv names, when it names the boot
+/// config of a machine under one of `roots`.
+///
+/// The boot config is handed to `_boot-vm` as a path, either bare or behind a
+/// flag (`--boot-config=<path>`), optionally quoted. Only a token whose path
+/// is a `boot-config.json` beneath this home's data root decides anything — a
+/// path under any other home (even one whose name this root is a string
+/// prefix of) is not ours to reap.
+fn token_boot_config_dir(token: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates = vec![token];
+    if let Some((_, value)) = token.split_once('=') {
+        candidates.push(value);
+    }
+    for candidate in candidates {
+        let path = Path::new(candidate.trim_matches(['"', '\'']));
+        if !path.is_absolute()
+            || path.file_name().and_then(|name| name.to_str()) != Some(BOOT_CONFIG_FILE)
+        {
+            continue;
+        }
+        let Some(dir) = path.parent() else {
+            continue;
+        };
+        if roots.iter().any(|root| dir.starts_with(root)) {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Machine data directories a `ps` line's argv names, one per token that
+/// carries a boot config under one of `roots`. An argv shape this cannot
+/// parse yields nothing.
+fn boot_config_dirs(line: &str, roots: &[PathBuf]) -> Vec<PathBuf> {
+    line.split_whitespace()
+        .filter_map(|token| token_boot_config_dir(token, roots))
+        .collect()
+}
+
+/// Classify a `ps` line by the machine state its argv names.
+///
+/// The boot config itself is gone once the machine booted, so the directory
+/// is what proves the machine exists.
+fn machine_data_state(line: &str, roots: &[PathBuf]) -> MachineDataState {
+    let dirs = boot_config_dirs(line, roots);
+    if dirs.iter().any(|dir| dir.exists()) {
+        return MachineDataState::Present;
+    }
+    if dirs.is_empty() {
+        MachineDataState::Unknown
+    } else {
+        MachineDataState::Removed
+    }
+}
+
+/// Filesystem form of a path for cross-checking argv against the mount
+/// table: both sides are canonicalized so `/tmp/...` and `/private/tmp/...`
+/// compare equal. A path that cannot be canonicalized (a fixture, an
+/// already-removed directory) is compared as written.
+fn canonical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Suffix of a SmolVM layer-store mount point: the machine data directory
+/// plus `pack/layers-cs`.
+#[cfg(any(target_os = "macos", test))]
+const LAYER_STORE_MOUNT_SUFFIX: &str = "/pack/layers-cs";
+
+/// Layer-store mounts under one of this home's machine data roots, each with
+/// the machine data directory it belongs to.
+///
+/// macOS mounts a packed machine's `pack/layers-cs` APFS sparseimage inside
+/// the machine's data directory while the machine runs (`machine start`) and
+/// detaches it on `stop`/`delete`. `mount` prints
+/// `<device> on <mount point> (<options>)`; a mount point that is not a layer
+/// store beneath one of the roots (a nested home, a neighboring home whose
+/// name overlaps at a path component) is not ours to touch.
+#[cfg(any(target_os = "macos", test))]
+fn layer_store_mounts(roots: &[PathBuf], mount_table: &str) -> Vec<(PathBuf, PathBuf)> {
+    let mut mounts = Vec::new();
+    for line in mount_table.lines() {
+        let Some((_, rest)) = line.split_once(" on ") else {
+            continue;
+        };
+        let Some((path, _)) = rest.rsplit_once(" (") else {
+            continue;
+        };
+        let path = path.trim();
+        if !path.starts_with('/') {
+            continue;
+        }
+        let Some(dir) = path.strip_suffix(LAYER_STORE_MOUNT_SUFFIX) else {
+            continue;
+        };
+        let dir = Path::new(dir);
+        if !roots.iter().any(|root| dir.starts_with(root)) {
+            continue;
+        }
+        mounts.push((PathBuf::from(path), dir.to_path_buf()));
+    }
+    mounts
+}
+
+/// Layer-store mounts no live hypervisor is using.
+///
+/// What remains after a hypervisor died without a `stop`/`delete`: an engine
+/// killed mid-teardown, a mutation that deleted the smolvm registry out from
+/// under a running VM, or a SIGKILL purge. A mount whose machine data
+/// directory still has a `_boot-vm` process is live and must be left alone.
+#[cfg(any(target_os = "macos", test))]
+fn orphan_layer_store_mounts(
+    roots: &[PathBuf],
+    ps_output: &str,
+    mount_table: &str,
+) -> Vec<PathBuf> {
+    let live: std::collections::BTreeSet<PathBuf> = ps_output
+        .lines()
+        .filter(|line| line.contains(BOOT_VM_PROCESS))
+        .flat_map(|line| boot_config_dirs(line, roots))
+        .map(|dir| canonical_path(&dir))
+        .collect();
+    layer_store_mounts(roots, mount_table)
+        .into_iter()
+        .filter(|(_, dir)| !live.contains(&canonical_path(dir)))
+        .map(|(mount, _)| mount)
+        .collect()
+}
+
+/// Detach layer-store mounts this Preloop home's machines left behind.
+///
+/// A hypervisor killed out-of-band — the crash-purge's SIGKILL, an engine
+/// that exited mid-teardown — leaves its `pack/layers-cs` sparseimage
+/// mounted: the mount outlives the process that made it, and `machine
+/// delete` can no longer reach a machine whose registry row is gone. The
+/// directory then cannot be removed (`Resource busy`), so the documented way
+/// to reset a home fails.
+///
+/// Safe to call while the engine serves: a mount with a live hypervisor is
+/// skipped, and `hdiutil` refuses to detach a busy volume, so a running
+/// machine is never disturbed. A mount `hdiutil` refuses is left in place
+/// (its hypervisor may have started between the scan and the detach). No-op
+/// where the layer store is not a host mount.
+///
+/// Every tool it runs (`/sbin/mount`, `ps`, `hdiutil`) is bounded by
+/// [`PROBE_DEADLINE`]: `hdiutil` sits in the kernel waiting on a volume that
+/// may never answer, and this runs from `delete` and from teardown paths (an
+/// engine exit, a CLI `Drop`) where a hang is the one outcome nobody can
+/// recover from. It stays synchronous because those callers have no runtime to
+/// await on; the engine calls it on a blocking thread.
+pub fn detach_orphaned_layer_mounts() -> Result<usize, VmError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(0)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let roots = machine_data_roots();
+        if roots.is_empty() {
+            return Ok(0);
+        }
+        // launchd's PATH has no /sbin, so the mount table tool is named absolutely.
+        let mounts = run_host_tool("mount", "/sbin/mount", &[], PROBE_DEADLINE)?;
+        let mount_table = complete_inventory("/sbin/mount", &mounts)?;
+        detach_orphaned_layer_mounts_in(&roots, &mount_table)
+    }
+}
+
+/// The scan → decide → detach pass over one `mount` table, split from the
+/// shell-out above so a test can drive it with a fixture table.
+#[cfg(target_os = "macos")]
+fn detach_orphaned_layer_mounts_in(roots: &[PathBuf], mount_table: &str) -> Result<usize, VmError> {
+    let ps = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
+    let process_table = complete_inventory("ps", &ps)?;
+    let mut detached = 0usize;
+    for mount in orphan_layer_store_mounts(roots, &process_table, mount_table) {
+        let mount_arg = mount.display().to_string();
+        match run_host_status(
+            "hdiutil detach",
+            "hdiutil",
+            &["detach", "-quiet", &mount_arg],
+            PROBE_DEADLINE,
+        ) {
+            Ok(output) if output.status.success() => {
+                detached += 1;
+                info!(mount = %mount.display(), "detached orphaned SmolVM layer mount");
+            }
+            Ok(output) => warn!(
+                mount = %mount.display(),
+                exit_code = output.status.code().unwrap_or(-1),
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "hdiutil detach refused; leaving the layer mount in place"
+            ),
+            Err(error @ VmError::TimedOut { .. }) => warn!(
+                mount = %mount.display(),
+                %error,
+                "hdiutil detach did not answer; leaving the layer mount in place"
+            ),
+            Err(error) => warn!(
+                mount = %mount.display(),
+                %error,
+                "hdiutil detach failed or hit its deadline; leaving the layer mount in place"
+            ),
+        }
+    }
+    Ok(detached)
+}
+
+/// Which `_boot-vm` hypervisors a [`purge_orphaned_vms`] call may kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanPurge {
+    /// Every hypervisor whose argv names this Preloop home's data root.
+    ///
+    /// Only safe where nothing of ours can be running: pool startup, after
+    /// the stale machines have been deleted, and shutdown.
+    All,
+    /// Only hypervisors whose machine data directory is already gone — the
+    /// directory the `boot-config.json` in their argv names no longer exists.
+    ///
+    /// Safe while the engine is serving. A registered machine, a running job
+    /// VM, a golden fork base, and a create in flight all have their data
+    /// directory on disk (smolvm writes the directory before it launches the
+    /// hypervisor that reads its config out of it), so none of them can
+    /// match. What does match is a hypervisor holding storage descriptors for
+    /// files nothing can reach again, which is exactly the leak a failed
+    /// `machine delete` leaves behind.
+    RemovedDataDir,
+}
+
+/// Kill any lingering SmolVM `_boot-vm` hypervisor processes whose machine
+/// state lives under this Preloop home's machine data root.
+///
+/// A server death (crash, OOM, SIGKILL) orphans the detached `_boot-vm`
+/// processes: the CLI flow detaches them (the parent-death watchdog is
+/// off by design), and only the in-VM agent or an explicit `machine stop`
+/// can shut them down. If the machine's data directory is then removed out
+/// from under the live VM (a home cleanup), the smolvm database no longer
+/// knows the machine, so `machine delete` cannot reach it — the `_boot-vm`
+/// keeps the storage file descriptors open and the unlinked blocks leak
+/// until the process exits. The `_boot-vm` argv names its
+/// `boot-config.json` under the data dir, so orphaned processes are
+/// identifiable by path: only a token naming a boot config under one of
+/// [`machine_data_roots`] makes a process ours — a neighboring home whose
+/// path merely shares a prefix is never matched.
+///
+/// `scope` decides which of those processes may be killed; see
+/// [`OrphanPurge`]. Called at pool startup (crash recovery, `All`) and on an
+/// interval while the pool serves (`RemovedDataDir`). Returns the number of
+/// processes killed.
+///
+/// Both host tools it runs (`ps`, `kill`) are bounded by [`PROBE_DEADLINE`]:
+/// this is called from the pool's reconcile loop, where a wedged `ps` on a
+/// thrashing host must not stall the tick that also sweeps data dirs. A tool
+/// that runs out of time is reported; the next tick retries. A `ps` table the
+/// capture cap cut short is reported the same way rather than swept as if it
+/// were complete (see [`complete_inventory`]).
+pub fn purge_orphaned_vms(scope: OrphanPurge) -> Result<usize, VmError> {
+    let roots = machine_data_roots();
+    if roots.is_empty() {
+        return Ok(0);
+    }
+    let output = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
+    let text = complete_inventory("ps", &output)?;
+    let mut killed = 0usize;
+    for line in text.lines() {
+        if !line.contains(BOOT_VM_PROCESS) {
+            continue;
+        }
+        // Anything whose machine data directory still exists may be live:
+        // spare it rather than kill a machine that is registered, running a
+        // job, or still being created. See `OrphanPurge::RemovedDataDir`.
+        match machine_data_state(line, &roots) {
+            MachineDataState::Unknown => continue,
+            MachineDataState::Present if scope == OrphanPurge::RemovedDataDir => continue,
+            MachineDataState::Present | MachineDataState::Removed => {}
+        }
+        let Some(pid) = line
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 0 {
+            continue;
+        }
+        // SIGKILL: the machine is unreachable through smolvm (no record, or
+        // an unresponsive agent) — the hypervisor process must die to
+        // release the storage fds.
+        let pid_arg = pid.to_string();
+        let status = run_host_status("kill", "kill", &["-9", &pid_arg], PROBE_DEADLINE);
+        if matches!(status, Ok(output) if output.status.success()) {
+            killed += 1;
+        }
+    }
+    Ok(killed)
+}
+
+/// SIGKILL every `_boot-vm` hypervisor whose boot config lives in `data_dir`.
+///
+/// The escalation for a refused `machine delete -f`: smolvm declines to stop
+/// a guest whose agent cannot confirm a safe shutdown and "leaves the VM
+/// alive for retry", but nothing retries — the hypervisor keeps the
+/// machine's `storage.raw`/`overlay.raw` descriptors open (and its
+/// `pack/layers-cs` mount on macOS) until it dies. Attribution is the argv
+/// boot-config path compared against the canonical data directory, so only
+/// this machine's own hypervisor matches; a process whose argv names no
+/// boot config under [`machine_data_roots`] is never touched. Returns the
+/// number of processes killed.
+fn kill_vm_processes_in(data_dir: &Path) -> Result<usize, VmError> {
+    let roots = machine_data_roots();
+    if roots.is_empty() {
+        return Ok(0);
+    }
+    let target = canonical_path(data_dir);
+    let output = run_host_tool("ps", "ps", &["ax", "-o", "pid=,command="], PROBE_DEADLINE)?;
+    let text = complete_inventory("ps", &output)?;
+    // Attribute by the boot-config path as written in argv, not by splitting
+    // argv on whitespace: `ps` prints the command verbatim, so a data root
+    // containing spaces (an operator's PRELOOP_HOME, a worktree path) would
+    // shred the token a whitespace split looks for. Data dirs are
+    // hash-unique, so the literal `…/boot-config.json` match cannot collide
+    // with another machine's argument.
+    let mut needles = Vec::new();
+    for dir in [&target, data_dir] {
+        let needle = format!("{}/{}", dir.display(), BOOT_CONFIG_FILE);
+        if !needles.contains(&needle) {
+            needles.push(needle);
+        }
+    }
+    let mut killed = 0usize;
+    for line in text.lines() {
+        if !line.contains(BOOT_VM_PROCESS) {
+            continue;
+        }
+        let attributed = needles.iter().any(|needle| line.contains(needle))
+            || boot_config_dirs(line, &roots)
+                .iter()
+                .any(|dir| canonical_path(dir) == target);
+        if !attributed {
+            continue;
+        }
+        let Some(pid) = line
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 0 {
+            continue;
+        }
+        let pid_arg = pid.to_string();
+        let status = run_host_status("kill", "kill", &["-9", &pid_arg], PROBE_DEADLINE);
+        if matches!(status, Ok(output) if output.status.success()) {
+            killed += 1;
+        }
+    }
+    Ok(killed)
+}
+
+/// SmolVM phrasings that mean the guest agent could not confirm a safe
+/// shutdown, so the machine was left running.
+///
+/// Upstream's current wording is "running guest agent does not support safe
+/// shutdown; VM left unchanged; update the guest agent before retrying"; the
+/// pre-1.16 agents fail one layer later, in the storage sync step, with "guest
+/// did not confirm filesystem synchronization; left the VM alive for retry".
+const SHUTDOWN_REFUSAL_MARKERS: &[&str] = &[
+    "does not support safe shutdown",
+    "did not confirm filesystem synchronization",
+];
+
+/// Whether an error message is SmolVM's refusal to stop a guest agent whose
+/// capabilities it cannot trust.
+fn is_shutdown_refusal(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    SHUTDOWN_REFUSAL_MARKERS
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+/// Declared-size ceiling for SmolVM pack extraction (512 GiB): above the
+/// official golden's sparse disk sizes, still finite.
+const PACK_MAX_EXTRACT_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+
+fn smolvm_runtime_env(binary: Option<&Path>) -> Vec<(String, std::ffi::OsString)> {
+    let host_home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut env = Vec::new();
+    let explicit_data_dir = std::env::var_os("SMOLVM_DATA_DIR").map(PathBuf::from);
+    let data_dir = explicit_data_dir
+        .clone()
+        .or_else(|| effective_preloop_home().map(|home| home.join("smolvm")));
+    // SmolVM 1.8.x ignores SMOLVM_DATA_DIR on macOS and derives its registry
+    // from HOME. Keep each Preloop home isolated whether or not
+    // SMOLVM_DATA_DIR is set, so every engine finds its own machines under
+    // `<home>/smolvm-home` and never a foreign registry — `machine_data_root`
+    // resolves the same directory on that platform.
+    #[cfg(target_os = "macos")]
+    if let Some(preloop_home) = effective_preloop_home() {
+        env.push((
+            "HOME".to_owned(),
+            preloop_home.join("smolvm-home").into_os_string(),
+        ));
+    }
+    if explicit_data_dir.is_none()
+        && let Some(data_dir) = &data_dir
+    {
+        env.push((
+            "SMOLVM_DATA_DIR".to_owned(),
+            data_dir.clone().into_os_string(),
+        ));
+    }
+
+    // HOME may be isolated above, so preserve the host installation assets
+    // explicitly for the child SmolVM process: the agent rootfs lives in the
+    // REAL host's platform data dir, which the isolated HOME would miss. The
+    // rootfs that ships next to the resolved binary outranks a data-dir copy
+    // that disagrees with it, so a stale copy can never pin an old guest
+    // agent (see [`agent_rootfs`]).
+    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_none()
+        && let Some(path) =
+            agent_rootfs::exported_rootfs_cached(&agent_rootfs::Runtime::from_env(), binary)
+    {
+        env.push(("SMOLVM_AGENT_ROOTFS".to_owned(), path.into_os_string()));
+    }
+
+    // smolvm caps a pack extraction at 128 GiB of *header-declared* size, so
+    // the official golden's sparse disks (declared far beyond what they
+    // allocate) fail every unpack with "tar archive exceeds max total size"
+    // (#371). The packs Preloop extracts are digest- or checksum-verified
+    // before use, so the bomb guard only needs to stay finite. An operator
+    // value wins.
+    if std::env::var_os("SMOLVM_PACK_MAX_EXTRACT_BYTES").is_none() {
+        env.push((
+            "SMOLVM_PACK_MAX_EXTRACT_BYTES".to_owned(),
+            PACK_MAX_EXTRACT_BYTES.to_string().into(),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = Vec::new();
+        if let Some(path) = std::env::var_os("SMOLVM_LIB_DIR") {
+            candidates.push(PathBuf::from(path));
+        }
+        if let Some(binary) = binary {
+            let resolved = binary
+                .canonicalize()
+                .ok()
+                .or_else(|| binary.is_absolute().then(|| binary.to_path_buf()));
+            if let Some(parent) = resolved.and_then(|path| path.parent().map(Path::to_path_buf)) {
+                candidates.push(parent.join("lib"));
+            }
+        }
+        if let Some(home) = host_home {
+            candidates.push(home.join(".smolvm/lib"));
+        }
+        let Some(lib_dir) = candidates
+            .into_iter()
+            .find(|path| path.join("libkrunfw.5.dylib").is_file())
+        else {
+            return env;
+        };
+        let mut paths = vec![lib_dir];
+        if let Some(existing) = std::env::var_os("DYLD_LIBRARY_PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(loader_path) = std::env::join_paths(paths) {
+            env.push(("DYLD_LIBRARY_PATH".to_owned(), loader_path));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = binary;
+    }
+    env
+}
+
+/// Add the bundled SmolVM libraries to boot-capable child commands on macOS.
+///
+/// The macOS release binary dynamically loads `libkrunfw.5.dylib` from the
+/// adjacent `.smolvm/lib` directory, but the binary has no rpath and the
+/// bootstrap process does not inherit a loader path from the installer.
+/// Without this, `machine create` succeeds and every subsequent VM start
+/// fails at the Hypervisor.framework boundary. An explicit `SMOLVM_LIB_DIR`
+/// wins; otherwise use the resolved binary's sibling directory or the
+/// standard per-user install location.
+/// Directories derived from the effective Preloop home that must exist before
+/// SmolVM starts (it does not create a missing data dir itself).
+fn runtime_dirs_to_create() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if std::env::var_os("SMOLVM_DATA_DIR").is_none()
+        && let Some(home) = effective_preloop_home()
+    {
+        dirs.push(home.join("smolvm"));
+    }
+    // SmolVM derives its registry from HOME on macOS regardless of
+    // SMOLVM_DATA_DIR (see `smolvm_runtime_env`), so the isolated smolvm home
+    // must always exist.
+    #[cfg(target_os = "macos")]
+    if let Some(home) = effective_preloop_home() {
+        dirs.push(home.join("smolvm-home"));
+    }
+    dirs
+}
+
+/// Add the bundled SmolVM libraries to boot-capable child commands on macOS.
+///
+/// The macOS release binary dynamically loads `libkrunfw.5.dylib` from the
+/// adjacent `.smolvm/lib` directory, but the binary has no rpath and the
+/// bootstrap process does not inherit a loader path from the installer.
+/// Without this, `machine create` succeeds and every subsequent VM start
+/// fails at the Hypervisor.framework boundary. An explicit `SMOLVM_LIB_DIR`
+/// wins; otherwise use the resolved binary's sibling directory or the
+/// standard per-user install location.
+pub fn apply_smolvm_runtime_env(
+    command: &mut std::process::Command,
+    binary: Option<&Path>,
+) -> Result<(), VmError> {
+    for dir in runtime_dirs_to_create() {
+        std::fs::create_dir_all(&dir).map_err(|source| VmError::RuntimeIo { source })?;
+    }
+    for (key, value) in smolvm_runtime_env(binary) {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+fn apply_smolvm_runtime_env_async(
+    command: &mut Command,
+    binary: Option<&Path>,
+) -> Result<(), VmError> {
+    for dir in runtime_dirs_to_create() {
+        std::fs::create_dir_all(&dir).map_err(|source| VmError::RuntimeIo { source })?;
+    }
+    for (key, value) in smolvm_runtime_env(binary) {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+/// Apply the sandbox policy to a provider command.
+#[cfg(target_os = "linux")]
+fn apply_sandbox_env(command: &mut Command, lookup: EnvLookup) -> Result<(), VmError> {
+    let sandbox = sandbox_env_with(lookup)?;
+    for key in sandbox.remove {
+        command.env_remove(key);
+    }
+    for (key, value) in sandbox.set {
+        command.env(key, value);
+    }
+    Ok(())
+}
+
+/// Non-Linux: seccomp and Landlock are no-ops upstream; nothing to set.
+#[cfg(not(target_os = "linux"))]
+fn apply_sandbox_env(_command: &mut Command, _lookup: EnvLookup) -> Result<(), VmError> {
+    Ok(())
+}
+
+/// This process's own cgroup v2 directory, or `None` on a cgroup v1 / hybrid
+/// host (no unified `0::` line). Mirrors upstream's `cgroup_v2_self_dir`.
+#[cfg(target_os = "linux")]
+fn process_cgroup_dir() -> Option<PathBuf> {
+    // Not cgroup v2 (no unified hierarchy).
+    if !Path::new("/sys/fs/cgroup/cgroup.controllers").is_file() {
+        return None;
+    }
+    let rel = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim()
+        .to_owned();
+    if rel.is_empty() {
+        return None;
+    }
+    Some(cgroup_root_dir(&rel))
+}
+
+/// Resolve a cgroup v2 root without changing anything in the hierarchy: the
+/// answer for every process that is not the supervisor. `None` means no
+/// usable delegation, so VMs run without host resource caps (the seccomp and
+/// Landlock variables are unaffected).
+#[cfg(target_os = "linux")]
+fn read_only_cgroup_root() -> Option<PathBuf> {
+    process_cgroup_dir().filter(|root| is_usable_delegation_read_only(root))
+}
+
+/// Resolve a cgroup v2 root, establishing the delegation when one is missing
+/// and this process is privileged enough to create it. Supervisor-only — see
+/// [`init_vm_cgroup_delegation`], the sole caller.
+#[cfg(target_os = "linux")]
+fn delegated_cgroup_root_mutating() -> Option<PathBuf> {
+    let root = process_cgroup_dir()?;
+    // Already delegated (e.g. a systemd unit with `Delegate=cpu memory pids`
+    // that also enabled the controllers in `cgroup.subtree_control`):
+    // VMM leaves can be created and capped immediately. The cgroup may hold
+    // this process (controllers were enabled by systemd while it was empty),
+    // which is fine — the no-internal-process rule only constrains enabling,
+    // not hosting children — but the root must actually accept child leaves:
+    // an unprivileged process in an undelegated cgroup must not be handed a
+    // root whose `vm-<pid>` leaf creation would silently fail.
+    if is_usable_delegation_read_only(&root) {
+        return Some(root);
+    }
+    // The controllers are not distributed yet, but this process may be able
+    // to enable them itself (a root supervisor, or a systemd unit with
+    // `Delegate=` — which chowns the subtree to the service user yet leaves
+    // `cgroup.subtree_control` empty, so without this write the per-VM
+    // leaves get no `cpu.max`/`memory.max`/`pids.max` at all). The kernel
+    // only accepts a `cgroup.subtree_control` write on a cgroup with no
+    // member processes, so move into a leaf first — upstream's
+    // `setup_cgroup_delegation_root` does exactly this.
+    // Any failure means no delegation: caps are skipped, never fatal.
+    let leaf = root.join("preloop-supervisor");
+    let pid = std::process::id().to_string();
+    // A leaf left behind by an earlier run is fine — an empty cgroup still
+    // accepts new members, and re-enabling already-enabled controllers is a
+    // no-op, so only the two writes matter.
+    let _ = std::fs::create_dir(&leaf);
+    let ok = fs_write(&leaf.join("cgroup.procs"), &pid)
+        && fs_write(&root.join("cgroup.subtree_control"), "+cpu +memory +pids")
+        && can_host_child_leaf(&root);
+    ok.then_some(root)
+}
+
+/// Whether `root` is a delegation Preloop can actually cap VMs with, using
+/// only reads: the controllers are distributed to children and the current
+/// user can create a child leaf.
+///
+/// Deliberately non-mutating. This predicate runs on the read-only path used
+/// by `preloop shell` and the debug session, which must never write to the
+/// cgroup hierarchy; the mutating probe below is confined to the
+/// supervisor's delegation setup where a write is already expected.
+#[cfg(target_os = "linux")]
+fn is_usable_delegation_read_only(root: &Path) -> bool {
+    cgroup_controllers_enabled(root) && can_create_child_leaf(root)
+}
+
+/// Whether the current user can create a child cgroup directory under `root`
+/// without creating anything. A directory may be writable/executable while
+/// the cgroup filesystem still refuses `mkdir` — under systemd delegation
+/// the subtree is chowned to the service user, and `CGROUP_DELEGATE` file
+/// ownership is what actually authorizes child creation — so this checks
+/// write+execute permission on the directory (the closest read-only proxy)
+/// rather than assuming.
+#[cfg(target_os = "linux")]
+fn can_create_child_leaf(root: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(root) else {
+        return false;
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let mode = metadata.permissions().mode();
+    // Owner w+x for the owner, group w+x for the group, other w+x for the
+    // rest — exactly the permissions `mkdir` requires of the parent.
+    let owner_wx = mode & 0o300 == 0o300;
+    let group_wx = mode & 0o030 == 0o030;
+    let other_wx = mode & 0o003 == 0o003;
+    owner_wx || group_wx || other_wx
+}
+
+/// The cgroup can host `_boot-vm`'s `vm-<pid>` child leaves, proven by
+/// actually creating and removing a probe leaf. Supervisor-only: this is a
+/// write, so it must never run on the read-only CLI path.
+///
+/// The probe leaf is removed again; a leaf that cannot be removed is not a
+/// usable root either, and reporting `false` keeps `.preloop-probe` from
+/// being left behind on a path that claims success.
+#[cfg(target_os = "linux")]
+fn can_host_child_leaf(root: &Path) -> bool {
+    let probe = root.join(".preloop-probe");
+    std::fs::create_dir(&probe)
+        .and_then(|()| std::fs::remove_dir(&probe))
+        .is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn fs_write(path: &Path, value: &str) -> bool {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(value.as_bytes()))
+        .is_ok()
+}
+
+/// Whether `dir/cgroup.subtree_control` enables the controllers Preloop caps
+/// on (`cpu`, `memory`, `pids`) — the kernel's record of a delegation.
+///
+/// Accepts both readback spellings seen in the wild: `+cpu +memory +pids`
+/// (sign-prefixed) and `cpu memory pids` (bare). A `-`-prefixed controller
+/// is disabled either way.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_controllers_enabled(dir: &Path) -> bool {
+    let Ok(control) = std::fs::read_to_string(dir.join("cgroup.subtree_control")) else {
+        return false;
+    };
+    let enabled: std::collections::HashSet<&str> = control
+        .split_whitespace()
+        .filter_map(|token| match token.strip_prefix('-') {
+            Some(_) => None,
+            None => Some(token.strip_prefix('+').unwrap_or(token)),
+        })
+        .collect();
+    enabled.contains("cpu") && enabled.contains("memory") && enabled.contains("pids")
+}
+
+/// Map a `/proc/self/cgroup` v2 entry to the on-disk cgroup directory.
+///
+/// The file prints `0::/system.slice/preloop.service` — an absolute-looking
+/// path whose leading slash `Path::join` would treat as a fresh root and
+/// discard `/sys/fs/cgroup` — so the slash is trimmed before joining. That
+/// is the whole mapping, exactly as upstream's `cgroup_v2_self_dir` does it:
+/// the on-disk directory name is the systemd unit name verbatim, `\xHH`
+/// escapes included (`mnt-my\x2ddir.mount` is a real directory; the
+/// unescaped `mnt-my-dir.mount` is not).
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_root_dir(rel: &str) -> PathBuf {
+    Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'))
+}
+
+/// Whether an image declares a usable startup command (entrypoint or cmd).
+///
+/// Registry references and packs carry their own entrypoint/cmd in the image
+/// or pack metadata, so the provider assumes they have one and never overrides
+/// it with the keep-alive workload. A local OCI archive (docker-save `.tar`)
+/// is inspected from its `manifest.json` + config: if the config names neither
+/// an entrypoint nor a cmd, the machine would boot with an empty record and
+/// can fail to start (libkrun EINVAL) once the memory ceiling is raised.
+fn image_has_startup_command(image: &str) -> bool {
+    let path = Path::new(image);
+    if !path.is_file() || image.ends_with(".smolmachine") {
+        return true;
+    }
+    // Docker-save archive: read manifest.json, then the config file it names.
+    let manifest = read_tar_json_member(path, "manifest.json").and_then(|value| {
+        value
+            .get(0)
+            .and_then(|entry| entry.get("Config"))
+            .and_then(|config| config.as_str())
+            .map(str::to_owned)
+    });
+    let Some(config_name) = manifest else {
+        return true;
+    };
+    let Some(config) = read_tar_json_member(path, &config_name) else {
+        return true;
+    };
+    // docker-save nests the image config under `config`; the OCI layout keeps
+    // it at the top level.
+    let config = config.get("config").unwrap_or(&config);
+    let has_entrypoint = config
+        .get("Entrypoint")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|v| !v.is_empty());
+    let has_cmd = config
+        .get("Cmd")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|v| !v.is_empty());
+    has_entrypoint || has_cmd
+}
+
+/// Read and parse one member of a docker-save tar by name (prefix-stripped).
+fn read_tar_json_member(tar_path: &Path, member: &str) -> Option<serde_json::Value> {
+    let Ok(file) = File::open(tar_path) else {
+        return None;
+    };
+    let mut archive = tar::Archive::new(file);
+    let Ok(entries) = archive.entries() else {
+        return None;
+    };
+    let member = member.trim_start_matches("./");
+    for mut entry in entries.flatten() {
+        let Ok(entry_path) = entry.path() else {
+            continue;
+        };
+        if entry_path.to_string_lossy().trim_start_matches("./") == member {
+            let mut raw = Vec::new();
+            if entry.read_to_end(&mut raw).is_err() {
+                return None;
+            }
+            return serde_json::from_slice(&raw).ok();
+        }
+    }
+    None
+}
+
+/// Whether an image string names a packed machine rather than an OCI input.
+///
+/// `.smolmachine` packs and other local files go through `--from`.
+/// Docker-save OCI archives (`.tar`) are image inputs, not packs: smolvm's
+/// `--image` accepts them and sets up virtiofs mounts the same way it does for
+/// registry images, while `--from` machines do not (bare rootfs directories
+/// lose mounts entirely).
+fn is_pack_image(image: &str) -> bool {
+    image.ends_with(".smolmachine") || (Path::new(image).is_file() && !image.ends_with(".tar"))
+}
+
+fn validate_spec(spec: &MachineSpec) -> Result<(), VmError> {
+    if spec.image.trim().is_empty()
+        || spec.cpus == 0
+        || spec.memory_mib < 128
+        || spec.storage_gib == 0
+    {
+        return Err(VmError::InvalidSpec(
+            "image, CPU, memory, and storage must be non-zero".into(),
+        ));
+    }
+    if matches!(
+        spec.role,
+        MachineRole::OfficialPack | MachineRole::CustomPack
+    ) && !is_pack_image(&spec.image)
+    {
+        return Err(VmError::InvalidSpec(format!(
+            "a runtime pack role requires a packed image: {}",
+            spec.image
+        )));
+    }
+    for mount in &spec.volumes {
+        if !mount.host.is_absolute() || !mount.guest.is_absolute() {
+            return Err(VmError::InvalidSpec("volume paths must be absolute".into()));
+        }
+        if !Path::new(&mount.host).exists() {
+            return Err(VmError::InvalidSpec(format!(
+                "volume source does not exist: {}",
+                mount.host.display()
+            )));
+        }
+    }
+    for mount in &spec.sockets {
+        if !mount.host.is_absolute() || !mount.guest.is_absolute() {
+            return Err(VmError::InvalidSpec("socket paths must be absolute".into()));
+        }
+        validate_socket_source(&mount.host)?;
+    }
+    Ok(())
+}
+
+/// A socket mount punches a hole in the guest boundary, so the host path must
+/// be exactly what the caller named: a real socket, reached without traversing
+/// a symlink that could be repointed at another endpoint.
+#[cfg(unix)]
+fn validate_socket_source(host: &Path) -> Result<(), VmError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let symlink_meta = std::fs::symlink_metadata(host).map_err(|error| {
+        VmError::InvalidSpec(format!(
+            "socket source does not exist: {} ({error})",
+            host.display()
+        ))
+    })?;
+    if symlink_meta.file_type().is_symlink() {
+        return Err(VmError::InvalidSpec(format!(
+            "socket source must not be a symlink: {}",
+            host.display()
+        )));
+    }
+    if !symlink_meta.file_type().is_socket() {
+        return Err(VmError::InvalidSpec(format!(
+            "socket source is not a Unix socket: {}",
+            host.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_socket_source(host: &Path) -> Result<(), VmError> {
+    Err(VmError::InvalidSpec(format!(
+        "socket mounts require Unix: {}",
+        host.display()
+    )))
+}
+
+/// Map a shared [`deadline`] failure onto [`VmError`].
+///
+/// The single place a `smolvm`/host-tool wait becomes a provider error, so
+/// every caller names the same dependency and the same deadline: a timeout
+/// keeps [`VmError::TimedOut`] — the operator has to know nothing answered —
+/// and anything else is the launch failure it is.
+fn vm_error_from_command(
+    operation: &'static str,
+    program: &Path,
+    error: deadline::CommandError,
+) -> VmError {
+    match error {
+        deadline::CommandError::TimedOut { exceeded, program } => VmError::TimedOut {
+            operation,
+            program,
+            deadline: exceeded.deadline(),
+        },
+        deadline::CommandError::Spawn { source, .. }
+        | deadline::CommandError::Io { source, .. } => VmError::Launch {
+            program: program.display().to_string(),
+            source,
+        },
+    }
+}
+
+/// Run a runtime command to completion under `deadline`, capturing both streams
+/// bounded by `capture_limit`.
+///
+/// A thin adapter over [`deadline::run_command_capped`], which owns the
+/// mechanics: the pipes are drained with the wait (so a chatty child cannot
+/// block on a full pipe and look hung), the child is SIGKILLed and reaped at the
+/// deadline, and the capture keeps the provider's bound. Callers run under the
+/// lifecycle lock, and a runtime that never answers must not hold it.
+async fn run_runtime_command(
+    operation: &'static str,
+    program: &Path,
+    command: Command,
+    capture_limit: usize,
+    deadline: Duration,
+) -> Result<ExecOutput, VmError> {
+    let what = format!("{operation} ({})", program.display());
+    match deadline::run_command_capped(command, deadline, &what, capture_limit).await {
+        Ok((output, truncated)) => Ok(ExecOutput {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            truncated,
+        }),
+        Err(error) => Err(vm_error_from_command(operation, program, error)),
+    }
+}
+
+/// A host tool's captured output (see [`run_host_tool`]).
+#[derive(Debug)]
+struct HostToolOutput {
+    /// Captured standard output.
+    stdout: Vec<u8>,
+    /// Whether the tool exited zero.
+    success: bool,
+    /// Exit code, or `-1` when the tool died to a signal.
+    exit_code: i32,
+    /// Whether [`HOST_TOOL_CAPTURE_LIMIT`] cut either stream short.
+    ///
+    /// The cap exists to bound engine memory. It must not turn into a silent
+    /// licence to act on half an inventory, so the tools whose output is read
+    /// as a complete table ([`complete_inventory`]) refuse a truncated capture.
+    truncated: bool,
+}
+
+/// Run a host tool to completion under `deadline`, blocking.
+///
+/// A thin adapter over [`deadline::run_command_blocking_capped`], which owns the
+/// mechanics: a reader thread per pipe (so a chatty `ps ax` on a busy host
+/// cannot block on a full pipe and masquerade as a hang), the drain past the
+/// capture cap, and the SIGKILL + bounded reap at the deadline.
+///
+/// `std::process`, not the tokio API: this backs the orphan sweeps
+/// ([`detach_orphaned_layer_mounts`], [`purge_orphaned_vms`],
+/// [`filesystem_available_bytes`]), which the CLI calls from a `Drop` handler
+/// where no runtime exists. Engine callers run them on a blocking thread
+/// ([`tokio::task::spawn_blocking`]), never on a worker.
+fn run_host_tool(
+    operation: &'static str,
+    program: &str,
+    args: &[&str],
+    deadline: Duration,
+) -> Result<HostToolOutput, VmError> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    let what = format!("{operation} ({program})");
+    match deadline::run_command_blocking_capped(command, deadline, &what, HOST_TOOL_CAPTURE_LIMIT) {
+        Ok((output, truncated)) => Ok(HostToolOutput {
+            stdout: output.stdout,
+            success: output.status.success(),
+            exit_code: output.status.code().unwrap_or(-1),
+            truncated,
+        }),
+        Err(error) => Err(vm_error_from_command(operation, Path::new(program), error)),
+    }
+}
+
+/// Run a host tool whose exit status is all that matters, under `deadline`.
+///
+/// `kill` and `hdiutil detach` print nothing a caller parses; the shared
+/// blocking runner still drains their pipes and kills them at the deadline.
+fn run_host_status(
+    operation: &'static str,
+    program: &str,
+    args: &[&str],
+    deadline: Duration,
+) -> Result<std::process::Output, VmError> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    let what = format!("{operation} ({program})");
+    deadline::run_command_blocking(command, deadline, &what)
+        .map_err(|error| vm_error_from_command(operation, Path::new(program), error))
+}
+
+/// The complete standard output of an inventory tool, or the error that says
+/// the capture cap cut it short.
+///
+/// `ps ax` and `/sbin/mount` are read as the whole host — every later parser
+/// derives "no such process" or "not mounted" from their absence. A truncated
+/// capture would hide every entry after the cutoff, and the sweep would report
+/// success over an inventory it never saw. The cap bounds memory; it is not a
+/// licence to act on half a table, so a truncated one fails the tick loudly and
+/// the next tick retries.
+fn complete_inventory(tool: &'static str, output: &HostToolOutput) -> Result<String, VmError> {
+    if output.truncated {
+        return Err(VmError::Protocol(format!(
+            "{tool} wrote more than the {HOST_TOOL_CAPTURE_LIMIT}-byte capture limit; \
+             refusing to sweep from a truncated inventory"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn forward(
+    mut reader: impl AsyncRead + Unpin,
+    output: mpsc::Sender<OutputChunk>,
+    stdout: bool,
+) -> std::io::Result<()> {
+    let mut chunk = vec![0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        let value = if stdout {
+            OutputChunk::Stdout(chunk[..read].to_vec())
+        } else {
+            OutputChunk::Stderr(chunk[..read].to_vec())
+        };
+        if output.send(value).await.is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// Forward a child's piped stdout and stderr to `output` and return its exit
+/// code.
+///
+/// Shared by every provider's streaming exec: both readers are drained
+/// concurrently with the wait, so a child that fills one pipe while the other
+/// stays idle cannot deadlock, and a dropped receiver ends forwarding without
+/// killing the child.
+pub async fn stream_output(
+    child: &mut tokio::process::Child,
+    output: mpsc::Sender<OutputChunk>,
+) -> std::io::Result<i32> {
+    let stdout = forward(
+        child.stdout.take().expect("piped stdout"),
+        output.clone(),
+        true,
+    );
+    let stderr = forward(child.stderr.take().expect("piped stderr"), output, false);
+    let (stdout, stderr, status) = tokio::join!(stdout, stderr, child.wait());
+    stdout?;
+    stderr?;
+    Ok(status?.code().unwrap_or(-1))
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod tests {
+
+    /// Serializes the tests that rewrite `PRELOOP_HOME`: `purge_orphaned_vms`
+    /// resolves the Preloop home from the process environment, so two of them
+    /// running concurrently would purge each other's scratch home.
+    static PRELOOP_HOME_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Sets `PRELOOP_HOME` for the test's scope and restores it on drop.
+    struct PreloopHomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl PreloopHomeGuard {
+        fn set(home: &std::path::Path) -> Self {
+            let previous = std::env::var_os("PRELOOP_HOME");
+            // SAFETY: single-threaded test section under `PRELOOP_HOME_LOCK`.
+            unsafe { std::env::set_var("PRELOOP_HOME", home) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for PreloopHomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                // SAFETY: single-threaded test section under `PRELOOP_HOME_LOCK`.
+                Some(value) => unsafe { std::env::set_var("PRELOOP_HOME", value) },
+                None => unsafe { std::env::remove_var("PRELOOP_HOME") },
+            }
+        }
+    }
+
+    /// Point the guest-agent guard at an empty rootfs for this test's scope.
+    ///
+    /// The guard inspects the host's real smolvm installation when a fake
+    /// binary has no sibling rootfs, so a machine with a stale installed agent
+    /// would refuse every fake-smolvm test for a reason the test is not about.
+    /// An operator-set `SMOLVM_AGENT_ROOTFS` wins over every candidate, and an
+    /// empty one holds no agent, which the guard allows (with a warning).
+    /// Restored on drop; callers hold [`PRELOOP_HOME_LOCK`].
+    struct AgentRootfsGuard {
+        previous: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl AgentRootfsGuard {
+        fn set() -> Self {
+            let dir = tempfile::tempdir().expect("agent rootfs scratch");
+            let previous = std::env::var_os("SMOLVM_AGENT_ROOTFS");
+            // SAFETY: single-threaded test section under `PRELOOP_HOME_LOCK`.
+            unsafe { std::env::set_var("SMOLVM_AGENT_ROOTFS", dir.path()) };
+            Self {
+                previous,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for AgentRootfsGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                // SAFETY: single-threaded test section under `PRELOOP_HOME_LOCK`.
+                Some(value) => unsafe { std::env::set_var("SMOLVM_AGENT_ROOTFS", value) },
+                None => unsafe { std::env::remove_var("SMOLVM_AGENT_ROOTFS") },
+            }
+        }
+    }
+
+    /// Spawn a stand-in for a detached `_boot-vm` whose argv carries `args`.
+    ///
+    /// `sh -c '… & wait'` keeps the shell alive with the marker visible in its
+    /// argv (a bare `sh -c cmd` execs cmd, dropping the args).
+    fn spawn_fake_boot_vm(args: &[&str]) -> std::process::Child {
+        let argv = ["-c", "sleep 60 & wait", "_boot-vm"]
+            .into_iter()
+            .chain(args.iter().copied());
+        std::process::Command::new("sh")
+            .args(argv)
+            .spawn()
+            .expect("spawn dummy boot-vm")
+    }
+
+    fn process_alive(pid: i32) -> bool {
+        // A dead pid makes `kill` print "No such process"; the exit status is
+        // the answer, so keep its stderr out of the test output.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("probe process")
+            .success()
+    }
+
+    /// Scratch machine data dir for the pack-prune tests: `<tmp>/pack-prune-<uuid>/`.
+    fn pack_prune_scratch() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("preloop-pack-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn prune_pack_dir_removes_pack_beside_finished_disk() {
+        let data_dir = pack_prune_scratch();
+        std::fs::write(data_dir.join("storage.raw"), b"disk").unwrap();
+        let pack = data_dir.join("pack");
+        std::fs::create_dir_all(pack.join("layers")).unwrap();
+        std::fs::write(pack.join("storage.ext4"), b"intermediate").unwrap();
+        std::fs::write(pack.join("layers").join("abc.tar"), b"layer").unwrap();
+
+        assert!(super::prune_pack_dir(&data_dir).expect("prune"));
+        assert!(!pack.exists(), "pack/ must be gone");
+        assert!(data_dir.join("storage.raw").is_file(), "disk must survive");
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn prune_pack_dir_skips_when_disk_missing() {
+        let data_dir = pack_prune_scratch();
+        let pack = data_dir.join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("storage.ext4"), b"intermediate").unwrap();
+
+        assert!(!super::prune_pack_dir(&data_dir).expect("prune"));
+        assert!(
+            pack.is_dir(),
+            "pack/ must be left alone without storage.raw"
+        );
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    /// A machine data dir with no registry entry is unreachable garbage once
+    /// the create-before-register grace window passes; the sweep must take it
+    /// while sparing registered dirs and SmolVM's own node-wide state, whose
+    /// loss dangles every packed machine's lease (#371).
+    #[test]
+    fn sweep_orphaned_dirs_removes_unregistered_machine_dirs_only() {
+        let root = std::env::temp_dir().join(format!("preloop-orphan-{}", uuid::Uuid::new_v4()));
+        let known = root.join("0123456789abcdef");
+        let orphan = root.join("59cc3c416f4b6d5e");
+        let shared_store = root.join("_shared").join("a1b2c3d4");
+        let restore_base = root.join("_restore-base");
+        let not_a_hash = root.join("ABCDEF0123456789");
+        for dir in [&known, &orphan, &shared_store, &restore_base, &not_a_hash] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let known_dirs = std::collections::BTreeSet::from([known.clone()]);
+
+        // Zero grace: every unregistered dir is provably old enough.
+        let swept = super::sweep_orphaned_dirs(
+            std::slice::from_ref(&root),
+            &known_dirs,
+            std::time::Duration::ZERO,
+        )
+        .expect("sweep");
+
+        assert_eq!(swept, 1);
+        assert!(known.is_dir(), "registered dir survives");
+        assert!(!orphan.exists(), "orphaned machine dir is removed");
+        assert!(shared_store.is_dir(), "shared pack store survives");
+        assert!(restore_base.is_dir(), "restore base survives");
+        assert!(not_a_hash.is_dir(), "non-machine names are never swept");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `create` that failed before registering leaves its data dir — and
+    /// the `pack/` intermediates inside it — invisible to `machine data-dir`
+    /// and `delete`. The residue sweep finds it by exclusion (16-hex name,
+    /// no registry row) and removes `pack/` without requiring `storage.raw`,
+    /// while leaving registered dirs, pack-less dirs, and SmolVM's own
+    /// node state alone.
+    #[test]
+    fn prune_unregistered_pack_dirs_reclaims_failed_unpack_residue() {
+        let root = std::env::temp_dir().join(format!("preloop-residue-{}", uuid::Uuid::new_v4()));
+        let registered = root.join("0123456789abcdef");
+        let residue = root.join("59cc3c416f4b6d5e");
+        let bare_orphan = root.join("aaaabbbbccccdddd");
+        let shared_store = root.join("_shared");
+        for dir in [&registered, &residue, &bare_orphan, &shared_store] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // The failed unpack: pack/ exists, storage.raw does not.
+        std::fs::create_dir_all(residue.join("pack")).unwrap();
+        std::fs::write(residue.join("pack").join("storage.ext4"), b"part").unwrap();
+        // The registered machine: pack/ beside its finished disk stays.
+        std::fs::create_dir_all(registered.join("pack")).unwrap();
+        std::fs::write(registered.join("pack").join("storage.ext4"), b"keep").unwrap();
+        std::fs::write(registered.join("storage.raw"), b"disk").unwrap();
+        let known_dirs = std::collections::BTreeSet::from([registered.clone()]);
+
+        let pruned = super::prune_unregistered_pack_dirs(std::slice::from_ref(&root), &known_dirs)
+            .expect("sweep");
+
+        assert_eq!(pruned, 1);
+        assert!(
+            !residue.join("pack").exists(),
+            "unregistered pack/ is removed"
+        );
+        assert!(
+            residue.is_dir(),
+            "the residue dir itself is left for the orphan sweep"
+        );
+        assert!(
+            registered.join("pack").is_dir(),
+            "registered pack/ survives"
+        );
+        assert!(bare_orphan.is_dir(), "a dir with no pack/ is untouched");
+        assert!(shared_store.is_dir(), "shared pack store survives");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn df_available_column_survives_spaces_in_names() {
+        // Linux: plain layout.
+        let linux = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n\
+                     /dev/nvme0n1p2   960379920 512000000 399560000      57% /\n";
+        assert_eq!(parse_df_available_kib(linux), Some(399_560_000));
+        // macOS automounter: the filesystem name itself contains a space, so a
+        // fixed column index would read `Used` as `Available`.
+        let spaced_fs = "Filesystem    1024-blocks Used Available Capacity  Mounted on\n\
+                         map auto_home           0    0         0   100%    /System/Volumes/Data/home\n";
+        assert_eq!(parse_df_available_kib(spaced_fs), Some(0));
+        // A mount point containing spaces sits after Capacity and must not
+        // matter either.
+        let spaced_mount = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                            /dev/disk3s5 971350180 698000000 235000000 75% /Volumes/My Disk\n";
+        assert_eq!(parse_df_available_kib(spaced_mount), Some(235_000_000));
+    }
+
+    #[test]
+    fn df_output_without_a_data_row_is_rejected() {
+        assert_eq!(
+            parse_df_available_kib("Filesystem 1024-blocks Used Available Capacity Mounted on\n"),
+            None
+        );
+        assert_eq!(parse_df_available_kib(""), None);
+    }
+
+    #[test]
+    fn available_bytes_measures_nearest_existing_ancestor() {
+        let missing = std::env::temp_dir().join(format!("preloop-df-{}/a/b", uuid::Uuid::new_v4()));
+        let bytes = filesystem_available_bytes(&missing).expect("ancestor temp dir is measurable");
+        assert!(bytes > 0, "temp filesystem reports no free space");
+    }
+
+    /// The grace window keeps a dir too young to be proven orphaned: smolvm
+    /// writes the data dir before the registry row commits, so a fresh dir
+    /// may belong to a create still in flight.
+    #[test]
+    fn sweep_orphaned_dirs_spares_young_dirs() {
+        let root = std::env::temp_dir().join(format!("preloop-orphan-{}", uuid::Uuid::new_v4()));
+        let young = root.join("fedcba9876543210");
+        std::fs::create_dir_all(&young).unwrap();
+
+        let swept = super::sweep_orphaned_dirs(
+            std::slice::from_ref(&root),
+            &std::collections::BTreeSet::new(),
+            super::ORPHAN_DIR_GRACE,
+        )
+        .expect("sweep");
+
+        assert_eq!(swept, 0);
+        assert!(young.is_dir(), "young dir survives the grace window");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prune_pack_dir_skips_when_no_pack() {
+        let data_dir = pack_prune_scratch();
+        std::fs::write(data_dir.join("storage.raw"), b"disk").unwrap();
+
+        assert!(!super::prune_pack_dir(&data_dir).expect("prune"));
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn prune_pack_dir_refuses_symlink_pack() {
+        let data_dir = pack_prune_scratch();
+        std::fs::write(data_dir.join("storage.raw"), b"disk").unwrap();
+        let target = data_dir.join("real-target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep"), b"data").unwrap();
+        std::os::unix::fs::symlink(&target, data_dir.join("pack")).unwrap();
+
+        assert!(!super::prune_pack_dir(&data_dir).expect("prune"));
+        assert!(target.join("keep").is_file(), "symlink target must survive");
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn prune_pack_dir_counts_bytes_without_following_links() {
+        let data_dir = pack_prune_scratch();
+        std::fs::write(data_dir.join("a"), vec![7u8; 100]).unwrap();
+        let sub = data_dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("b"), vec![8u8; 50]).unwrap();
+        std::os::unix::fs::symlink(data_dir.join("a"), sub.join("link")).unwrap();
+        // 100 (a) + 50 (b) + the link's own bytes; the link target's 100
+        // bytes are not counted twice, i.e. the link is not followed.
+        let link_len = std::fs::symlink_metadata(sub.join("link")).unwrap().len();
+        assert_eq!(super::dir_size_bytes(&data_dir), 150 + link_len);
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    #[test]
+    fn kill_vm_processes_in_kills_only_the_named_machines_hypervisor() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("preloop-kill-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let root = super::machine_data_root().expect("this home resolves to a data root");
+        let target_dir = root.join("target-machine");
+        let neighbor_dir = root.join("neighbor-machine");
+        std::fs::create_dir_all(target_dir.join("pack/layers-cs")).expect("target dir");
+        std::fs::create_dir_all(&neighbor_dir).expect("neighbor dir");
+
+        let mut target =
+            spawn_fake_boot_vm(&[target_dir.join("boot-config.json").to_str().unwrap()]);
+        let mut neighbor =
+            spawn_fake_boot_vm(&[neighbor_dir.join("boot-config.json").to_str().unwrap()]);
+        let target_pid = target.id() as i32;
+        let neighbor_pid = neighbor.id() as i32;
+
+        let killed = super::kill_vm_processes_in(&target_dir).expect("scoped kill");
+
+        assert_eq!(killed, 1, "only the named machine's hypervisor may die");
+        let _ = target.wait();
+        assert!(!process_alive(target_pid));
+        assert!(
+            process_alive(neighbor_pid),
+            "a neighboring machine's hypervisor must be spared"
+        );
+        let _ = neighbor.kill();
+        let _ = neighbor.wait();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The real trigger end to end: smolvm refuses `machine delete -f`
+    /// because the guest cannot confirm a safe shutdown and leaves the VM
+    /// alive. The provider must resolve the machine's data directory, kill
+    /// only that hypervisor, and let the retried delete finish. The data
+    /// dir name carries a space to pin the argv attribution against
+    /// whitespace in a PRELOOP_HOME or worktree path.
+    #[cfg(unix)]
+    #[tokio::test]
+    // The PRELOOP_HOME guard must stay held across the delete's awaits:
+    // `kill_vm_processes_in` reads PRELOOP_HOME via `machine_data_root`, and
+    // releasing it mid-test would let a parallel env-mutating test redirect
+    // this test's kills. Sync locking across awaits is the established
+    // pattern for the env-mutating suite.
+    #[allow(clippy::await_holding_lock)]
+    async fn refused_delete_kills_the_hypervisor_and_retries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("preloop-refused-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let root = super::machine_data_root().expect("this home resolves to a data root");
+        let data_dir = root.join("vm with space");
+        std::fs::create_dir_all(&data_dir).expect("machine data dir");
+
+        let mut hypervisor =
+            spawn_fake_boot_vm(&[data_dir.join("boot-config.json").to_str().unwrap()]);
+        let hypervisor_pid = hypervisor.id() as i32;
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("delete-refused");
+        let binary = directory.path().join("smolvm");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *data-dir*) printf '%s\\n' '{}';;\n  *delete*)\n    if [ ! -f '{}' ]; then\n      touch '{}'\n      echo 'guest did not confirm filesystem synchronization; left the VM alive for retry' >&2\n      exit 1\n    fi;;\nesac\n",
+                data_dir.display(),
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let provider = SmolVmProvider::new(&binary);
+        provider
+            .delete(&MachineName::new("runner").unwrap())
+            .await
+            .expect("a refused delete must be force-cleaned and retried");
+
+        assert!(marker.exists(), "the first delete attempt was refused");
+        let _ = hypervisor.wait();
+        assert!(
+            !process_alive(hypervisor_pid),
+            "the stranded hypervisor must be dead before the delete retry"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn purge_orphaned_vms_kills_matching_boot_vm_processes() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("preloop-purge-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let boot_config = super::machine_data_root()
+            .expect("this home resolves to a data root")
+            .join("deadbeef/boot-config.json");
+        // A process that looks like an orphaned _boot-vm for this home: the
+        // argv carries the boot-config path, so `ps` shows it in the command
+        // line.
+        let mut child = spawn_fake_boot_vm(&[boot_config.to_str().unwrap()]);
+        let pid = child.id() as i32;
+        let killed = purge_orphaned_vms(OrphanPurge::All).expect("purge");
+        assert!(killed >= 1, "purge should have killed the matching process");
+        // Reap the SIGKILLed child so it is not a zombie (kill -0 on a
+        // zombie still succeeds until it is reaped).
+        let _ = child.wait();
+        assert!(!process_alive(pid), "matching _boot-vm must be dead");
+    }
+
+    /// A hypervisor is ours only when its argv names a boot config under one
+    /// of this home's machine data roots. A neighboring home whose path the
+    /// data root is a *string prefix* of (`…/smolvm` vs `…/smolvm-vm-other`)
+    /// shares no path component with it; killing that home's VM would take
+    /// down a different engine's running job.
+    #[test]
+    fn purge_never_touches_a_neighboring_homes_hypervisor() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home =
+            std::env::temp_dir().join(format!("preloop-purge-neighbor-{}", uuid::Uuid::new_v4()));
+        // The neighbor's home is spelled so that this home's data root prefix
+        // is a string prefix of its machine paths, but not a path-component
+        // prefix: exactly the shape old substring matches claimed as ours.
+        let neighbor_boot_config = {
+            let _neighbor = PreloopHomeGuard::set(&home.join("smolvm-vm-other"));
+            super::machine_data_root()
+                .expect("the neighbor home resolves to a data root")
+                .join("deadbeef/boot-config.json")
+        };
+        let mut neighbor_child = spawn_fake_boot_vm(&[neighbor_boot_config.to_str().unwrap()]);
+        let neighbor_pid = neighbor_child.id() as i32;
+        let _home = PreloopHomeGuard::set(&home);
+
+        assert_eq!(
+            purge_orphaned_vms(OrphanPurge::All).expect("purge"),
+            0,
+            "a neighboring home's hypervisor is not ours to kill"
+        );
+        assert!(
+            process_alive(neighbor_pid),
+            "the neighboring home's VM must survive this home's purge"
+        );
+        let _ = neighbor_child.kill();
+        let _ = neighbor_child.wait();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The mid-flight scope must spare every hypervisor whose machine data
+    /// directory still exists — a registered machine, a running job VM, a
+    /// golden, or a create in flight all keep theirs — and still reclaim one
+    /// whose data directory was removed from under it. `All` kills every
+    /// hypervisor this home owns, which is what makes the scope, not the
+    /// process match, the protection for live machines.
+    #[test]
+    fn removed_data_dir_purge_spares_live_data_dirs_and_unowned_argvs() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home =
+            std::env::temp_dir().join(format!("preloop-purge-live-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let vms = super::machine_data_root().expect("this home resolves to a data root");
+        // A live machine's directory, in the shape a running machine leaves on
+        // disk: smolvm consumes `boot-config.json` at boot, so only the
+        // directory — not that file — is durable evidence of the machine.
+        let live_dir = vms.join("live");
+        std::fs::create_dir_all(&live_dir).expect("create live machine dir");
+        std::fs::write(live_dir.join("vm.lock"), b"").unwrap();
+        let live = live_dir.join("boot-config.json");
+        // Same home, no data directory: the failed-delete leak.
+        let gone = vms.join("gone/boot-config.json");
+        // A `_boot-vm` whose argv names no boot config under this home: no
+        // machine can be concluded from it, so neither scope may kill it —
+        // ownership is a parsed path, never a mention of the home.
+        let unclassified = home.join("smolvm-home");
+        let mut live_child = spawn_fake_boot_vm(&[live.to_str().unwrap()]);
+        let mut gone_child = spawn_fake_boot_vm(&[gone.to_str().unwrap()]);
+        let mut unknown_child = spawn_fake_boot_vm(&["--data-dir", unclassified.to_str().unwrap()]);
+        let live_pid = live_child.id() as i32;
+        let gone_pid = gone_child.id() as i32;
+        let unknown_pid = unknown_child.id() as i32;
+
+        assert_eq!(
+            purge_orphaned_vms(OrphanPurge::RemovedDataDir).expect("purge"),
+            1,
+            "only the hypervisor whose data directory is gone may be killed"
+        );
+        assert!(
+            process_alive(live_pid),
+            "a machine whose data directory exists must survive the mid-flight purge"
+        );
+        assert!(
+            process_alive(unknown_pid),
+            "an argv that names no boot config must survive the mid-flight purge"
+        );
+        let _ = gone_child.wait();
+        assert!(
+            !process_alive(gone_pid),
+            "the orphaned hypervisor must be dead"
+        );
+
+        assert_eq!(
+            purge_orphaned_vms(OrphanPurge::All).expect("purge"),
+            1,
+            "the startup scope kills the hypervisor the mid-flight scope spared"
+        );
+        let _ = live_child.wait();
+        assert!(!process_alive(live_pid), "only the scope spared it");
+        assert!(
+            process_alive(unknown_pid),
+            "an argv that names no boot config is not ours under any scope"
+        );
+        let _ = unknown_child.kill();
+        let _ = unknown_child.wait();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Serializes the tests that rewrite `PATH`: fake `mount`/`hdiutil`
+    /// stand-ins resolve through it, and `PATH` is process-global.
+    #[cfg(target_os = "macos")]
+    static PATH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Prepends `directory` to `PATH` for the test's scope, restoring the
+    /// previous value on drop.
+    #[cfg(target_os = "macos")]
+    struct PathPrependGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl PathPrependGuard {
+        fn prepend(directory: &std::path::Path) -> Self {
+            let previous = std::env::var_os("PATH");
+            let mut path = directory.as_os_str().to_owned();
+            path.push(":");
+            if let Some(previous) = &previous {
+                path.push(previous);
+            }
+            // SAFETY: serialized by `PATH_LOCK`.
+            unsafe { std::env::set_var("PATH", path) };
+            Self { previous }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for PathPrependGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized by `PATH_LOCK`.
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("PATH", value) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+        }
+    }
+
+    /// A layer-store mount belongs to this home when it hangs off this home's
+    /// machine data root — in either the raw or the canonical form of the path
+    /// (`mount` prints `/private/tmp/...` for a `/tmp/...` home) — and only
+    /// the mounts no live hypervisor claims may be detached. A neighboring
+    /// home's mount that this home's root is a string prefix of, and any
+    /// mount that is not a layer store, must never be selected.
+    #[test]
+    fn orphan_layer_store_mounts_spare_machines_with_a_live_hypervisor() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        // Under `/tmp` on purpose: on macOS that is a path *through a
+        // symlink*, so the argv form and the mount-table form differ unless
+        // the scan canonicalizes both sides.
+        let home = std::path::PathBuf::from("/tmp")
+            .join(format!("preloop-layer-mounts-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let vms = super::machine_data_root().expect("this home resolves to a data root");
+        let live = vms.join("aaaaaaaaaaaaaaaa");
+        let orphan = vms.join("bbbbbbbbbbbbbbbb");
+        for dir in [&live, &orphan] {
+            std::fs::create_dir_all(dir.join("pack/layers-cs")).unwrap();
+        }
+        let roots = super::machine_data_roots();
+        let canonical_vms = std::fs::canonicalize(&vms).unwrap();
+        // A neighboring home whose path shares this home's data-root prefix
+        // as a *string* but not as a path component (`…/smolvm` vs
+        // `…/smolvm-vm-other`): its mount is not ours to detach.
+        let neighbor_mount = {
+            let _neighbor = PreloopHomeGuard::set(&home.join("smolvm-vm-other"));
+            super::machine_data_root()
+                .expect("the neighbor home resolves to a data root")
+                .join("cccccccccccccccc/pack/layers-cs")
+        };
+        let mount_table = format!(
+            "/dev/disk3s5 on / (apfs, local, read-only, sealed)\n\
+             /dev/disk11s1 on {live}/pack/layers-cs (apfs, local, journaled, nobrowse)\n\
+             /dev/disk9s1 on {orphan}/pack/layers-cs (apfs, local, journaled, nobrowse)\n\
+             /dev/disk10s1 on {neighbor} (apfs, local)\n\
+             /dev/disk12s1 on {orphan}/storage (apfs, local)\n",
+            live = canonical_vms.join("aaaaaaaaaaaaaaaa").display(),
+            orphan = canonical_vms.join("bbbbbbbbbbbbbbbb").display(),
+            neighbor = neighbor_mount.display(),
+        );
+        // The live _boot-vm's argv names its machine's boot config in the raw
+        // form of the path (the file itself is consumed at boot; only the
+        // directory is durable).
+        let ps_output = format!(
+            "  501 /Users/x/.smolvm/smolvm-bin _boot-vm {}/boot-config.json\n\
+             502 /usr/bin/unrelated\n",
+            live.display()
+        );
+
+        assert_eq!(
+            orphan_layer_store_mounts(&roots, &ps_output, &mount_table),
+            vec![canonical_vms.join("bbbbbbbbbbbbbbbb/pack/layers-cs")],
+            "only the mount whose hypervisor is gone may be detached"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The detach pass reads the `mount` table it is handed and shells out to
+    /// `hdiutil`; a fake `hdiutil` on `PATH` records the exact argv, so the
+    /// whole scan → decide → detach path is covered without attaching a disk
+    /// image. The table is passed in because `mount` is named absolutely
+    /// (`/sbin/mount`), so it cannot be faked on `PATH`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detach_orphaned_layer_mounts_detaches_each_mount_without_a_hypervisor() {
+        let _path_guard = PATH_LOCK.lock();
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("preloop-detach-{}", uuid::Uuid::new_v4()));
+        let _home = PreloopHomeGuard::set(&home);
+        let orphan = super::machine_data_root()
+            .expect("this home resolves to a data root")
+            .join("bbbbbbbbbbbbbbbb");
+        std::fs::create_dir_all(orphan.join("pack/layers-cs")).unwrap();
+        let log = home.join("hdiutil.log");
+        let bin = home.join("fake-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let canonical = std::fs::canonicalize(&orphan).unwrap();
+        let mount_table = format!(
+            "/dev/disk3s5 on / (apfs, local, read-only, sealed)\n\
+             /dev/disk9s1 on {}/pack/layers-cs (apfs, local, journaled, nobrowse)\n",
+            canonical.display()
+        );
+        let hdiutil = bin.join("hdiutil");
+        std::fs::write(
+            &hdiutil,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hdiutil, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = PathPrependGuard::prepend(&bin);
+
+        // The real `ps` runs: no `_boot-vm` names this fixture home, so the
+        // mount is provably orphaned.
+        let detached =
+            detach_orphaned_layer_mounts_in(&machine_data_roots(), &mount_table).expect("detach");
+        assert_eq!(detached, 1, "the orphaned layer mount must be detached");
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("fake hdiutil log"),
+            format!("detach -quiet {}/pack/layers-cs\n", canonical.display()),
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Make `path` older than [`super::ORPHAN_DIR_GRACE`], the way a dir
+    /// SmolVM created before its registry row landed is.
+    fn backdate(path: &std::path::Path) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::open(path)
+            .expect("open dir")
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .expect("backdate dir");
+    }
+
+    /// Write an executable stand-in for `smolvm` into `dir` and return it.
+    fn fake_smolvm(dir: &std::path::Path, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join("smolvm");
+        std::fs::write(&binary, script).expect("write fake smolvm");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake smolvm");
+        binary
+    }
+
+    /// Regression for issue #371: SmolVM creates a machine's data dir before
+    /// it publishes the registry row, and a packed create extracts for
+    /// minutes — longer than [`super::ORPHAN_DIR_GRACE`]. `machine create`
+    /// holds the lifecycle write lock for its whole run, so the sweep must
+    /// hold the read side and wait for it rather than delete the live,
+    /// unregistered dir; the same tick's `RemovedDataDir` purge then killed
+    /// the create's hypervisor. Without the lock the sweep reclaims the dir
+    /// while the create runs, which is exactly the reported failure.
+    #[test]
+    fn sweep_waits_for_a_create_in_flight_and_spares_its_data_dir() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let root = super::machine_data_root().expect("data root");
+        let dir = root.join("59cc3c416f4b6d5e");
+        let orphan = root.join("0000000000000000");
+        for path in [&dir, &orphan] {
+            std::fs::create_dir_all(path).expect("create machine dir");
+        }
+        // SmolVM's own plaintext name binding, written at dir creation.
+        std::fs::write(dir.join("name"), b"runner-0").expect("name file");
+        // Backdate last: creating child entries moves the dir's mtime.
+        for path in [&dir, &orphan] {
+            backdate(path);
+        }
+
+        let scratch = tempfile::tempdir().expect("scratch");
+        let ready = scratch.path().join("create-started");
+        let release = scratch.path().join("create-release");
+        let registered = scratch.path().join("registered");
+        // The create stands in for a packed extraction: the dir already
+        // exists (older than the grace), the registry row does not.
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"$1 $2\" in\n\
+             \"machine ls\") if [ -f '{registered}' ]; then echo '[{{\"name\":\"runner-0\"}}]'; \
+             else echo '[]'; fi ;;\n\
+             \"machine data-dir\") echo '{dir}' ;;\n\
+             \"machine create\") : > '{ready}'; \
+             while [ ! -f '{release}' ]; do sleep 0.05; done; : > '{registered}' ;;\n\
+             esac\n",
+            registered = registered.display(),
+            dir = dir.display(),
+            ready = ready.display(),
+            release = release.display(),
+        );
+        let binary = fake_smolvm(scratch.path(), &script);
+        let provider = super::SmolVmProvider::new(&binary);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let spec = MachineSpec {
+            name: MachineName::new("runner-0").unwrap(),
+            image: "ghcr.io/acme/runner:latest".to_owned(),
+            cpus: 2,
+            memory_mib: 256,
+            storage_gib: 10,
+            overlay_gib: None,
+            network: NetworkPolicy::Disabled,
+            volumes: Vec::new(),
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
+        };
+        let create_provider = provider.clone();
+        let create = runtime.spawn(async move { create_provider.create(&spec).await });
+
+        // `machine create` is running, so the provider holds the write lock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < deadline, "create never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let sweep_provider = provider.clone();
+        let sweep = runtime.spawn(async move { sweep_provider.sweep_orphaned_data_dirs().await });
+        // A sweep that takes no lock completes here, deleting the in-flight
+        // create's dir; with the lock it is blocked behind the writer.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let waited_for_create = !sweep.is_finished();
+
+        std::fs::write(&release, b"").expect("release create");
+        runtime
+            .block_on(create)
+            .expect("create task")
+            .expect("create");
+        let swept = runtime.block_on(sweep).expect("sweep task").expect("sweep");
+
+        assert!(
+            dir.is_dir(),
+            "a create's unregistered data dir must survive the sweep"
+        );
+        assert_eq!(
+            swept, 1,
+            "only the dir with no create in flight is reclaimed"
+        );
+        assert!(
+            !orphan.exists(),
+            "a stale unregistered dir is still reclaimed"
+        );
+        assert!(
+            waited_for_create,
+            "the sweep must wait for the create in flight, not scan past it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The lock excludes only creates live in this engine: a dir left by a
+    /// create whose engine died mid-extraction (no registry row) is a real
+    /// orphan and must still be reclaimed, or a restart would leak it forever.
+    #[test]
+    fn sweep_reclaims_a_leftover_unregistered_dir() {
+        let _guard = PRELOOP_HOME_LOCK.lock();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let root = super::machine_data_root().expect("data root");
+        let dir = root.join("59cc3c416f4b6d5e");
+        std::fs::create_dir_all(&dir).expect("create leftover dir");
+        std::fs::write(dir.join("name"), b"runner-0").expect("name file");
+        backdate(&dir);
+
+        let scratch = tempfile::tempdir().expect("scratch");
+        let binary = fake_smolvm(
+            scratch.path(),
+            "#!/bin/sh\n[ \"$1 $2\" = \"machine ls\" ] && echo '[]'\nexit 0\n",
+        );
+        let provider = super::SmolVmProvider::new(&binary);
+        // A synchronous runtime keeps the sync `PRELOOP_HOME` lock out of
+        // any await, where clippy's `await_holding_lock` would object.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let swept = runtime
+            .block_on(provider.sweep_orphaned_data_dirs())
+            .expect("sweep");
+        assert_eq!(swept, 1, "the leftover dir must be reclaimed");
+        assert!(!dir.exists(), "an unregistered leftover is a real orphan");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn agent_rootfs_candidates_probe_platform_then_legacy() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let home = dir.path();
+        #[cfg(target_os = "macos")]
+        let platform = home.join("Library/Application Support/smolvm/agent-rootfs");
+        #[cfg(not(target_os = "macos"))]
+        let platform = home.join(".local/share/smolvm/agent-rootfs");
+        let legacy = home.join(".smolvm/agent-rootfs");
+        std::fs::create_dir_all(&platform).expect("platform agent rootfs");
+        std::fs::create_dir_all(&legacy).expect("legacy agent rootfs");
+        let found = agent_rootfs_candidates(Some(home), None, None)
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("a candidate exists");
+        assert_eq!(
+            found, platform,
+            "the platform default must be probed before the legacy location"
+        );
+
+        // An explicit SMOLVM_DATA_DIR wins over the platform defaults.
+        let explicit = home.join("custom/agent-rootfs");
+        std::fs::create_dir_all(&explicit).expect("explicit agent rootfs");
+        let found = agent_rootfs_candidates(Some(home), Some(home.join("custom").as_path()), None)
+            .into_iter()
+            .find(|path| path.is_dir())
+            .expect("explicit candidate exists");
+        assert_eq!(found, explicit);
+    }
+
+    /// The rootfs shipped next to the resolved binary is a candidate, and on
+    /// Linux it leads: a stale data-directory copy must never outrank the
+    /// agent that came out of the same release as the binary.
+    #[test]
+    fn agent_rootfs_candidates_place_the_binaries_sibling_first_on_linux() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // macOS resolves `/var` to `/private/var`; the guard canonicalizes the
+        // binary it inspects, so build the fixture under the canonical root.
+        let root = dir.path().canonicalize().expect("canonical temp dir");
+        let prefix = root.join("prefix");
+        std::fs::create_dir_all(&prefix).expect("prefix");
+        let binary = prefix.join("smolvm");
+        std::fs::write(&binary, b"#!/bin/sh\n").expect("binary");
+        let shipped = prefix.join("agent-rootfs");
+        std::fs::create_dir_all(shipped.join("sbin")).expect("shipped rootfs");
+        std::fs::write(shipped.join("sbin/init"), b"#!/bin/sh\n").expect("init");
+        assert_eq!(
+            super::agent_rootfs::shipped_rootfs(&binary).as_deref(),
+            Some(shipped.as_path()),
+            "the fixture must look like an install prefix"
+        );
+        let data_dir = root.join("data");
+        let candidates = agent_rootfs_candidates(
+            Some(root.as_path()),
+            Some(data_dir.as_path()),
+            Some(binary.as_path()),
+        );
+        assert!(candidates.contains(&shipped), "{candidates:?}");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            candidates.first(),
+            Some(&shipped),
+            "Linux must prefer the binary's sibling over the data-directory copy"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(data_dir.join("agent-rootfs").as_path()),
+            "the data-directory candidate keeps its place on this platform"
+        );
+    }
+
+    use super::*;
+
+    #[test]
+    fn cgroup_root_dir_trims_the_leading_slash_of_proc_self_cgroup_paths() {
+        // `/proc/self/cgroup` prints `0::/system.slice/preloop.service` with
+        // an absolute-looking path; Path::join would discard the /sys/fs/cgroup
+        // base entirely.
+        assert_eq!(
+            cgroup_root_dir("/system.slice/preloop.service"),
+            PathBuf::from("/sys/fs/cgroup/system.slice/preloop.service")
+        );
+        assert_eq!(
+            cgroup_root_dir("user.slice/user-1000.slice/user@1000.service/app.slice"),
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice")
+        );
+        // The root cgroup prints `/`.
+        assert_eq!(cgroup_root_dir("/"), PathBuf::from("/sys/fs/cgroup"));
+    }
+
+    /// systemd's `\xHH` escaping is part of the directory name on disk:
+    /// `/sys/fs/cgroup/system.slice/mnt-my\x2ddir.mount` exists while the
+    /// unescaped spelling does not, and `/proc/self/cgroup` reports the
+    /// escaped form. Decoding it would name a directory that is not there.
+    #[test]
+    fn cgroup_root_dir_preserves_systemd_escapes_verbatim() {
+        assert_eq!(
+            cgroup_root_dir("/system.slice/mnt-my\\x2ddir.mount"),
+            PathBuf::from("/sys/fs/cgroup/system.slice/mnt-my\\x2ddir.mount")
+        );
+    }
+
+    /// The exact refusal SmolVM emits when a re-arm tries to stop a golden
+    /// that still has live clones — names parsed from the message are the
+    /// authoritative dependency list when the pool's in-memory clone map is
+    /// empty (fresh engine start after a session that leaked machines).
+    #[test]
+    fn extract_dependent_clones_parses_smolvm_refusal() {
+        assert_eq!(
+            extract_dependent_clones(
+                "Error: agent operation failed: stop: machine 'preloop-runner-golden' is the \
+                 fork base for 2 live clone(s) (preloop-runner-535-1, preloop-runner-642-1); \
+                 stop or delete the clones first"
+            ),
+            vec!["preloop-runner-535-1", "preloop-runner-642-1"]
+        );
+        assert_eq!(
+            extract_dependent_clones("is the fork base for 1 live clone(s) (preloop-runner-9-1)"),
+            vec!["preloop-runner-9-1"]
+        );
+    }
+
+    #[test]
+    fn extract_dependent_clones_ignores_unrelated_errors() {
+        assert!(extract_dependent_clones("vm not found: preloop-runner-golden").is_empty());
+        assert!(extract_dependent_clones("").is_empty());
+        assert!(extract_dependent_clones("database is locked").is_empty());
+    }
+
+    /// A re-arm must fail closed when the registry names clones this process
+    /// does not know: they may belong to a live lease in another process.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rearm_refuses_to_delete_clones_it_does_not_own() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        let log = scratch.path().join("delete.log");
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"$1 $2\" in\n\
+             \"machine stop\")\n\
+               echo \"machine 'preloop-runner-golden' is the fork base for 1 live clone(s) \
+             (pool-runner-9-1); stop or delete the clones first\" >&2\n\
+               exit 1 ;;\n\
+             \"machine delete\")\n\
+               echo delete >> '{}'\n\
+               exit 0 ;;\n\
+             esac\n\
+             exit 0\n",
+            log.display()
+        );
+        let binary = fake_smolvm(scratch.path(), &script);
+        let provider = super::SmolVmProvider::new(&binary);
+        let golden = MachineName::new("preloop-runner-golden").unwrap();
+        let error = provider
+            .rearm_fork_base(&golden, None)
+            .await
+            .expect_err("a base with unknown clones must not be re-armed");
+        assert!(
+            error.to_string().contains("refusing to delete"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !log.exists(),
+            "re-arm deleted a clone it could not prove it owned"
+        );
+    }
+
+    #[test]
+    fn cgroup_controllers_enabled_requires_all_three_controllers() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = directory.path().join("cgroup.subtree_control");
+        // Kernel readback with sign prefixes.
+        std::fs::write(&control, "+cpu +memory +pids\n").unwrap();
+        assert!(cgroup_controllers_enabled(directory.path()));
+        // Readback without sign prefixes.
+        std::fs::write(&control, "cpu memory pids\n").unwrap();
+        assert!(cgroup_controllers_enabled(directory.path()));
+        std::fs::write(&control, "+cpu +memory +pids +io\n").unwrap();
+        assert!(cgroup_controllers_enabled(directory.path()));
+        std::fs::write(&control, "+cpu +memory\n").unwrap();
+        assert!(!cgroup_controllers_enabled(directory.path()));
+        std::fs::write(&control, "cpu memory\n").unwrap();
+        assert!(!cgroup_controllers_enabled(directory.path()));
+        std::fs::write(&control, "-cpu +memory +pids\n").unwrap();
+        assert!(!cgroup_controllers_enabled(directory.path()));
+        std::fs::write(&control, "+cpu -memory +pids\n").unwrap();
+        assert!(!cgroup_controllers_enabled(directory.path()));
+        std::fs::remove_file(&control).unwrap();
+        assert!(!cgroup_controllers_enabled(directory.path()));
+    }
+
+    /// The exported policy is the exact observable contract: on Linux every
+    /// invocation defaults to seccomp/Landlock `enforce` and honors only
+    /// validated overrides; everywhere else nothing is injected.
+    #[test]
+    fn sandbox_env_defaults_to_enforce_and_validates_overrides() {
+        assert_eq!(
+            sandbox_env_from(fake_env(&[])).unwrap(),
+            vec![
+                ("SMOLVM_SECCOMP".to_owned(), "enforce".to_owned()),
+                ("SMOLVM_LANDLOCK".to_owned(), "enforce".to_owned()),
+            ]
+        );
+
+        // A pre-set value upstream honors wins over the default.
+        for (seccomp, landlock) in [("enforce", "enforce"), ("audit", "off"), ("off", "enforce")] {
+            assert_eq!(
+                sandbox_env_from(fake_env(&[
+                    ("SMOLVM_SECCOMP", seccomp),
+                    ("SMOLVM_LANDLOCK", landlock),
+                ]))
+                .unwrap(),
+                vec![
+                    ("SMOLVM_SECCOMP".to_owned(), seccomp.to_owned()),
+                    ("SMOLVM_LANDLOCK".to_owned(), landlock.to_owned()),
+                ]
+            );
+        }
+
+        // Anything else is a hard error: upstream would read it as "off".
+        for (variable, value) in [
+            ("SMOLVM_SECCOMP", "banana"),
+            ("SMOLVM_SECCOMP", ""),
+            ("SMOLVM_SECCOMP", "Enforce"),
+            ("SMOLVM_LANDLOCK", "banana"),
+            ("SMOLVM_LANDLOCK", "audit"),
+            ("SMOLVM_LANDLOCK", ""),
+        ] {
+            assert!(
+                matches!(
+                    sandbox_env_from(fake_env(&[(variable, value)])),
+                    Err(VmError::InvalidSandboxEnv { variable: v, value: ref got, .. })
+                        if v == variable && got == value
+                ),
+                "{variable}={value} must fail closed"
+            );
+        }
+    }
+
+    /// An [`EnvLookup`]-shaped view over a fixed set of pairs: the sandbox
+    /// policy is exercised without touching the process environment, so
+    /// these tests carry no ordering dependence.
+    fn fake_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sandbox_env_is_empty_off_linux() {
+        let sandbox = smolvm_sandbox_env().unwrap();
+        assert!(sandbox.set.is_empty());
+        assert!(sandbox.remove.is_empty());
+    }
+
+    /// Preloop is authoritative for `SMOLVM_CGROUP_ROOT`: when no usable
+    /// delegation exists, an inherited value must be removed from the child
+    /// environment, never forwarded. The test environment never calls
+    /// `init_vm_cgroup_delegation`, so this process takes the read-only path;
+    /// on a host with a delegation the variable is set instead, and the
+    /// assertion below reflects that.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_policy_strips_an_inherited_cgroup_root_without_delegation() {
+        let sandbox = smolvm_sandbox_env().unwrap();
+        let resolved_root = sandbox
+            .set
+            .iter()
+            .any(|(key, _)| key == "SMOLVM_CGROUP_ROOT");
+        if resolved_root {
+            // Delegated host: the variable is set to our own validated root,
+            // and must not ALSO be scheduled for removal.
+            assert!(!sandbox.remove.contains(&"SMOLVM_CGROUP_ROOT"));
+        } else {
+            assert!(sandbox.remove.contains(&"SMOLVM_CGROUP_ROOT"));
+        }
+        // Regardless of the host, the seccomp/Landlock halves are enforced.
+        assert!(
+            sandbox
+                .set
+                .iter()
+                .any(|(key, value)| key == "SMOLVM_SECCOMP" && value == "enforce")
+        );
+        assert!(
+            sandbox
+                .set
+                .iter()
+                .any(|(key, value)| key == "SMOLVM_LANDLOCK" && value == "enforce")
+        );
+    }
+
+    /// An invalid override must not wedge the recovery operations: a typo in
+    /// `SMOLVM_SECCOMP` must make `create` fail closed while `list`, `status`,
+    /// `stop`, and `delete` still work — they are the only way to fix the
+    /// typo. The recovery command strips the invalid variables rather than
+    /// forwarding them.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn invalid_override_keeps_recovery_operations_usable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("smolvm");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\ncase \"$*\" in\n  *ls*) echo '[]';;\n  *status*) echo running;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        fn rejected(key: &str) -> Option<String> {
+            (key == "SMOLVM_SECCOMP").then(|| "Enforce".to_owned())
+        }
+        let provider = SmolVmProvider::new(&binary).with_env_lookup(rejected);
+
+        // Boot-capable path: fails closed.
+        let spec = MachineSpec {
+            name: MachineName::new("runner").unwrap(),
+            image: "ghcr.io/acme/runner:latest".to_owned(),
+            cpus: 2,
+            memory_mib: 256,
+            storage_gib: 10,
+            overlay_gib: None,
+            network: NetworkPolicy::Disabled,
+            volumes: Vec::new(),
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
+        };
+        let create_error = provider.create(&spec).await.unwrap_err();
+        assert!(
+            matches!(create_error, VmError::InvalidSandboxEnv { .. }),
+            "create must fail closed, got {create_error}"
+        );
+
+        // Recovery paths: still usable, with the invalid variables stripped.
+        assert_eq!(
+            provider
+                .list()
+                .await
+                .unwrap_or_else(|error| panic!("list must stay usable: {error}")),
+            Vec::<MachineName>::new()
+        );
+        assert_eq!(
+            provider
+                .status(&MachineName::new("runner").unwrap())
+                .await
+                .unwrap_or_else(|error| panic!("status must stay usable: {error}")),
+            MachineState::Running
+        );
+        provider
+            .stop(&MachineName::new("runner").unwrap())
+            .await
+            .unwrap();
+        provider
+            .delete(&MachineName::new("runner").unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_retries_transient_nonempty_directory_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("smolvm");
+        let marker = directory.path().join("delete-attempted");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nif [ ! -f '{}' ]; then\n  touch '{}'\n  echo 'failed to remove machine data: Directory not empty (os error 66)' >&2\n  exit 1\nfi\n",
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let provider = SmolVmProvider::new(&binary);
+        provider
+            .delete(&MachineName::new("runner").unwrap())
+            .await
+            .expect("transient nonempty-directory cleanup must be retried");
+        assert!(marker.exists());
+
+        // A missing machine is already deleted and must satisfy the same
+        // idempotent provider contract.
+        std::fs::write(&binary, "#!/bin/sh\necho 'machine not found' >&2\nexit 1\n").unwrap();
+        provider
+            .delete(&MachineName::new("runner").unwrap())
+            .await
+            .expect("deleting an absent machine must succeed");
+    }
+
+    /// A rejected sandbox override must surface as
+    /// [`VmError::InvalidSandboxEnv`] — never as the misleading
+    /// `UnsupportedSocketMount`, which would blame the binary — and must not
+    /// be remembered as a capability verdict: once the operator fixes the
+    /// environment the very next call probes the binary for real, on the
+    /// same provider whose probe cell the failure could have poisoned.
+    /// Linux-only: the sandbox policy (and so any override) applies there.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn invalid_sandbox_override_never_poisons_the_socket_mount_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn rejected(key: &str) -> Option<String> {
+            (key == "SMOLVM_SECCOMP").then(|| "banana".to_owned())
+        }
+        fn unset(_key: &str) -> Option<String> {
+            None
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        // Advertises `--mount-socket` to the capability probe and accepts
+        // every other invocation.
+        let binary = directory.path().join("smolvm");
+        std::fs::write(&binary, "#!/bin/sh\nprintf -- '--mount-socket\\n'\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let host_socket = directory.path().join("engine.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&host_socket).unwrap();
+        let spec = MachineSpec {
+            name: MachineName::new("probe").unwrap(),
+            image: "ghcr.io/acme/runner:latest".to_owned(),
+            cpus: 2,
+            memory_mib: 256,
+            storage_gib: 10,
+            overlay_gib: None,
+            network: NetworkPolicy::Disabled,
+            volumes: Vec::new(),
+            sockets: vec![SocketMount {
+                host: host_socket,
+                guest: PathBuf::from("/run/preloop-engine.sock"),
+            }],
+            dns: None,
+            rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
+        };
+
+        let provider = SmolVmProvider::new(&binary).with_env_lookup(rejected);
+        let error = provider.create(&spec).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                VmError::InvalidSandboxEnv {
+                    variable: "SMOLVM_SECCOMP",
+                    ..
+                }
+            ),
+            "expected InvalidSandboxEnv, got {error}"
+        );
+
+        // Same provider, same (still unset) probe cell, corrected environment.
+        provider
+            .clone()
+            .with_env_lookup(unset)
+            .create(&spec)
+            .await
+            .unwrap();
+    }
+
+    /// The text an x86_64 pool actually produced (audit: `preloop serve`
+    /// golden start on cpane, smolvm 1.22.2/1.30.1): libkrun reports the MMIO
+    /// bus running out of IRQ lines, wrapped in the `EINVAL` smolvm prints for
+    /// every rejected boot configuration.
+    const REAL_IRQ_FAILURE: &str = "Starting machine 'cpane-runner-golden' with 2 mount(s)...\n\
+         Error: agent operation failed: monitor agent: start vm: krun_start_enter returned: -22 \
+         (EINVAL — libkrun rejected the VM configuration usually a disk/overlay that could not be \
+         opened (still held by another VM that has not fully exited, or a corrupt/foreign-owned \
+         image) or an unsupported device option)\n\
+         libkrun detail: build microVM: Cannot initialize a MMIO Network Device or add a device to \
+         the MMIO Bus. no more IRQs are available\n\
+         (boot process exited (code 1) before the agent was ready)";
+
+    /// The real failure text is classified, in both spellings upstream uses.
+    #[test]
+    fn irq_exhaustion_signature_matches_the_reported_failure() {
+        assert!(super::is_irq_exhaustion(REAL_IRQ_FAILURE));
+        assert!(super::is_irq_exhaustion(
+            "smolvm start failed with exit code 1: RegisterNetDevice(IrqsExhausted)"
+        ));
+        // Truncated at the capture limit, the signature still has to match.
+        assert!(super::is_irq_exhaustion("no more IRQs are available"));
+    }
+
+    /// Every other start failure keeps its own message: the same `EINVAL` for
+    /// a held or corrupt disk is the documented look-alike, and a misclassified
+    /// device budget would send the operator chasing mounts instead of disks.
+    #[test]
+    fn unrelated_boot_failures_are_not_irq_exhaustion() {
+        for stderr in [
+            "Error: agent operation failed: monitor agent: start vm: krun_start_enter returned: \
+             -22 (EINVAL — libkrun rejected the VM configuration usually a disk/overlay that could \
+             not be opened (still held by another VM that has not fully exited, or a \
+             corrupt/foreign-owned image) or an unsupported device option)",
+            "Error: krun_start_enter returned: -22 (EINVAL)",
+            "Error: agent operation failed: fork: golden 'preloop-runner-golden' is already \
+             paused; a valid retained checkpoint is required",
+            "Error: running guest agent does not support safe shutdown; VM left unchanged; update \
+             the guest agent before retrying",
+            "Cannot access /dev/kvm (permission denied)",
+            "Error: tar error: No space left on device",
+            "error: unrecognized option '--mount-socket'",
+            // Names the MMIO bus and an IRQ line, but reports no exhaustion.
+            "build microVM: cannot add IRQ line 12 to the MMIO bus: address already in use",
+        ] {
+            assert!(
+                !super::is_irq_exhaustion(stderr),
+                "must not classify as IRQ exhaustion: {stderr}"
+            );
+        }
+    }
+
+    /// The message the operator reads: what happened, the inventory the spec
+    /// declared, the version in use, both x86_64 ceilings, the remedy — and the
+    /// raw smolvm output after it.
+    #[test]
+    fn irq_exhaustion_message_names_the_inventory_version_ceilings_and_remedy() {
+        let message = super::irq_exhaustion_message(
+            "preloop-runner-golden",
+            "start",
+            Some(super::DeclaredDevices {
+                volumes: 3,
+                sockets: 1,
+            }),
+            Some("smolvm 1.18.2"),
+            REAL_IRQ_FAILURE,
+        );
+        for expected in [
+            "needs more virtio devices than this host's SmolVM provides",
+            "3 volume mount(s), 1 socket mount(s)",
+            "4 device(s) on top of the 9-device launcher set",
+            "x86_64 libkrun allocates 19 IRQ lines (5-23) to virtio devices on SmolVM >= 1.23.0 \
+             and 11 before that",
+            "the arm64/macOS ceiling has not been measured",
+            "`smolvm --version` on this host reports smolvm 1.18.2",
+            "Upgrade SmolVM to >= 1.30.1 (`preloop update --ensure-runtime`) or start this machine \
+             with fewer mounts",
+        ] {
+            assert!(
+                message.contains(expected),
+                "`{expected}` missing from:\n{message}"
+            );
+        }
+        assert!(
+            message.ends_with(REAL_IRQ_FAILURE),
+            "the raw smolvm output must be appended:\n{message}"
+        );
+
+        // An adopted machine has no recorded spec: the diagnostic says so and
+        // still names the budget, instead of inventing a count.
+        let adopted = super::irq_exhaustion_message(
+            "preloop-runner-golden",
+            "start_forkable",
+            None,
+            None,
+            REAL_IRQ_FAILURE,
+        );
+        assert!(
+            adopted.contains("not recorded in this process"),
+            "an unknown inventory must be reported as unknown:\n{adopted}"
+        );
+        assert!(adopted.contains("9-device launcher set"));
+        assert!(adopted.contains("could not be read"));
+        assert!(adopted.ends_with(REAL_IRQ_FAILURE));
+    }
+
+    /// The declared inventory counts the spec's mounts, and only those: the
+    /// disks every machine carries are the documented baseline.
+    #[test]
+    fn declared_devices_counts_volumes_and_sockets_from_the_spec() {
+        let mut spec = MachineSpec {
+            name: MachineName::new("runner-0").unwrap(),
+            image: "ghcr.io/acme/runner:latest".to_owned(),
+            cpus: 2,
+            memory_mib: 256,
+            storage_gib: 10,
+            overlay_gib: Some(10),
+            network: NetworkPolicy::Disabled,
+            volumes: Vec::new(),
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
+        };
+        assert_eq!(super::DeclaredDevices::default().total(), 0);
+        spec.volumes = vec![
+            VolumeMount {
+                host: PathBuf::from("/host/bundle"),
+                guest: PathBuf::from("/opt/preloop/bin"),
+                read_only: true,
+            },
+            VolumeMount {
+                host: PathBuf::from("/host/control"),
+                guest: PathBuf::from("/run/preloop-control"),
+                read_only: false,
+            },
+        ];
+        spec.sockets = vec![SocketMount {
+            host: PathBuf::from("/host/engine.sock"),
+            guest: PathBuf::from("/run/preloop-engine.sock"),
+        }];
+        assert_eq!(
+            spec.declared_devices(),
+            super::DeclaredDevices {
+                volumes: 2,
+                sockets: 1
+            }
+        );
+        assert_eq!(spec.declared_devices().total(), 3);
+    }
+
+    /// A guest-local volume is a bare guest path. A relative one, a colon (the
+    /// `host:guest[:ro]` delimiter), or a control byte would change the CLI
+    /// form or cannot be passed at all, so those are rejected at every
+    /// constructor: direct, serde, and the environment override.
+    #[test]
+    fn guest_volume_paths_must_fit_the_bare_path_cli_form() {
+        assert!(GuestVolume::new("/var/lib/docker").is_ok());
+        assert!(GuestVolume::new("/srv/my state").is_ok());
+        assert!(GuestVolume::new("/srv/docker.sock").is_ok());
+        assert!(GuestVolume::new("/srv/データ").is_ok());
+        let relative = GuestVolume::new("var/lib/docker").unwrap_err();
+        assert!(
+            matches!(&relative, VmError::InvalidSpec(message) if message.contains("absolute")),
+            "{relative:?}"
+        );
+        for value in ["/host/cache:/guest/cache", "/var/lib/do:cker"] {
+            let colon = GuestVolume::new(value).unwrap_err();
+            assert!(
+                matches!(&colon, VmError::InvalidSpec(message) if message.contains("host:guest")),
+                "{colon:?}"
+            );
+        }
+        for value in [
+            "/var/lib/docker\0",
+            "/var/lib/dock\ner",
+            "/var/lib/dock\t er",
+        ] {
+            let control = GuestVolume::new(value).unwrap_err();
+            assert!(
+                matches!(&control, VmError::InvalidSpec(message) if message.contains("control")),
+                "{control:?}"
+            );
+        }
+        // The serde constructor is the same validation: a persisted or
+        // deserialized machine cannot smuggle a host mount through.
+        assert!(
+            serde_json::from_str::<GuestVolume>("\"/host/cache:/guest/cache\"").is_err(),
+            "deserialization must reject the host:guest form"
+        );
+        // The host override goes through the same constructor.
+        let invalid = MachineSpec::resolve_guest_volumes(
+            None,
+            Some("/host/cache:/guest/cache"),
+            MachineRole::OfficialPack,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&invalid, VmError::InvalidSpec(message) if message.contains("host:guest")),
+            "{invalid:?}"
+        );
+        assert_eq!(
+            GuestVolume::new("/var/lib/containerd").unwrap().as_path(),
+            Path::new("/var/lib/containerd")
+        );
+    }
+
+    /// The default guest-local volumes are opt-in per role: only the official
+    /// runner pack opts into the known layout. A custom pack keeps its packed
+    /// container state visible, and a builder never mounts over state the pack
+    /// cannot capture. `Some([])` is the explicit off switch alongside an
+    /// empty host override.
+    #[test]
+    fn guest_volumes_follow_the_machine_role_and_honour_explicit_disable() {
+        let paths = |configured: Option<&str>, role| {
+            MachineSpec::resolve_guest_volumes(None, configured, role)
+                .expect("valid")
+                .into_iter()
+                .map(|volume| volume.as_path().display().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(None, MachineRole::OfficialPack),
+            vec![
+                "/var/lib/docker".to_owned(),
+                "/var/lib/containerd".to_owned()
+            ]
+        );
+        assert_eq!(
+            paths(
+                Some("/var/lib/docker,/srv/state"),
+                MachineRole::OfficialPack
+            ),
+            vec!["/var/lib/docker".to_owned(), "/srv/state".to_owned()]
+        );
+        // An empty override is the documented off switch.
+        assert!(paths(Some(""), MachineRole::OfficialPack).is_empty());
+        assert!(paths(Some("   "), MachineRole::OfficialPack).is_empty());
+        // An ordinary custom pack defaults to no mounts: its
+        // /var/lib/docker may be exactly where its preloaded images live.
+        assert!(paths(None, MachineRole::CustomPack).is_empty());
+        // An operator can still opt a custom pack in explicitly.
+        assert_eq!(
+            paths(Some("/srv/state"), MachineRole::CustomPack),
+            vec!["/srv/state".to_owned()]
+        );
+        // Builders and image machines never take the host override: the
+        // builder's writes would land on a disk `pack create` does not pack.
+        for role in [MachineRole::Builder, MachineRole::Image] {
+            assert!(paths(None, role).is_empty());
+            assert!(paths(Some("/var/lib/docker"), role).is_empty());
+        }
+        // An explicit list (including the empty one) is honoured wherever it
+        // is asked for and beats the host override.
+        let explicit = vec![GuestVolume::new("/srv/state").unwrap()];
+        assert_eq!(
+            MachineSpec::resolve_guest_volumes(
+                Some(&explicit),
+                Some("/host:guest"),
+                MachineRole::Image
+            )
+            .expect("valid"),
+            explicit
+        );
+        assert!(
+            MachineSpec::resolve_guest_volumes(Some(&[]), None, MachineRole::OfficialPack)
+                .expect("valid")
+                .is_empty()
+        );
+        // A configured relative path is a typo, not a silent no-op.
+        let invalid = MachineSpec::resolve_guest_volumes(
+            None,
+            Some("/var/lib/docker,relative"),
+            MachineRole::OfficialPack,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&invalid, VmError::InvalidSpec(message) if message.contains("absolute")),
+            "{invalid:?}"
+        );
+    }
+
+    /// Only the official pack gets the managed systemd workload by default. A
+    /// custom pack keeps its own entrypoint unless the host switch or the spec
+    /// names one, and a builder never takes an ambient default.
+    #[test]
+    fn workload_init_follows_the_machine_role_and_honours_explicit_disable() {
+        let resolve = |explicit: Option<&[String]>, configured: Option<&str>, role| {
+            MachineSpec::resolve_workload_init(explicit, configured, role)
+        };
+        assert_eq!(
+            resolve(None, None, MachineRole::OfficialPack),
+            Some(vec!["/sbin/init".to_owned()])
+        );
+        // A custom pack's init is part of the source the operator chose.
+        assert!(resolve(None, None, MachineRole::CustomPack).is_none());
+        assert_eq!(
+            resolve(
+                None,
+                Some("/lib/systemd/systemd --system"),
+                MachineRole::OfficialPack
+            ),
+            Some(vec![
+                "/lib/systemd/systemd".to_owned(),
+                "--system".to_owned()
+            ])
+        );
+        assert_eq!(
+            resolve(
+                None,
+                Some("/lib/systemd/systemd --system"),
+                MachineRole::CustomPack
+            ),
+            Some(vec![
+                "/lib/systemd/systemd".to_owned(),
+                "--system".to_owned()
+            ]),
+            "the host switch is an explicit opt-in for a custom pack"
+        );
+        assert_eq!(
+            resolve(None, Some("  /sbin/init  "), MachineRole::OfficialPack),
+            Some(vec!["/sbin/init".to_owned()]),
+            "surrounding whitespace is trimmed, not passed as an argument"
+        );
+        assert!(resolve(None, Some(""), MachineRole::OfficialPack).is_none());
+        assert!(resolve(None, Some("   "), MachineRole::CustomPack).is_none());
+        // The explicit empty list disables even when the host switch is set.
+        assert!(resolve(Some(&[]), Some("/sbin/init"), MachineRole::CustomPack).is_none());
+        // An explicit per-machine command wins over the host switch.
+        let explicit = vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()];
+        for role in [MachineRole::OfficialPack, MachineRole::CustomPack] {
+            assert_eq!(
+                resolve(Some(&explicit), Some(""), role),
+                Some(explicit.clone())
+            );
+        }
+        // A builder runs only what was asked for: its default is the pack's
+        // own entrypoint, not a workload that writes over the state it exports.
+        assert!(resolve(None, None, MachineRole::Builder).is_none());
+        assert!(resolve(None, Some("/sbin/init"), MachineRole::Builder).is_none());
+        assert_eq!(
+            resolve(Some(&explicit), Some("/sbin/init"), MachineRole::Builder),
+            Some(explicit)
+        );
+        // Image machines never get one: their keep-alive handling is separate.
+        assert!(resolve(None, None, MachineRole::Image).is_none());
+        assert!(resolve(Some(&["/sbin/init".to_owned()]), None, MachineRole::Image).is_none());
+    }
+
+    /// `--dns` only reaches a guest on the TSI backend, where a systemd guest
+    /// wants the resolved stub; an explicit value always wins, and a machine
+    /// with networking off never gains a resolver (`--dns` implies `--net`).
+    #[test]
+    fn resolved_guest_dns_is_the_stub_only_for_a_tsi_systemd_machine() {
+        assert_eq!(
+            resolved_guest_dns(None, true, "tsi", true),
+            Some("127.0.0.53".to_owned())
+        );
+        assert_eq!(resolved_guest_dns(None, true, "virtio-net", true), None);
+        assert_eq!(resolved_guest_dns(None, true, "tsi", false), None);
+        assert_eq!(resolved_guest_dns(None, false, "tsi", true), None);
+        assert_eq!(
+            resolved_guest_dns(Some("8.8.8.8"), true, "tsi", true),
+            Some("8.8.8.8".to_owned())
+        );
+        assert_eq!(
+            resolved_guest_dns(Some("  "), true, "virtio-net", true),
+            None
+        );
+    }
+
+    /// Only a workload that starts systemd gets the implicit stub: the managed
+    /// `/sbin/init` default and an operator-named `systemd` binary qualify, an
+    /// arbitrary command does not, and anything unrecognized fails closed.
+    #[test]
+    fn the_implicit_stub_requires_a_systemd_workload() {
+        let workload = |command: &[&str]| -> Option<Vec<String>> {
+            Some(command.iter().map(|arg| (*arg).to_owned()).collect())
+        };
+        for command in [
+            &["/sbin/init"][..],
+            &["/lib/systemd/systemd", "--system"][..],
+        ] {
+            assert!(
+                workload_init_is_systemd(workload(command).as_deref()),
+                "{command:?}"
+            );
+        }
+        for command in [
+            &["/bin/sh", "-c", "sleep infinity"][..],
+            &["sleep", "infinity"][..],
+            &[""][..],
+        ] {
+            assert!(
+                !workload_init_is_systemd(workload(command).as_deref()),
+                "{command:?}"
+            );
+        }
+        assert!(!workload_init_is_systemd(None));
+        assert!(!workload_init_is_systemd(Some(&[])));
+        assert_eq!(
+            resolved_guest_dns(
+                None,
+                true,
+                "tsi",
+                workload_init_is_systemd(workload(&["/bin/sh", "-c", "sleep infinity"]).as_deref())
+            ),
+            None,
+            "a custom non-systemd workload has nothing answering on the stub"
+        );
+        assert_eq!(
+            resolved_guest_dns(
+                Some("8.8.8.8"),
+                true,
+                "tsi",
+                workload_init_is_systemd(workload(&["/bin/sh"]).as_deref())
+            ),
+            Some("8.8.8.8".to_owned()),
+            "an explicit resolver still wins"
+        );
+    }
+
+    /// End to end through the provider: a `machine start` that reports IRQ
+    /// exhaustion comes back as [`VmError::IrqExhausted`] carrying the spec's
+    /// inventory and the reported smolvm version, and its `Display` is the
+    /// actionable message rather than smolvm's bare `EINVAL`.
+    #[cfg(unix)]
+    #[tokio::test]
+    // The PRELOOP_HOME guard must stay held across the awaits: `create` and
+    // `start` resolve the runtime environment through `effective_preloop_home`.
+    // Sync locking across awaits is the established pattern for the
+    // env-mutating suite.
+    #[allow(clippy::await_holding_lock)]
+    async fn start_failure_with_the_irq_signature_becomes_the_dedicated_variant() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let _agent_rootfs = AgentRootfsGuard::set();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        // The failure text lives in a file: it carries quotes of its own, so
+        // it cannot be inlined into the fake's shell script safely.
+        let failure = scratch.path().join("irq-failure.txt");
+        std::fs::write(&failure, REAL_IRQ_FAILURE).expect("failure fixture");
+        let binary = fake_smolvm(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 --version) echo 'smolvm 1.18.2' ;;\n\
+                 esac\n\
+                 case \"$1 $2\" in\n\
+                 \"machine create\") echo 'created' ;;\n\
+                 \"machine start\") cat '{failure}' >&2; exit 1 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                failure = failure.display()
+            ),
+        );
+        let provider = super::SmolVmProvider::new(&binary);
+        let bundle = scratch.path().join("bundle");
+        let control = scratch.path().join("control");
+        for dir in [&bundle, &control] {
+            std::fs::create_dir_all(dir).expect("mount source");
+        }
+        let spec = MachineSpec {
+            name: MachineName::new("runner-0").unwrap(),
+            image: "ghcr.io/acme/runner:latest".to_owned(),
+            cpus: 2,
+            memory_mib: 256,
+            storage_gib: 10,
+            overlay_gib: None,
+            network: NetworkPolicy::Disabled,
+            volumes: vec![
+                VolumeMount {
+                    host: bundle,
+                    guest: PathBuf::from("/opt/preloop/bin"),
+                    read_only: true,
+                },
+                VolumeMount {
+                    host: control,
+                    guest: PathBuf::from("/run/preloop-control"),
+                    read_only: false,
+                },
+            ],
+            sockets: Vec::new(),
+            dns: None,
+            rosetta: false,
+            role: MachineRole::Image,
+            guest_volumes: None,
+            workload_init: None,
+        };
+        provider.create(&spec).await.expect("create");
+
+        let error = provider
+            .start(&spec.name)
+            .await
+            .expect_err("start must fail");
+        let VmError::IrqExhausted {
+            machine,
+            operation,
+            declared,
+            smolvm_version,
+            message,
+        } = &error
+        else {
+            panic!("expected IrqExhausted, got {error}");
+        };
+        assert_eq!(machine, "runner-0");
+        assert_eq!(*operation, "start");
+        assert_eq!(
+            *declared,
+            Some(super::DeclaredDevices {
+                volumes: 2,
+                sockets: 0
+            })
+        );
+        assert_eq!(smolvm_version.as_deref(), Some("smolvm 1.18.2"));
+        let rendered = error.to_string();
+        assert_eq!(&rendered, message);
+        assert!(rendered.contains("2 volume mount(s), 0 socket mount(s)"));
+        assert!(rendered.contains("Upgrade SmolVM to >= 1.30.1"));
+        assert!(rendered.contains("no more IRQs are available"));
+        // The ledger is per machine: an adopted machine has no entry, and the
+        // message must say that instead of borrowing another machine's count.
+        let adopted = provider
+            .start(&MachineName::new("adopted-golden").unwrap())
+            .await
+            .expect_err("start must fail");
+        assert!(
+            matches!(adopted, VmError::IrqExhausted { declared: None, .. }),
+            "expected an unknown inventory, got {adopted}"
+        );
+        // A deleted machine's inventory goes with it, so a name reused later
+        // cannot report the previous machine's devices.
+        provider.delete(&spec.name).await.expect("delete");
+        let reused = provider
+            .start(&spec.name)
+            .await
+            .expect_err("start must fail");
+        assert!(
+            matches!(reused, VmError::IrqExhausted { declared: None, .. }),
+            "a deleted machine must not keep its inventory, got {reused}"
+        );
+    }
+
+    /// The other half of the classification: a start failure without the
+    /// signature keeps its `Command` error, so the pool's existing
+    /// held-disk/corrupt-image diagnosis is untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn start_failure_without_the_signature_keeps_its_command_error() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let _agent_rootfs = AgentRootfsGuard::set();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        let held_disk = scratch.path().join("held-disk.txt");
+        std::fs::write(
+            &held_disk,
+            "Error: agent operation failed: monitor agent: start vm: krun_start_enter returned: \
+             -22 (EINVAL — libkrun rejected the VM configuration usually a disk/overlay that could \
+             not be opened (still held by another VM that has not fully exited, or a \
+             corrupt/foreign-owned image) or an unsupported device option)",
+        )
+        .expect("failure fixture");
+        let binary = fake_smolvm(
+            scratch.path(),
+            &format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 --version) echo 'smolvm 1.30.1' ;;\n\
+                 esac\n\
+                 case \"$1 $2\" in\n\
+                 \"machine create\") echo 'created' ;;\n\
+                 \"machine start\") cat '{held_disk}' >&2; exit 1 ;;\n\
+                 esac\n\
+                 exit 0\n",
+                held_disk = held_disk.display()
+            ),
+        );
+        let provider = super::SmolVmProvider::new(&binary);
+        let error = provider
+            .start(&MachineName::new("runner-0").unwrap())
+            .await
+            .expect_err("start must fail");
+        assert!(
+            matches!(
+                error,
+                VmError::Command {
+                    operation: "start",
+                    exit_code: 1,
+                    ..
+                }
+            ),
+            "a held-disk EINVAL must keep its Command error, got {error}"
+        );
+        assert!(
+            !error.to_string().contains("virtio devices"),
+            "must not claim a device budget: {error}"
+        );
+    }
+
+    /// `start_forkable` is the rearm path a pool takes after a graceful
+    /// shutdown; it boots the same launcher and must classify identically.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn start_forkable_failures_are_classified_too() {
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let _agent_rootfs = AgentRootfsGuard::set();
+        let home = tempfile::tempdir().expect("home");
+        let _home = PreloopHomeGuard::set(home.path());
+        let scratch = tempfile::tempdir().expect("scratch");
+        let binary = fake_smolvm(
+            scratch.path(),
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             --version) echo 'smolvm 1.30.1' ;;\n\
+             esac\n\
+             echo 'libkrun detail: build microVM: no more IRQs are available' >&2\n\
+             exit 1\n",
+        );
+        let provider = super::SmolVmProvider::new(&binary);
+        let error = provider
+            .start_forkable(&MachineName::new("preloop-runner-golden").unwrap())
+            .await
+            .expect_err("start_forkable must fail");
+        assert!(
+            matches!(
+                error,
+                VmError::IrqExhausted {
+                    operation: "start_forkable",
+                    ..
+                }
+            ),
+            "expected IrqExhausted, got {error}"
+        );
+        // The floor the message tells the operator to upgrade to is compiled
+        // from versions.toml, never a literal in this file.
+        assert!(error.to_string().contains(super::SMOLVM_MIN_VERSION));
+    }
+
+    /// The egress-floor policy needs a backend that carries it, so
+    /// virtio-net is the default and the only recognized escape hatch is an
+    /// exact `tsi`; anything else (including a typo) keeps virtio-net rather
+    /// than silently dropping the floor.
+    #[test]
+    fn public_only_net_backend_defaults_to_virtio_net_and_honors_only_exact_overrides() {
+        assert_eq!(public_only_net_backend(fake_env(&[])), "virtio-net");
+        assert_eq!(
+            public_only_net_backend(fake_env(&[("PRELOOP_SMOLVM_NET_BACKEND", "tsi")])),
+            "tsi"
+        );
+        assert_eq!(
+            public_only_net_backend(fake_env(&[("PRELOOP_SMOLVM_NET_BACKEND", "virtio-net")])),
+            "virtio-net"
+        );
+        for bogus in ["", "TSI", "gvproxy"] {
+            assert_eq!(
+                public_only_net_backend(fake_env(&[("PRELOOP_SMOLVM_NET_BACKEND", bogus)])),
+                "virtio-net",
+                "`{bogus}` must not select a backend that cannot carry the egress floor"
+            );
+        }
+    }
+
+    /// Write an executable stand-in for a host tool that records its pid in the
+    /// file named by its first argument and then sleeps forever.
+    #[cfg(unix)]
+    fn wedged_tool(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join(name);
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nprintf 'pid=%s\\n' \"$$\" > \"$1\"\nexec sleep 300\n",
+        )
+        .expect("write wedged tool");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod wedged tool");
+        binary
+    }
+
+    /// The pid the wedged tool recorded in `record`, once it is there.
+    #[cfg(unix)]
+    fn recorded_pid(record: &std::path::Path) -> i32 {
+        let budget = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < budget {
+            if let Ok(text) = std::fs::read_to_string(record)
+                && let Some(pid) = text
+                    .trim()
+                    .strip_prefix("pid=")
+                    .and_then(|pid| pid.parse::<i32>().ok())
+            {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("{} was never written", record.display());
+    }
+
+    /// Poll until `pid` is gone, up to `budget`.
+    #[cfg(unix)]
+    fn await_process_gone(pid: i32, budget: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            if !process_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A host tool that never exits must be killed at its deadline, and the
+    /// error must name the tool and the deadline: this is what keeps
+    /// `hdiutil`/`ps`/`mount` from wedging the sweep that runs them, and what
+    /// lets an operator tell a hang from a failure.
+    #[cfg(unix)]
+    #[test]
+    fn host_tool_deadline_kills_a_wedged_tool() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let tool = wedged_tool(dir.path(), "wedged-tool");
+        let record = dir.path().join("wedged-tool.pid");
+        // The helper owns the spawn, so the deadline has to outlast this test
+        // binary's own exec latency — measured in seconds under a fully loaded
+        // `cargo test` — before the assertion about the *tool* (its pid file,
+        // its death) means anything. Three seconds is still orders of
+        // magnitude below every production deadline.
+        let deadline = Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        let error = run_host_tool(
+            "ps",
+            tool.to_str().unwrap(),
+            &[record.to_str().unwrap()],
+            deadline,
+        )
+        .expect_err("a tool that never exits must hit its deadline");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&error, VmError::TimedOut { operation, deadline: named, program }
+                if *operation == "ps"
+                    && *named == deadline
+                    && program == tool.to_str().unwrap()),
+            "expected a named deadline error, got {error:?}"
+        );
+        assert!(
+            elapsed >= deadline,
+            "returned before the deadline elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the deadline took {elapsed:?} to fire"
+        );
+        let pid = recorded_pid(&record);
+        assert!(
+            await_process_gone(pid, std::time::Duration::from_secs(10)),
+            "the tool must be SIGKILLed at its deadline, not left running"
+        );
+    }
+
+    /// The runtime executables in the field are wrappers: a script that spawns
+    /// the real `smolvm` and waits for it. Killing only the wrapper pid at the
+    /// deadline would return `TimedOut` and release the lifecycle lock while
+    /// the operation the wrapper started keeps running, so a retry races it.
+    /// The deadline therefore signals the child's whole process group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_deadline_kills_the_runtime_the_wrapper_spawned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("scratch");
+        let tool = dir.path().join("wrapper-runtime");
+        let record = dir.path().join("wrapper-runtime.pid");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\n\
+             sleep 300 &\n\
+             printf 'pid=%s\\n' \"$!\" > \"$1\"\n\
+             wait\n",
+        )
+        .expect("write the wrapper stand-in");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the wrapper stand-in");
+        let deadline = Duration::from_secs(3);
+        let mut command = Command::new(&tool);
+        command.arg(&record);
+        let started = std::time::Instant::now();
+        let error = run_runtime_command("exec", &tool, command, DEFAULT_CAPTURE_LIMIT, deadline)
+            .await
+            .expect_err("a wrapper that waits on a wedged runtime must hit its deadline");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&error, VmError::TimedOut { operation, deadline: named, .. }
+                if *operation == "exec" && *named == deadline),
+            "expected a named deadline error, got {error:?}"
+        );
+        assert!(
+            elapsed >= deadline && elapsed < std::time::Duration::from_secs(30),
+            "deadline fired at {elapsed:?}"
+        );
+        let runtime = recorded_pid(&record);
+        assert!(
+            await_process_gone(runtime, std::time::Duration::from_secs(10)),
+            "the runtime the wrapper spawned (pid {runtime}) outlived the deadline; \
+             a retry would race an operation that never stopped"
+        );
+    }
+
+    /// A child that writes more than the 64 KiB pipe buffer before exiting must
+    /// still complete: the drain is what keeps it from blocking on a full pipe,
+    /// which would look exactly like a hang and be reported as one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chatty_child_still_completes() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "i=0; while [ $i -lt 6000 ]; do \
+             printf 'line %s aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' \"$i\"; \
+             i=$((i+1)); done",
+        ]);
+        let output = run_runtime_command(
+            "exec",
+            Path::new("sh"),
+            command,
+            DEFAULT_CAPTURE_LIMIT,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a chatty child that exits must not be reported as a hang");
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            output.stdout.len() > 64 * 1024,
+            "expected more than one pipe buffer, captured {} bytes",
+            output.stdout.len()
+        );
+        assert!(!output.truncated, "the capture is below the provider cap");
+        assert!(String::from_utf8_lossy(&output.stdout).starts_with("line 0 "));
+    }
+
+    /// A capability probe that ran out of time must not be cached as
+    /// "unsupported": caching a wedge would disable socket mounts for the
+    /// process's whole life. The cell stores only `Ok`, so a later probe — after
+    /// the runtime recovers — gets to answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_timed_out_capability_probe_is_not_cached() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _home_guard = PRELOOP_HOME_LOCK.lock();
+        let _agent_rootfs = AgentRootfsGuard::set();
+        let dir = tempfile::tempdir().expect("scratch");
+        let tool = dir.path().join("smolvm");
+        let probed = dir.path().join("probed");
+        std::fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 --version) echo 'smolvm 1.15.0'; exit 0 ;;\n\
+                 esac\n\
+                 if [ -f '{state}' ]; then\n\
+                   printf '%s\\n' 'Usage: smolvm machine create [--mount-socket]'\n\
+                   exit 0\n\
+                 fi\n\
+                 : > '{state}'\n\
+                 exec sleep 300\n",
+                state = probed.display()
+            ),
+        )
+        .expect("write fake smolvm");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake smolvm");
+
+        let provider = SmolVmProvider::new(&tool).with_deadlines(WaitDeadlines {
+            probe: Duration::from_secs(3),
+            ..WaitDeadlines::default()
+        });
+        let first = provider
+            .socket_mount_supported
+            .get_or_try_init(|| provider.supports_mount_socket())
+            .await;
+        assert!(
+            matches!(&first, Err(VmError::TimedOut { operation, .. })
+                if *operation == "machine create --help"),
+            "a wedged probe must surface as a timeout, got {first:?}"
+        );
+        let second = provider
+            .socket_mount_supported
+            .get_or_try_init(|| provider.supports_mount_socket())
+            .await;
+        assert!(
+            matches!(&second, Ok(true)),
+            "a timed-out probe must not be cached as unsupported, got {second:?}"
+        );
+    }
+}

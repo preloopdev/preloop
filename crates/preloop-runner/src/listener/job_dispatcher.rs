@@ -860,6 +860,25 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    /// Write the `.runner` metadata the worker validates before `run_job`.
+    /// The URL is a local, non-GitHub engine, and only `.runner` is written:
+    /// tests must not need the credential files to dispatch a job.
+    fn write_runner_metadata(root: &std::path::Path) {
+        std::fs::write(
+            root.join(".runner"),
+            r#"{
+                "agentId": 1,
+                "agentName": "test-runner",
+                "poolId": 1,
+                "serverUrl": "http://127.0.0.1:1",
+                "gitHubUrl": "http://127.0.0.1:1",
+                "workFolder": "_work",
+                "controlPlane": "engine"
+            }"#,
+        )
+        .unwrap();
+    }
+
     /// Fake status provider for testing ensure_dispatch_finished.
     struct FakeStatusProvider {
         response: serde_json::Value,
@@ -881,6 +900,7 @@ mod tests {
     #[tokio::test]
     async fn test_worker_dispatch_run_new_job() {
         let dir = TempDir::new().unwrap();
+        write_runner_metadata(dir.path());
         let workspace_dir = dir.path().join("work");
         let payload = serde_json::json!({
             "jobId": "job-worker-1",
@@ -910,6 +930,7 @@ mod tests {
     #[tokio::test]
     async fn test_worker_dispatch_cancellation() {
         let dir = TempDir::new().unwrap();
+        write_runner_metadata(dir.path());
         let workspace_dir = dir.path().join("work");
         let payload = serde_json::json!({
             "jobId": "job-worker-cancel",
@@ -1015,6 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_job_extracts_request_id_from_job_id() {
         let dir = TempDir::new().unwrap();
+        write_runner_metadata(dir.path());
         let payload = serde_json::json!({
             "jobId": "my-unique-job-42",
             "jobDisplayName": "Test",
@@ -1033,6 +1055,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_job_extracts_request_id_from_fallback() {
         let dir = TempDir::new().unwrap();
+        write_runner_metadata(dir.path());
         let payload = serde_json::json!({
             "requestId": "fallback-id",
             "jobDisplayName": "Test",
@@ -1141,9 +1164,166 @@ mod tests {
         );
     }
 
+    /// A worker started without `.runner` must exit non-zero before any
+    /// workflow step, and its error must name the missing registration so the
+    /// listener's crash annotation tells the operator what to fix.
+    #[tokio::test]
+    async fn missing_runner_metadata_fails_worker_before_job_execution() {
+        let dir = TempDir::new().unwrap();
+        let workspace_dir = dir.path().join("work");
+        let marker = workspace_dir.join("should-not-exist");
+        let payload = serde_json::json!({
+            "jobId": "missing-metadata-job",
+            "jobDisplayName": "Missing Metadata",
+            "steps": [{
+                "id": "step-1",
+                "contextName": "step1",
+                "displayName": "Must Not Run",
+                "run": format!("touch {}", marker.display()),
+                "shell": "bash"
+            }],
+            "fileTable": {"workDirectory": workspace_dir.to_str().unwrap()}
+        });
+
+        let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
+            .await
+            .unwrap();
+        assert!(
+            !running.wait().await.unwrap(),
+            "the worker must fail when registration metadata is missing"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tail = running.worker_output_tail();
+        assert!(
+            tail.contains(".runner"),
+            "the worker error must name the missing .runner, got: {tail:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "no workflow step may run without valid registration metadata"
+        );
+    }
+
+    /// Unknown planes and malformed legacy registration URLs are corrupt
+    /// metadata, not implicit engine registrations. The worker must fail
+    /// before the step can run, naming the field or URL problem.
+    #[tokio::test]
+    async fn invalid_runner_metadata_fails_worker_before_job_execution() {
+        let cases = [
+            (
+                "unknown-plane",
+                r#"{
+                    "agentId": 1,
+                    "agentName": "test-runner",
+                    "poolId": 1,
+                    "serverUrl": "http://127.0.0.1:1",
+                    "gitHubUrl": "http://127.0.0.1:1",
+                    "workFolder": "_work",
+                    "controlPlane": "surprise"
+                }"#,
+                "controlPlane",
+            ),
+            (
+                "malformed-url",
+                r#"{
+                    "agentId": 1,
+                    "agentName": "test-runner",
+                    "poolId": 1,
+                    "serverUrl": "http://127.0.0.1:1",
+                    "gitHubUrl": "not a url",
+                    "workFolder": "_work"
+                }"#,
+                "registration URL",
+            ),
+        ];
+
+        for (name, metadata, expected) in cases {
+            let dir = TempDir::new().unwrap();
+            std::fs::write(dir.path().join(".runner"), metadata).unwrap();
+            let workspace_dir = dir.path().join("work");
+            let marker = workspace_dir.join("should-not-exist");
+            let payload = serde_json::json!({
+                "jobId": format!("invalid-metadata-{name}"),
+                "jobDisplayName": "Invalid Metadata",
+                "steps": [{
+                    "id": "step-1",
+                    "contextName": "step1",
+                    "displayName": "Must Not Run",
+                    "run": format!("touch {}", marker.display()),
+                    "shell": "bash"
+                }],
+                "fileTable": {"workDirectory": workspace_dir.to_str().unwrap()}
+            });
+
+            let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
+                .await
+                .unwrap();
+            assert!(
+                !running.wait().await.unwrap(),
+                "{name}: the worker must fail on invalid registration metadata"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let tail = running.worker_output_tail();
+            assert!(
+                tail.contains(expected),
+                "{name}: worker error must mention {expected:?}, got: {tail:?}"
+            );
+            assert!(
+                !marker.exists(),
+                "{name}: no workflow step may run with invalid registration metadata"
+            );
+        }
+    }
+
+    /// A pre-`controlPlane` `.runner` with a valid engine URL is migrated to
+    /// the engine plane and still executes; corruption, not age, is fatal.
+    #[tokio::test]
+    async fn legacy_runner_metadata_without_control_plane_executes_job() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(".runner"),
+            r#"{
+                "agentId": 1,
+                "agentName": "test-runner",
+                "poolId": 1,
+                "serverUrl": "http://127.0.0.1:1",
+                "gitHubUrl": "http://127.0.0.1:1",
+                "workFolder": "_work"
+            }"#,
+        )
+        .unwrap();
+        let workspace_dir = dir.path().join("work");
+        let marker = workspace_dir.join("legacy-ran");
+        let payload = serde_json::json!({
+            "jobId": "legacy-metadata-job",
+            "jobDisplayName": "Legacy Metadata",
+            "steps": [{
+                "id": "step-1",
+                "contextName": "step1",
+                "displayName": "Run",
+                "run": format!("touch {}", marker.display()),
+                "shell": "bash"
+            }],
+            "fileTable": {"workDirectory": workspace_dir.to_str().unwrap()}
+        });
+
+        let mut running = spawn_job(payload, dir.path(), ProtocolPath::Broker)
+            .await
+            .unwrap();
+        assert!(
+            running.wait().await.unwrap(),
+            "a valid legacy .runner must execute the job"
+        );
+        assert!(
+            marker.exists(),
+            "the legacy-registered job must run its step"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_job_captures_worker_stdout() {
         let dir = TempDir::new().unwrap();
+        write_runner_metadata(dir.path());
         let workspace_dir = dir.path().join("work");
         let payload = serde_json::json!({
             "jobId": "capture-job",
@@ -1178,6 +1358,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_gracefully_lets_worker_cancel_and_exit() {
         let dir = TempDir::new().unwrap();
+        write_runner_metadata(dir.path());
         let workspace_dir = dir.path().join("work");
         let payload = serde_json::json!({
             "jobId": "shutdown-job",
@@ -1265,6 +1446,7 @@ mod tests {
         });
 
         let dir = TempDir::new().unwrap();
+        write_runner_metadata(dir.path());
         let workspace_dir = dir.path().join("work");
         let payload = serde_json::json!({
             "jobId": "job-unacked",
@@ -1316,6 +1498,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_zombie_is_cancelled_before_next_dispatch() {
         let dir = TempDir::new().unwrap();
+        write_runner_metadata(dir.path());
         let payload = serde_json::json!({
             "jobId": "zombie-job",
             "requestId": 41,
@@ -1349,6 +1532,7 @@ mod tests {
     #[tokio::test]
     async fn active_overlap_is_fatal_and_does_not_drop_job_silently() {
         let dir = TempDir::new().unwrap();
+        write_runner_metadata(dir.path());
         let payload = serde_json::json!({
             "jobId": "active-job",
             "requestId": 42,
@@ -1372,6 +1556,7 @@ mod tests {
     #[tokio::test]
     async fn completed_worker_dispatches_normally_without_status_probe() {
         let dir = TempDir::new().unwrap();
+        write_runner_metadata(dir.path());
         let payload = serde_json::json!({
             "jobId": "normal-job",
             "requestId": 43,

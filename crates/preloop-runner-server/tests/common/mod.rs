@@ -102,6 +102,8 @@ pub use preloop_runner_server::secrets_api::*;
 
 pub use preloop_runner_server::shared_http::*;
 
+pub use preloop_runner_server::sarif::*;
+
 pub use preloop_runner_server::snapshots::*;
 
 pub use preloop_runner_server::state::*;
@@ -210,7 +212,6 @@ pub fn app(state: AppState, shutdown: CancellationToken) -> Router {
 /// `preserve_on_failure` is a property of the run, carried to the runner on the
 /// job message. It must be absent unless asked for, so the default wire shape
 /// stays byte-identical to what an official runner expects.
-
 pub fn selected_jobs_workflow() -> &'static str {
     r#"
 on: push
@@ -252,7 +253,7 @@ pub async fn open_protocol_live(app: &axum::Router, uri: String, bearer: &str) -
 
 /// The protocol live-log read route must not let one job's runtime
 /// credential read another job's output. A job may read its own feed.
-
+///
 /// Build a two-job run and return `(run_id, [(job_id, plan_id, agent_job_id)])`
 /// ordered by request id, so filter tests can address either job.
 pub async fn two_job_run_for_log_filters(
@@ -474,22 +475,35 @@ pub async fn open_live(app: &axum::Router, uri: String) -> Response {
 }
 
 /// Mint a blob JWT the way the signed-URL handlers do: `sub: preloop-blob`,
-/// `kind`, `job` ("" for system), `jti` = staging dir name. Returns
-/// `(jwt, jti)` — the pending-reservation maps key on `jti`.
-pub fn mint_blob_jwt(state: &AppState, kind: &str, job: &str) -> (String, String) {
+/// `kind`, `op` ("read" | "write"), `job` (never empty), `jti` = staging
+/// dir name. Returns `(jwt, jti)` — the pending-reservation maps key on
+/// `jti`.
+pub fn mint_blob_jwt(state: &AppState, kind: &str, job: &str, op: &str) -> (String, String) {
     let jti = uuid::Uuid::new_v4().to_string();
-    let jwt = state
+    (mint_blob_jwt_for_jti(state, kind, job, op, &jti), jti)
+}
+
+/// Mint a blob JWT for an existing staging dir `jti` (e.g. a `read` token
+/// for a blob uploaded through a `write` token).
+pub fn mint_blob_jwt_for_jti(
+    state: &AppState,
+    kind: &str,
+    job: &str,
+    op: &str,
+    jti: &str,
+) -> String {
+    state
         .local_jwt_with_lifetime(
             json!({
                 "sub": "preloop-blob",
                 "kind": kind,
+                "op": op,
                 "job": job,
                 "jti": jti,
             }),
-            crate::memory_caps::PENDING_UPLOAD_TTL,
+            crate::memory_caps::SIGNED_BLOB_URL_TTL,
         )
-        .unwrap();
-    (jwt, jti)
+        .unwrap()
 }
 
 /// Point PAT scope introspection at a dead local address so tests that
@@ -531,8 +545,8 @@ pub async fn live_pat_scope_api(scopes: &'static str) -> crate::state::TestEnvVa
 /// time. That override must never reach a fork-restricted job: the job keeps
 /// the local job-scoped runtime token, which authenticates only against this
 /// control plane.
-
-// Non-asserting helper for tests that need to inspect an error response.
+///
+/// Non-asserting helper for tests that need to inspect an error response.
 pub async fn try_req(app: &Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
     let mut builder = Request::builder().method(method).uri(uri);
     if uri.starts_with("/api/v1/")
@@ -697,7 +711,7 @@ pub async fn request_status_without_bearer(
 /// Token validity alone used to authorize every worker route, so any live job
 /// could open a session on another job's behalf — suspending its timeout — and
 /// could drain its verdict, since taking a verdict consumes it.
-
+///
 /// Open a debug session as a worker would, for exchange tests.
 pub fn open_session_body(run_id: RunId, agent_job_id: uuid::Uuid) -> Value {
     json!({
@@ -726,7 +740,7 @@ pub fn open_session_body(run_id: RunId, agent_job_id: uuid::Uuid) -> Value {
 /// `ACTIONS_RUNTIME_TOKEN`, so the exchange has to be worth nothing to a step
 /// that replays it. Hence: exactly one issuance per job request, spent by the
 /// worker during job setup before any step runs.
-
+///
 pub async fn verdict_poll_timeout_is_not_an_abort_impl() {
     let temp = tempfile::tempdir().unwrap();
     let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
@@ -921,6 +935,26 @@ pub async fn submit_yaml(app: &Router, yaml: &str, repo: &str) -> Value {
     .await
 }
 
+/// Submit a workflow and return its first job's `(run_id, plan_id,
+/// agent_job_id)`. The JobServer action-download endpoints resolve the run
+/// from the plan id in the URL, so tests addressing them need a real one.
+pub async fn submit_run_first_job(
+    app: &axum::Router,
+    state: &AppState,
+    yaml: &str,
+) -> (String, String, uuid::Uuid) {
+    let accepted = submit_yaml(app, yaml, "owner/repo").await;
+    let run_id = accepted["run_id"].as_str().unwrap().to_owned();
+    let parsed: RunId = run_id.parse().unwrap();
+    let inner = state.test_tx().await;
+    let request = inner
+        .job_requests
+        .values()
+        .find(|request| request.run_id == parsed)
+        .expect("submit must create a job request");
+    (run_id, request.plan_id.clone(), request.agent_job_id)
+}
+
 /// Extract the queued job message for a run, wherever it currently sits.
 pub fn queued_message_for(
     tx: &crate::control::testview::TestState,
@@ -963,7 +997,7 @@ pub fn jwt_sub(token: &str) -> Option<String> {
 /// configures no App. That PAT must reach jobs as their `GITHUB_TOKEN`:
 /// previously only `PRELOOP_GITHUB_TOKEN` was consulted, so setup reported
 /// success while every job silently ran on the local runtime token instead.
-
+///
 /// Send a request carrying a specific bearer token and return just the status
 /// code — the shared counterpart the cache-gating tests use, so a
 /// request-shape change lands in one place.
@@ -1177,10 +1211,10 @@ pub async fn generated_server_dag_properties_1000_cases() {
         let mut seed = 20250713u64 ^ case.wrapping_mul(0x9E37_79B9);
         let count = 2 + (next(&mut seed) % 4) as usize;
         let mut needs = vec![Vec::<usize>::new(); count];
-        for job in 1..count {
+        for (job, needs_of_job) in needs.iter_mut().enumerate().skip(1) {
             for dependency in 0..job {
                 if next(&mut seed) & 1 == 1 {
-                    needs[job].push(dependency);
+                    needs_of_job.push(dependency);
                 }
             }
         }
@@ -1307,6 +1341,21 @@ pub fn commit_workflow_fixture(worktree: &FsPath, paths: &[&str]) -> String {
         .unwrap()
         .trim()
         .to_owned()
+}
+/// Give a local Git fixture the origin remote required by pull-request merge
+/// snapshots. The bare repository is kept beside the workspace so each test
+/// remains self-contained.
+pub fn add_fixture_origin(root: &FsPath, worktree: &FsPath) {
+    let origin = root.join("origin.git");
+    git_fixture_command(
+        worktree,
+        &["init", "-q", "--bare", origin.to_str().unwrap()],
+    );
+    git_fixture_command(
+        worktree,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git_fixture_command(worktree, &["push", "-q", "origin", "main"]);
 }
 
 pub fn git_fixture_command(worktree: &FsPath, args: &[&str]) {
@@ -1630,7 +1679,7 @@ pub async fn register_live_job_in(
     job_uuid: uuid::Uuid,
     _plan_id: &str,
     repository: &str,
-) {
+) -> String {
     let accepted = crate::submit_run_inner(
         &state.shared(),
         preloop_gha_protocol::WorkflowSubmission {
@@ -1668,14 +1717,15 @@ pub async fn register_live_job_in(
                 "UPDATE log_files SET plan_id = ?2 WHERE plan_id = ?1",
                 (&previous, &replacement),
             )?;
-            Ok::<_, rusqlite::Error>(tx.0.execute(
+            tx.0.execute(
                 "UPDATE job_requests SET agent_job_id = ?2 WHERE agent_job_id = ?1",
                 (&previous, &replacement),
-            )?)
+            )
         })
         .await
         .expect("re-key the seed attempt");
     assert_eq!(updated, 1, "the seed run has exactly one attempt");
+    run_key
 }
 
 /// Register a live job attempt (see [`register_live_job_in`]) under a
@@ -1702,8 +1752,14 @@ pub async fn complete_live_job(state: &AppState, job_uuid: uuid::Uuid) {
 
 /// Register a live job whose run belongs to `test-org/test-repo`: the legacy
 /// cache path resolves job → attempt → run → submission repository.
-pub async fn register_live_job_with_run(state: &AppState, job_uuid: uuid::Uuid, plan_id: &str) {
-    register_live_job_in(state, job_uuid, plan_id, "test-org/test-repo").await;
+/// Returns the run key (a UUID string) so tests can bind legacy
+/// `/_apis/pipelines/workflows/:run_id/…` paths to the job's own run.
+pub async fn register_live_job_with_run(
+    state: &AppState,
+    job_uuid: uuid::Uuid,
+    plan_id: &str,
+) -> String {
+    register_live_job_in(state, job_uuid, plan_id, "test-org/test-repo").await
 }
 
 /// Claim the next queued job through the real broker path — register the

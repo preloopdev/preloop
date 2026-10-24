@@ -18,7 +18,10 @@ use crate::control::backend::{
 use crate::control::types::{
     ControlError, PollOutcome, SessionProtocol, StepPatch, SubmitJob, SubmitRun,
 };
-use crate::models::{QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord};
+use crate::models::{
+    QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord, WebhookDeliveryRecord,
+    WebhookDeliveryStatus,
+};
 use preloop_gha_protocol::{ExecutionStatus, JobId, RunId, azdo};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -566,6 +569,203 @@ async fn commits_wake_waiters_on_another_node() {
     assert!(
         wake.ready >= 1,
         "the hint must ask for at least one waiter, got {wake:?}"
+    );
+}
+
+/// Longest a webhook hint may take from an enqueue to another node's worker.
+/// The worker's own tick is five seconds, so a hint that lands later than this
+/// is not a wake.
+const WAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// A new webhook delivery for the wake tests.
+fn webhook_record(delivery_id: &str) -> WebhookDeliveryRecord {
+    WebhookDeliveryRecord {
+        delivery_id: delivery_id.to_owned(),
+        event: "push".to_owned(),
+        payload: br#"{"installation":{"id":9},"ref":"refs/heads/main"}"#.to_vec(),
+        received_at_us: 1,
+        state: WebhookDeliveryStatus::Received,
+        attempts: 0,
+        lease_until_us: None,
+        lease_token: None,
+        signer_app_id: None,
+        last_error: None,
+    }
+}
+
+/// Let in-flight hints land, then discard them.
+async fn drain_hints(hints: &mut tokio::sync::broadcast::Receiver<String>) {
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    while hints.try_recv().is_ok() {}
+}
+
+/// Probe enqueues through `writer` until `hints`, a subscription on another
+/// node, sees one. That node's LISTEN registers asynchronously with `connect`,
+/// so early hints can be lost. The caller then starts from an empty
+/// subscription.
+async fn await_webhook_listener(
+    writer: &PgBackend,
+    hints: &mut tokio::sync::broadcast::Receiver<String>,
+) {
+    for _ in 0..50 {
+        let probe = webhook_record(&format!("probe-{}", uuid::Uuid::new_v4()));
+        assert!(writer.enqueue_webhook_delivery(&probe).await.unwrap());
+        let heard = tokio::time::timeout(PROBE_WAIT, hints.recv()).await;
+        if let Ok(Ok(_)) = heard {
+            drain_hints(hints).await;
+            return;
+        }
+    }
+    panic!("the webhook wake listener never registered");
+}
+
+/// An enqueue on one node wakes the webhook worker of another well inside its
+/// five-second tick, and the hint names the node that wrote the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enqueued_webhook_delivery_wakes_other_nodes() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let mut hints = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut hints).await;
+
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("wake"))
+        .await
+        .unwrap();
+    assert!(written);
+    let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
+        .await
+        .expect("node B must hear the enqueue well before its five-second tick")
+        .expect("the hint channel stays open");
+    assert_eq!(origin, node_a.origin(), "the hint names the writing node");
+}
+
+/// A burst of enqueues shares notifications: node B hears at least one, and far
+/// fewer than the 64 rows written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn burst_of_webhook_enqueues_shares_notifications() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let mut hints = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut hints).await;
+
+    let records: Vec<WebhookDeliveryRecord> = (0..64)
+        .map(|i| webhook_record(&format!("burst-{i}")))
+        .collect();
+    let written = futures::future::join_all(
+        records
+            .iter()
+            .map(|record| node_a.enqueue_webhook_delivery(record)),
+    )
+    .await;
+    assert!(
+        written.iter().all(|result| matches!(result, Ok(true))),
+        "every burst row is new: {written:?}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut sent = 0;
+    while hints.try_recv().is_ok() {
+        sent += 1;
+    }
+    assert!(sent >= 1, "the burst must wake node B");
+    assert!(
+        sent <= 16,
+        "64 enqueues sent {sent} hints; the notifier must coalesce them"
+    );
+}
+
+/// A node's own enqueue echoes back on its own subscription carrying its own
+/// origin, which is what lets the forwarder drop the echo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_webhook_enqueue_echoes_with_the_writers_origin() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let mut own = node_a.subscribe_webhook_wakes();
+    let mut other = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut other).await;
+    await_webhook_listener(&node_b, &mut own).await;
+    drain_hints(&mut other).await;
+
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("echo"))
+        .await
+        .unwrap();
+    assert!(written);
+    for hints in [&mut own, &mut other] {
+        let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
+            .await
+            .expect("both nodes hear the enqueue")
+            .expect("the hint channel stays open");
+        assert_eq!(
+            origin,
+            node_a.origin(),
+            "the echo carries the writer's origin"
+        );
+    }
+}
+
+/// A hint is only a hint: with no subscriber on any node the enqueue still
+/// commits, and polling finds the delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webhook_enqueue_is_claimable_without_any_subscriber() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let written = node_a
+        .enqueue_webhook_delivery(&webhook_record("unhinted"))
+        .await
+        .unwrap();
+    assert!(written);
+    let claimed = node_b.claim_webhook_deliveries(10, 60).await.unwrap();
+    assert!(
+        claimed
+            .iter()
+            .any(|delivery| delivery.delivery_id == "unhinted"),
+        "polling must find the row even though no node took its hint"
+    );
+}
+
+/// Requeueing a finished delivery (the operator replay) wakes the other nodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requeued_webhook_delivery_wakes_other_nodes() {
+    let Some((_pg, node_a, node_b)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    assert!(
+        node_a
+            .enqueue_webhook_delivery(&webhook_record("replay"))
+            .await
+            .unwrap()
+    );
+    let claimed = node_a.claim_webhook_deliveries(1_000, 60).await.unwrap();
+    let token = claimed
+        .iter()
+        .find(|delivery| delivery.delivery_id == "replay")
+        .and_then(|delivery| delivery.lease_token.clone())
+        .expect("the replayed row is claimable");
+    assert!(
+        node_a
+            .complete_webhook_delivery("replay", &token)
+            .await
+            .unwrap()
+    );
+
+    let mut hints = node_b.subscribe_webhook_wakes();
+    await_webhook_listener(&node_a, &mut hints).await;
+    assert!(node_a.requeue_webhook_delivery("replay").await.unwrap());
+    let origin = tokio::time::timeout(WAKE_BOUND, hints.recv())
+        .await
+        .expect("the requeue must wake node B well before its tick")
+        .expect("the hint channel stays open");
+    assert_eq!(
+        origin,
+        node_a.origin(),
+        "the requeue's hint names the writing node"
     );
 }
 
@@ -1273,20 +1473,21 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
     };
     let run = RunId::new();
     // Cohort `m` (max-parallel 2): `a` holds gate `g1`, `aw` waits behind it,
-    // `bb` takes the free `g2`; `t1`/`t2` only drive promotion sweeps.
+    // `bb` takes `g2`, and `cc` fills the other slot.
     let mut submit = submit_run(
         run,
         vec![
             submit_job(run, "a", 1),
             submit_job(run, "aw", 2),
             submit_job(run, "bb", 3),
-            submit_job(run, "t1", 4),
-            submit_job(run, "t2", 5),
+            submit_job(run, "cc", 4),
+            submit_job(run, "t1", 5),
+            submit_job(run, "t2", 6),
         ],
     );
     for job in &mut submit.jobs {
         match job.queued.job_id.0.as_str() {
-            "a" | "aw" | "bb" => {
+            "a" | "aw" | "bb" | "cc" => {
                 job.queued.base_id = "m".to_owned();
                 job.queued.max_parallel = Some(2);
             }
@@ -1326,26 +1527,53 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
         .await
         .unwrap()
         .get(0);
-    // Fill the cohort cap with `bb` so `aw`'s promotion finds it saturated.
+    // Fill both slots so `aw`'s promotion finds the cohort saturated.
     complete("t2").await;
+    node.writer()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE jobs SET status='in_progress', queue_state='claimed' \
+             WHERE run_id=$1::text::uuid AND job_id IN ('bb','cc')",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap();
     // Completing `a` releases `g1` and re-parks `aw`.
     complete("a").await;
 
-    let hold: Option<i64> = node
+    let hold: Option<(String, Option<String>)> = node
         .writer()
         .await
         .unwrap()
         .query_opt(
-            "SELECT 1 FROM concurrency_holds \
+            "SELECT holder_kind, holder_job_id FROM concurrency_holds \
              WHERE repository='owner/repo' AND group_name='g1'",
             &[],
         )
         .await
         .unwrap()
-        .map(|row| row.get(0));
+        .map(|row| (row.get(0), row.get(1)));
+    let cohort: Vec<(String, String)> = node
+        .writer()
+        .await
+        .unwrap()
+        .query(
+            "SELECT j.job_id, j.status || '/' || j.queue_state || '/' || \
+                    COALESCE(s.max_parallel::text, 'null') \
+             FROM jobs j LEFT JOIN job_specs s \
+               ON s.run_id=j.run_id AND s.job_id=j.job_id \
+             WHERE j.run_id=$1::text::uuid AND j.base_id='m' ORDER BY j.job_order",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
     assert!(
         hold.is_none(),
-        "a re-parked waiter must not leave the finished holder's row behind"
+        "a re-parked waiter must not leave the finished holder's row behind; hold={hold:?}, cohort={cohort:?}"
     );
     let reparked: Option<i64> = node
         .writer()
@@ -1363,6 +1591,132 @@ async fn max_parallel_repark_keeps_fifo_slot_and_releases_group() {
         Some(wait_id),
         "the re-parked waiter must keep its FIFO position"
     );
+}
+
+/// The last terminal JobSet member releases the shared concurrency hold.
+#[tokio::test]
+async fn targeted_settle_releases_completed_jobset_hold() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    node.submit_run(submit_run(
+        run,
+        vec![
+            submit_job(run, "a", 1),
+            submit_job(run, "b", 2),
+            submit_job(run, "pending", 3),
+        ],
+    ))
+    .await
+    .unwrap();
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let ids = serde_json::json!(["a", "b"]).to_string();
+    let jobset_id: i64 = tx
+        .query_one(
+            "INSERT INTO jobsets (run_id, job_ids, state) \
+             VALUES ($1::text::uuid, $2::text::jsonb, 'ready') RETURNING jobset_id",
+            &[&run.0.to_string(), &ids],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    tx.execute(
+        "INSERT INTO concurrency_holds \
+         (namespace_id, repository, group_name, display_name, holder_kind, \
+          holder_run_id, holder_jobset_id) \
+         VALUES ('ns', 'owner/repo', 'shared', 'shared', 'jobset', $1::text::uuid, $2)",
+        &[&run.0.to_string(), &jobset_id],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE jobs SET status='in_progress', queue_state='claimed' \
+         WHERE run_id=$1::text::uuid AND job_id IN ('a','b')",
+        &[&run.0.to_string()],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    for (job, is_last) in [("a", false), ("b", true)] {
+        node.complete_job(JobCompletionInput {
+            run_id: run,
+            job_id: JobId(job.to_owned()),
+            agent_job_id: None,
+            status: ExecutionStatus::Success,
+            outputs: BTreeMap::new(),
+            runner_id: None,
+        })
+        .await
+        .unwrap();
+        let hold: Option<i32> = node
+            .writer()
+            .await
+            .unwrap()
+            .query_opt(
+                "SELECT 1 FROM concurrency_holds WHERE group_name='shared'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .map(|row| row.get(0));
+        assert_eq!(
+            hold.is_some(),
+            !is_last,
+            "the shared hold remains only while a JobSet member is non-terminal"
+        );
+    }
+}
+
+/// A late skipped report cannot replace a job's earlier cancellation.
+#[tokio::test]
+async fn late_skipped_completion_preserves_cancellation() {
+    let Some((_pg, node, _other)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run = RunId::new();
+    node.submit_run(submit_run(
+        run,
+        vec![
+            submit_job(run, "cancelled", 1),
+            submit_job(run, "pending", 2),
+        ],
+    ))
+    .await
+    .unwrap();
+    let client = node.writer().await.unwrap();
+    client
+        .execute(
+            "UPDATE jobs SET status='cancelled', queue_state='none' \
+             WHERE run_id=$1::text::uuid AND job_id='cancelled'",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap();
+    drop(client);
+
+    node.complete_job(JobCompletionInput {
+        run_id: run,
+        job_id: JobId("cancelled".to_owned()),
+        agent_job_id: None,
+        status: ExecutionStatus::Skipped,
+        outputs: BTreeMap::new(),
+        runner_id: None,
+    })
+    .await
+    .unwrap();
+    let client = node.writer().await.unwrap();
+    let status: String = client
+        .query_one(
+            "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id='cancelled'",
+            &[&run.0.to_string()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status, "cancelled");
 }
 
 /// A promotion that writes the promoted run's rows must take that run's row
@@ -1529,6 +1883,367 @@ async fn outbox_reader_does_not_pass_an_open_transaction() {
     );
 }
 
+/// `refresh_remaining_needs` waits for every leg of a matrix base: a need on
+/// the base is only met when all of its legs are terminal, and the expanded
+/// parent placeholder does not count.
+#[tokio::test]
+async fn refresh_remaining_needs_waits_for_every_matrix_leg() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    // build (parent) with two legs; test needs the base 'build'.
+    let build = submit_job(run_id, "build", 1);
+    let leg1 = submit_job(run_id, "build-0", 2);
+    let leg2 = submit_job(run_id, "build-1", 3);
+    let mut test = submit_job(run_id, "test", 4);
+    test.queued.needs = vec![JobId("build".to_owned())];
+    node.submit_run(submit_run(run_id, vec![build, leg1, leg2, test]))
+        .await
+        .unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+
+    // Shape the matrix via SQL: parent + legs with base_id.
+    tx.execute(
+        "UPDATE jobs SET kind='matrix_parent', base_id='build', queue_state='none' \
+         WHERE run_id=$1::text::uuid AND job_id='build'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    for leg in ["build-0", "build-1"] {
+        tx.execute(
+            "UPDATE jobs SET kind='matrix_leg', base_id='build', parent_job_id='build' \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+
+    // One leg done -> test stays counted against the remaining leg.
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build-0'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(!promotable, "test waits for every leg");
+    let remaining: i32 = tx
+        .query_one(
+            "SELECT remaining_needs FROM jobs \
+             WHERE run_id=$1::text::uuid AND job_id='test'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 1, "one leg is still non-terminal");
+
+    // All legs done -> test is promotable (parent placeholder does not block).
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build-1'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("build-1".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(promotable, "test is promotable once every leg is terminal");
+    tx.rollback().await.unwrap();
+}
+
+/// `refresh_remaining_needs` reports the dependent a completion unblocked and
+/// leaves the transitive ones alone: build <- test <- deploy.
+#[tokio::test]
+async fn refresh_remaining_needs_reports_only_the_unblocked_dependent() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let build = submit_job(run_id, "build", 1);
+    let mut test = submit_job(run_id, "test", 2);
+    test.queued.needs = vec![JobId("build".to_owned())];
+    let mut deploy = submit_job(run_id, "deploy", 3);
+    deploy.queued.needs = vec![JobId("test".to_owned())];
+    node.submit_run(submit_run(run_id, vec![build, test, deploy]))
+        .await
+        .unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+
+    // build terminal -> test is promotable, deploy is not.
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='build'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("build".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(promotable, "test should unblock when build is terminal");
+    let deploy_remaining: i32 = tx
+        .query_one(
+            "SELECT remaining_needs FROM jobs \
+             WHERE run_id=$1::text::uuid AND job_id='deploy'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(deploy_remaining, 1, "deploy still waits on test");
+
+    // test terminal -> deploy is promotable.
+    tx.execute(
+        "UPDATE jobs SET status='success' WHERE run_id=$1::text::uuid AND job_id='test'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    let promotable = super::dispatch::Sweep::refresh_remaining_needs(
+        &tx,
+        run_id,
+        &JobId("test".to_owned()),
+        "test",
+    )
+    .await
+    .unwrap();
+    assert!(promotable, "deploy should unblock when test is terminal");
+    tx.rollback().await.unwrap();
+}
+
+/// `cancel_fail_fast_siblings` cancels non-terminal legs sharing the base.
+/// Idempotent and respects the `fail_fast=false` opt-out.
+#[tokio::test]
+async fn cancel_fail_fast_siblings_cancels_legs() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let build = submit_job(run_id, "build", 1);
+    let leg0 = submit_job(run_id, "build-0", 2);
+    let leg1 = submit_job(run_id, "build-1", 3);
+    let leg2 = submit_job(run_id, "build-2", 4);
+    node.submit_run(submit_run(run_id, vec![build, leg0, leg1, leg2]))
+        .await
+        .unwrap();
+    let runner = node
+        .register_runner(register_runner("fail-fast"))
+        .await
+        .unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+
+    // Shape the matrix via SQL.
+    tx.execute(
+        "UPDATE jobs SET kind='matrix_parent', base_id='build', queue_state='none' \
+         WHERE run_id=$1::text::uuid AND job_id='build'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    for leg in ["build-0", "build-1", "build-2"] {
+        tx.execute(
+            "UPDATE jobs SET kind='matrix_leg', base_id='build', parent_job_id='build', \
+                    status='in_progress', queue_state='claimed' \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+    // The in-flight siblings carry the live binding/pool rows a claimed leg
+    // accrues; fail-fast cancellation must clear them like `settle_node`.
+    for leg in ["build-1", "build-2"] {
+        tx.execute(
+            "INSERT INTO job_assignments (run_id, job_id, runner_id) \
+             VALUES ($1::text::uuid, $2, $3) \
+             ON CONFLICT (run_id, job_id) DO NOTHING",
+            &[&run, &leg, &runner.runner.id],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "INSERT INTO provision_requests (run_id, job_id, namespace_id, pool_key, labels) \
+             VALUES ($1::text::uuid, $2, 'ns', 'pk', '{}'::jsonb) \
+             ON CONFLICT (run_id, job_id) DO NOTHING",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+    // Mark leg0 as failed.
+    tx.execute(
+        "UPDATE jobs SET status='failure' WHERE run_id=$1::text::uuid AND job_id='build-0'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+
+    let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &node,
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    // `logic::matrix_fail_fast` selects every non-terminal row of the base:
+    // the two legs and the parent placeholder (still `pending` here — a real
+    // expansion terminalizes the parent when it expands).
+    assert_eq!(
+        cancelled.len(),
+        3,
+        "the base's non-terminal rows are cancelled"
+    );
+    assert!(cancelled.contains(&JobId("build-1".to_owned())));
+    assert!(cancelled.contains(&JobId("build-2".to_owned())));
+    assert!(cancelled.contains(&JobId("build".to_owned())));
+
+    // Verify DB state.
+    let st: String = tx
+        .query_one(
+            "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id='build-1'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(st, "cancelled");
+    let assignments: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM job_assignments WHERE run_id=$1::text::uuid",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(assignments, 0, "fail-fast cancellation clears assignments");
+    let provisions: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM provision_requests WHERE run_id=$1::text::uuid",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        provisions, 0,
+        "fail-fast cancellation clears provision requests"
+    );
+
+    // Idempotent: second call cancels nothing.
+    let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &node,
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(cancelled.is_empty(), "second call is a no-op");
+    tx.rollback().await.unwrap();
+}
+
+/// A `fail_fast: false` leg opts its base out: the siblings keep running.
+#[tokio::test]
+async fn cancel_fail_fast_siblings_respects_the_opt_out() {
+    let Some((_pg, node, _)) = backend_pair().await else {
+        return skip_no_postgres();
+    };
+    let run_id = RunId(uuid::Uuid::new_v4());
+    let build = submit_job(run_id, "build", 1);
+    let leg0 = submit_job(run_id, "build-0", 2);
+    let leg1 = submit_job(run_id, "build-1", 3);
+    let mut submit = submit_run(run_id, vec![build, leg0, leg1]);
+    submit
+        .record
+        .job_fail_fast
+        .insert("build".to_owned(), false);
+    node.submit_run(submit).await.unwrap();
+
+    let mut client = node.writer().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let run = run_id.0.to_string();
+    for leg in ["build-0", "build-1"] {
+        tx.execute(
+            "UPDATE jobs SET kind='matrix_leg', base_id='build', parent_job_id='build', \
+                    status='in_progress', queue_state='claimed' \
+             WHERE run_id=$1::text::uuid AND job_id=$2",
+            &[&run, &leg],
+        )
+        .await
+        .unwrap();
+    }
+    // The base opted out: every spec row of the base carries the flag.
+    tx.execute(
+        "UPDATE job_specs SET fail_fast=false \
+         WHERE run_id=$1::text::uuid AND job_id IN ('build','build-0','build-1')",
+        &[&run],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE jobs SET status='failure' WHERE run_id=$1::text::uuid AND job_id='build-0'",
+        &[&run],
+    )
+    .await
+    .unwrap();
+
+    let cancelled = super::dispatch::Sweep::cancel_fail_fast_siblings(
+        &node,
+        &tx,
+        run_id,
+        &JobId("build-0".to_owned()),
+        "build",
+    )
+    .await
+    .unwrap();
+    assert!(
+        cancelled.is_empty(),
+        "fail_fast=false must leave the siblings alone"
+    );
+    let st: String = tx
+        .query_one(
+            "SELECT status FROM jobs WHERE run_id=$1::text::uuid AND job_id='build-1'",
+            &[&run],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(st, "in_progress");
+    tx.rollback().await.unwrap();
+}
+
 // ── claim-order plans ───────────────────────────────────────────────────
 
 /// The claim and front-gauge reads share ONE global queue order
@@ -1597,4 +2312,231 @@ async fn claim_order_is_served_by_the_global_ready_index() {
         !plan.contains("Sort"),
         "the front read must not sort:\n{plan}"
     );
+}
+
+// ── session deadline and guards ─────────────────────────────────────────
+
+/// A TCP listener that accepts every connection and never answers: the
+/// shape of a database that is hung rather than down. Each accepted socket
+/// is held open by a task that never returns, so the peer sees a live
+/// connection that simply never speaks. Returns its port and how many
+/// connections it accepted.
+async fn silent_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&accepts);
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _peer)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _held = socket;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    (port, accepts)
+}
+
+/// A hung database ends the session open at the deadline. Before the connect
+/// deadline, `connect_one` waited on the startup handshake forever, which is
+/// how a stalled Postgres froze engine startup and every pooled reconnect.
+///
+/// The deadline is shortened so the test proves the wait ends at *a*
+/// deadline without spending the production 10 s; the production value is
+/// covered by `the_connect_deadline_error_names_postgres_and_the_deadline`
+/// and by `pooled_sessions_carry_the_control_timeouts`.
+#[tokio::test]
+async fn a_stalled_database_ends_the_session_open_at_the_deadline() {
+    let (port, accepts) = silent_listener().await;
+    let url = format!("postgres://preloop@127.0.0.1:{port}/control");
+    let deadline = std::time::Duration::from_millis(250);
+    let started = std::time::Instant::now();
+    let error = super::connect_one_within(&url, "test-origin", deadline)
+        .await
+        .expect_err("a database that never answers must not open a session");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(200),
+        "the attempt gave up after {elapsed:?}, before the deadline: it must have waited for \
+         the answer, not failed for another reason"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the attempt ended after {elapsed:?}, not at its {deadline:?} deadline"
+    );
+    let message = format!("{error:?}");
+    for needle in ["Postgres", "connect deadline", "0.25"] {
+        assert!(message.contains(needle), "{message}");
+    }
+    assert!(
+        accepts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the TCP connect must have been accepted, so the stall was after it"
+    );
+}
+
+/// Seconds of a time-unit GUC as Postgres reports it (`30s` → 30.0), so the
+/// assertion does not depend on how Postgres prints the value. `extract`
+/// returns `numeric`, which the driver cannot deserialize into `f64` without
+/// the cast.
+async fn setting_seconds(client: &tokio_postgres::Client, name: &str) -> f64 {
+    client
+        .query_one(
+            &format!("SELECT (extract(epoch from current_setting('{name}')::interval))::float8"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// The Postgres message of a driver error. `Display` on a database error is
+/// only `db error`; the server's detail (which timeout fired) is on the
+/// `DbError`.
+fn db_message(error: &tokio_postgres::Error) -> String {
+    error
+        .as_db_error()
+        .map(|detail| detail.message().to_owned())
+        .unwrap_or_else(|| error.to_string())
+}
+
+/// Every pooled session carries the server-side guards, on both pools, at
+/// the values the module documents: a statement that gets past the connect
+/// deadline cannot then hold a runtime worker, a pooled connection and its
+/// row locks forever.
+#[tokio::test]
+async fn pooled_sessions_carry_the_control_timeouts() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        skip_no_postgres();
+        return;
+    };
+    let backend = connect(&url).await;
+    let sessions = [
+        ("writer", backend.writer().await.unwrap()),
+        ("reader", backend.reader().await.unwrap()),
+    ];
+    for (pool, client) in &sessions {
+        for (setting, expected) in [
+            ("statement_timeout", crate::store_pg::STATEMENT_TIMEOUT),
+            ("lock_timeout", crate::store_pg::LOCK_TIMEOUT),
+            (
+                "idle_in_transaction_session_timeout",
+                crate::store_pg::IDLE_IN_TRANSACTION_TIMEOUT,
+            ),
+        ] {
+            assert_eq!(
+                setting_seconds(client, setting).await,
+                expected.as_secs_f64(),
+                "{pool} session {setting}"
+            );
+        }
+    }
+}
+
+/// The statement guard turns a stuck statement into an error at the
+/// deadline. The serving 30 s would make this test take 30 s, so the same
+/// builder installs a short one: what is under test is that the guard SQL
+/// Postgres receives really cancels the statement, with the error naming the
+/// timeout.
+#[tokio::test]
+async fn the_statement_guard_kills_a_stuck_statement() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        skip_no_postgres();
+        return;
+    };
+    let backend = connect(&url).await;
+    let client = backend.writer().await.unwrap();
+    let short = std::time::Duration::from_millis(250);
+    client
+        .batch_execute(&crate::store_pg::session_timeouts_sql_with(
+            short, short, short,
+        ))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error = client
+        .batch_execute("SELECT pg_sleep(10)")
+        .await
+        .expect_err("a statement past its deadline must be cancelled");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the statement ran for {elapsed:?} instead of dying at {short:?}"
+    );
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::QUERY_CANCELED),
+        "{error}"
+    );
+    assert!(
+        db_message(&error).contains("statement timeout"),
+        "{}",
+        db_message(&error)
+    );
+}
+
+/// The lock guard ends a lock wait at its own deadline and names the lock,
+/// instead of letting the command queue behind a stuck transaction — the
+/// shape of the incident this family of deadlines exists for. The serving
+/// 15 s would make this test take 15 s, so the lock deadline is shortened
+/// through the same builder.
+#[tokio::test]
+async fn the_lock_guard_kills_a_stuck_lock_wait() {
+    let Some((_guard, url)) = fresh_database_opt().await else {
+        skip_no_postgres();
+        return;
+    };
+    let backend = connect(&url).await;
+    let mut holder = backend.writer().await.unwrap();
+    let waiter = backend.writer().await.unwrap();
+    holder
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS public.lock_probe (id int PRIMARY KEY); \
+             INSERT INTO public.lock_probe VALUES (1) ON CONFLICT DO NOTHING",
+        )
+        .await
+        .unwrap();
+    let held = holder.transaction().await.unwrap();
+    held.query_one(
+        "SELECT id FROM public.lock_probe WHERE id = 1 FOR NO KEY UPDATE",
+        &[],
+    )
+    .await
+    .unwrap();
+    let short = std::time::Duration::from_millis(250);
+    waiter
+        .batch_execute(&crate::store_pg::session_timeouts_sql_with(
+            std::time::Duration::from_secs(5),
+            short,
+            std::time::Duration::from_secs(5),
+        ))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error = waiter
+        .execute(
+            "SELECT id FROM public.lock_probe WHERE id = 1 FOR NO KEY UPDATE",
+            &[],
+        )
+        .await
+        .expect_err("a lock wait past its deadline must be cancelled");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the lock wait ran for {elapsed:?} instead of dying at {short:?}"
+    );
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+        "{error}"
+    );
+    assert!(
+        db_message(&error).contains("lock timeout"),
+        "{}",
+        db_message(&error)
+    );
+    held.rollback().await.unwrap();
 }

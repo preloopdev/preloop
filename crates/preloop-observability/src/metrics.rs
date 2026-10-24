@@ -638,26 +638,26 @@ pub fn normalize_route(raw: &str) -> String {
     let path = raw.split('?').next().unwrap_or(raw);
     // Known templates — longest prefix first
     const TEMPLATES: &[&str] = &[
-        "/api/v1/runs/:run_id",
+        "/api/v1/runs/{run_id}",
         "/api/v1/runs",
         "/api/v1/status",
         "/api/v1/scheduler/history",
         "/api/v1/debug/sessions",
         "/api/v1/github/register",
         "/api/v1/github/callback",
-        "/_apis/artifactcache/cache/:cache_id",
+        "/_apis/artifactcache/cache/{cache_id}",
         "/_apis/artifactcache/cache",
-        "/_apis/pipelines/workflows/:run_id/artifacts/:artifact_id",
-        "/_apis/pipelines/workflows/:run_id/artifacts",
-        "/runner/server/_apis/distributedtask/pools/:pool_id/agents",
+        "/_apis/pipelines/workflows/{run_id}/artifacts/{artifact_id}",
+        "/_apis/pipelines/workflows/{run_id}/artifacts",
+        "/runner/server/_apis/distributedtask/pools/{pool_id}/agents",
         "/runner/server/_apis/distributedtask/pools",
-        "/broker/:runner_id/acquirejob",
-        "/broker/:runner_id/renewjob",
-        "/broker/:runner_id/completejob",
+        "/broker/{runner_id}/acquirejob",
+        "/broker/{runner_id}/renewjob",
+        "/broker/{runner_id}/completejob",
         "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
         "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
-        "/twirp-blob/:kind/:token",
-        "/ws/live-logs/:job_id",
+        "/twirp-blob/{kind}/{token}",
+        "/ws/live-logs/{job_id}",
         "/snapshots",
         "/repos",
         "/oidc",
@@ -668,11 +668,11 @@ pub fn normalize_route(raw: &str) -> String {
         "/metrics",
     ];
     // Segment-wise matching: split both sides on '/' and require equal
-    // segment counts. Literal segments must be byte-equal; a `:param`
+    // segment counts. Literal segments must be byte-equal; a `{param}`
     // segment matches exactly one non-empty segment. Prefix-only matching
     // let `/broker/42/acquirejob` collide with other templates and let
     // trailing segments sneak in (e.g. `/api/v1/runs/abc/extra` reported as
-    // `/api/v1/runs/:run_id`); neither is possible with count equality.
+    // `/api/v1/runs/{run_id}`); neither is possible with count equality.
     let path_segments: Vec<&str> = path.split('/').collect();
     for tmpl in TEMPLATES {
         let tmpl_segments: Vec<&str> = tmpl.split('/').collect();
@@ -683,7 +683,7 @@ pub fn normalize_route(raw: &str) -> String {
             .iter()
             .zip(path_segments.iter())
             .all(|(t, p)| {
-                if t.starts_with(':') {
+                if t.starts_with('{') {
                     !p.is_empty()
                 } else {
                     t == p
@@ -715,11 +715,11 @@ mod tests {
     fn normalize_concrete_id_to_template() {
         assert_eq!(
             normalize_route("/api/v1/runs/abc123"),
-            "/api/v1/runs/:run_id"
+            "/api/v1/runs/{run_id}"
         );
         assert_eq!(
             normalize_route("/api/v1/runs/abc123?foo=bar"),
-            "/api/v1/runs/:run_id"
+            "/api/v1/runs/{run_id}"
         );
         assert_eq!(normalize_route("/api/v1/status"), "/api/v1/status");
         assert_eq!(normalize_route("/unknown/path/xyz"), "/unknown");
@@ -752,15 +752,15 @@ mod tests {
         // prefix matching collapsed them into one series.
         assert_eq!(
             normalize_route("/broker/42/acquirejob"),
-            "/broker/:runner_id/acquirejob"
+            "/broker/{runner_id}/acquirejob"
         );
         assert_eq!(
             normalize_route("/broker/42/renewjob"),
-            "/broker/:runner_id/renewjob"
+            "/broker/{runner_id}/renewjob"
         );
         assert_eq!(
             normalize_route("/broker/42/completejob"),
-            "/broker/:runner_id/completejob"
+            "/broker/{runner_id}/completejob"
         );
         // A shorter path cannot match a longer template (no partial match):
         // 2 segments vs the 3-segment acquirejob template.
@@ -768,7 +768,7 @@ mod tests {
         assert_eq!(normalize_route("/api/v1/status/x"), "/unknown");
         // Trailing segments cannot be silently dropped either.
         assert_eq!(normalize_route("/api/v1/runs/abc123/extra"), "/unknown");
-        // A `:param` segment still matches exactly one non-empty segment.
+        // A `{param}` segment still matches exactly one non-empty segment.
         assert_eq!(normalize_route("/broker//acquirejob"), "/unknown");
     }
 

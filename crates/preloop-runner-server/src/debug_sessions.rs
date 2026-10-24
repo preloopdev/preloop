@@ -1052,6 +1052,10 @@ pub async fn poll_verdict(
                         Err(error) => return Err(ApiError::from(error)),
                     };
                     if let Some(plan_id) = plan_id {
+                        // The request row does not carry the message's
+                        // `jobTimeout`, so a retry verdict's credential gets
+                        // the default window; the attempt it replays is
+                        // itself bounded by the original run's timeout.
                         let fresh = shared.state.mint_runtime_token(&plan_id, &agent_job_id);
                         response.snapshot_token = Some(fresh.clone());
                         // The origin-rewrite `authHeader` the job env

@@ -53,6 +53,13 @@ pub(crate) const NAMESPACE_CLAIM_CAPPED: &str = "\
 /// (the `jobs_namespace_queued` partial index).
 pub(crate) const NAMESPACE_QUEUED_STATES: &str = "('blocked','held','ready','pending_expansion')";
 
+/// Jobs per submit transaction chunk. A submit inserts its jobs in chunks of
+/// this size, committing between chunks, so no single request pins the
+/// writer for the whole insert — a concurrent control write waits for one
+/// chunk at most. Both backends share the constant so their chunked submits
+/// stay identical.
+pub(crate) const SUBMIT_JOB_CHUNK_SIZE: usize = 250;
+
 /// Submit admission for a namespace in `state`.
 ///
 /// API/CLI submits need an `active` namespace: `draining` keeps claiming its
@@ -520,7 +527,6 @@ pub(crate) struct AcquireContext {
 /// handler must fan out (events, check-run effects, live-log close).
 #[derive(Debug)]
 pub(crate) struct CompleteOutcome {
-    pub(crate) record: RunRecord,
     /// The status actually stored (terminal-locked jobs keep their first
     /// verdict).
     pub(crate) effective_status: ExecutionStatus,
@@ -541,6 +547,9 @@ pub(crate) struct CompleteOutcome {
 /// Result of `cancel_run` / `cancel_job`.
 #[derive(Debug)]
 pub(crate) struct CancelOutcome {
+    /// This `cancel_run` call transitioned a live run to cancelled under its lock.
+    /// False for an already-terminal run and for `cancel_job`.
+    pub(crate) run_cancelled: bool,
     /// Cancellation messages queued for in-progress jobs.
     pub(crate) cancellations: usize,
     /// Run status after cancellation (for `cancel_run`).
@@ -1039,7 +1048,7 @@ pub(crate) struct RunQueueClaimability {
     /// The run's jobs in the ready queue (`queue_state = ready`).
     pub(crate) queued: usize,
     /// Registered runners whose capabilities
-    /// (`crate::runtime_scheduling::job_matches_runner_capabilities`) match at
+    /// (`crate::runtime_scheduling::job_matches_runner`) match at
     /// least one of those ready jobs. 0 when `queued` is 0.
     pub(crate) claimable: usize,
 }
@@ -1327,8 +1336,17 @@ pub(crate) struct StatusInputs {
     /// the pool never provisioned.
     pub(crate) pool_busy: u32,
     /// Runners whose every session last polled more than `stale_after` ago
-    /// (a session never seen is not stale).
+    /// (a session never seen is not stale). Callers pass the session
+    /// liveness window — the same one the reaper prunes on — so this counts
+    /// runners that are gone rather than runners merely mid-step.
     pub(crate) runner_stale: u32,
+    /// Age of the least recently seen live session, in seconds; `None` when
+    /// no session has ever polled. This is the "is it still talking to us"
+    /// signal that the stale tally no longer carries while a step runs.
+    pub(crate) max_poll_age_seconds: Option<u64>,
+    /// Age of the oldest unreleased job lease, in seconds; `None` when no
+    /// request holds one.
+    pub(crate) max_lease_age_seconds: Option<u64>,
     /// Live runner → job pairings from claimed unfinished attempts.
     pub(crate) runner_assignments: Vec<preloop_observability::status::RunnerAssignment>,
     /// Age, run and job of the oldest ready job with a known enqueue time.
@@ -1497,4 +1515,134 @@ pub(crate) struct NewArtifactRow {
     pub(crate) name: String,
     pub(crate) storage_key: String,
     pub(crate) size_bytes: i64,
+}
+
+// ── Code-scanning SARIF ─────────────────────────────────────────────────
+
+/// Where a SARIF analysis came from: the GitHub code-scanning shim
+/// (`/repos/{owner}/{repo}/code-scanning/…`) or the native run API
+/// (`/api/v1/runs/{run_id}/sarif`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SarifAnalysisSource {
+    Github,
+    Api,
+}
+
+impl SarifAnalysisSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Github => "github",
+            Self::Api => "api",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "github" => Some(Self::Github),
+            "api" => Some(Self::Api),
+            _ => None,
+        }
+    }
+}
+
+/// Processing state of one analysis. Uploads are parsed synchronously, so a
+/// stored analysis is `complete` or `failed`; `pending` is reserved for an
+/// asynchronous processor that this build does not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SarifAnalysisStatus {
+    Pending,
+    Complete,
+    Failed,
+}
+
+impl SarifAnalysisStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "complete" => Some(Self::Complete),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One stored SARIF analysis. `storage_key` addresses the raw document in the
+/// run-scoped file store; `dedupe_key` is the content fingerprint that makes
+/// a re-upload of the same tool/commit/ref/findings set idempotent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SarifAnalysisRecord {
+    pub(crate) analysis_id: String,
+    pub(crate) run_id: RunId,
+    pub(crate) repository: String,
+    pub(crate) commit_sha: String,
+    pub(crate) git_ref: String,
+    pub(crate) tool_name: String,
+    pub(crate) source: SarifAnalysisSource,
+    pub(crate) status: SarifAnalysisStatus,
+    /// Job UUID that uploaded it, or `system`.
+    pub(crate) uploader: String,
+    pub(crate) dedupe_key: String,
+    pub(crate) storage_key: String,
+    /// Compressed (base64-decoded gzip) upload size.
+    pub(crate) size_bytes: i64,
+    /// Decompressed SARIF document size.
+    pub(crate) raw_size_bytes: i64,
+    pub(crate) finding_count: i64,
+    pub(crate) errors: Option<String>,
+    pub(crate) checkout_uri: Option<String>,
+    pub(crate) analysis_key: Option<String>,
+    pub(crate) environment: Option<String>,
+    pub(crate) started_at: Option<String>,
+    pub(crate) created_at_us: i64,
+    pub(crate) completed_at_us: Option<i64>,
+}
+
+/// An analysis to persist. `status` is always `complete` for a synchronous
+/// parse; the row's `completed_at` is stamped from the write's clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewSarifAnalysis {
+    pub(crate) analysis_id: String,
+    pub(crate) run_id: RunId,
+    pub(crate) repository: String,
+    pub(crate) commit_sha: String,
+    pub(crate) git_ref: String,
+    pub(crate) tool_name: String,
+    pub(crate) source: SarifAnalysisSource,
+    pub(crate) uploader: String,
+    pub(crate) dedupe_key: String,
+    pub(crate) storage_key: String,
+    pub(crate) size_bytes: i64,
+    pub(crate) raw_size_bytes: i64,
+    pub(crate) finding_count: i64,
+    pub(crate) errors: Option<String>,
+    pub(crate) checkout_uri: Option<String>,
+    pub(crate) analysis_key: Option<String>,
+    pub(crate) environment: Option<String>,
+    pub(crate) started_at: Option<String>,
+}
+
+/// One normalized SARIF result: what a UI or check annotation renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SarifFinding {
+    pub(crate) fingerprint: String,
+    pub(crate) tool_name: String,
+    pub(crate) rule_id: Option<String>,
+    pub(crate) rule_name: Option<String>,
+    pub(crate) level: String,
+    pub(crate) message: String,
+    pub(crate) path: Option<String>,
+    pub(crate) start_line: Option<i64>,
+    pub(crate) end_line: Option<i64>,
+    pub(crate) start_column: Option<i64>,
+    pub(crate) end_column: Option<i64>,
+    pub(crate) partial_fingerprint: Option<String>,
+    pub(crate) suppression: Option<String>,
 }

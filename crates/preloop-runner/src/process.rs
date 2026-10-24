@@ -510,7 +510,7 @@ async fn terminate_process_group(child: &mut AsyncGroupChild, group: ProcessGrou
 async fn force_kill_group(child: &mut AsyncGroupChild, group: ProcessGroup, program: &str) {
     #[cfg(unix)]
     if let Some(group) = group {
-        signal_group(group, Signal::SIGKILL);
+        signal_group(group, nix::sys::signal::Signal::SIGKILL);
     }
     #[cfg(not(unix))]
     let _ = group;
@@ -546,7 +546,7 @@ fn process_group(_child: &AsyncGroupChild) -> ProcessGroup {}
 /// Deliver `signal` to every member of `group`. A failure means the group has
 /// already drained, which is the outcome the caller wanted anyway.
 #[cfg(unix)]
-fn signal_group(group: nix::unistd::Pid, signal: Signal) {
+fn signal_group(group: nix::unistd::Pid, signal: nix::sys::signal::Signal) {
     let _ = nix::sys::signal::killpg(group, signal);
 }
 
@@ -596,19 +596,19 @@ fn send_signal(
     group: ProcessGroup,
     signal: ProcessSignal,
 ) -> std::io::Result<()> {
-    let signal = match signal {
-        ProcessSignal::Interrupt => Signal::SIGINT,
-        ProcessSignal::Terminate => Signal::SIGTERM,
+    let (nix_signal, command_group_signal) = match signal {
+        ProcessSignal::Interrupt => (nix::sys::signal::Signal::SIGINT, Signal::SIGINT),
+        ProcessSignal::Terminate => (nix::sys::signal::Signal::SIGTERM, Signal::SIGTERM),
     };
 
     // Address the group id directly: once the leader is reaped the child
     // handle can no longer reach the members that are still running.
     if let Some(group) = group {
-        signal_group(group, signal);
+        signal_group(group, nix_signal);
         return Ok(());
     }
 
-    child.signal(signal)
+    child.signal(command_group_signal)
 }
 
 #[cfg(not(unix))]

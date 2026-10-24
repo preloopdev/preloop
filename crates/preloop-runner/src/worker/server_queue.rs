@@ -240,18 +240,18 @@ impl ServerQueue {
     }
 
     /// Return concatenated content of all accumulated step logs (for job log upload).
-    pub fn all_step_log_content(&mut self) -> String {
+    ///
+    /// Errors are returned so callers do not upload a partial scratch-file
+    /// snapshot when the temporary file cannot be flushed or read.
+    pub fn all_step_log_content(&mut self) -> std::io::Result<String> {
         use std::io::{Read, Seek, SeekFrom, Write};
-        let _ = self.job_log_file.flush();
+        self.job_log_file.flush()?;
         let file = self.job_log_file.get_ref();
-        if let Ok(mut cloned) = file.try_clone() {
-            let mut content = String::new();
-            let _ = cloned.seek(SeekFrom::Start(0));
-            let _ = cloned.read_to_string(&mut content);
-            content
-        } else {
-            String::new()
-        }
+        let mut cloned = file.try_clone()?;
+        cloned.seek(SeekFrom::Start(0))?;
+        let mut content = String::new();
+        cloned.read_to_string(&mut content)?;
+        Ok(content)
     }
 }
 
@@ -417,7 +417,7 @@ mod tests {
         let mut q = ServerQueue::new("j".into(), "p".into());
         q.record_step_logs("s1", "line1\nline2\n");
         q.record_step_logs("s2", "line3");
-        let content = q.all_step_log_content();
+        let content = q.all_step_log_content().unwrap();
         assert_eq!(content, "line1\nline2\nline3\n");
     }
 

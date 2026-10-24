@@ -188,7 +188,12 @@ impl PgBackend {
                         .duration_since(started_at)
                         .unwrap_or_default()
                         .saturating_sub(paused_s);
-                    let job_timeout = request.job_timeout_s.unwrap_or(21600).max(0) as u64;
+                    // The same ceiling the message's `jobTimeout` was clamped
+                    // to at build: a stored template (or an older row) that
+                    // declares more must not keep the lease alive past it.
+                    let job_timeout = preloop_gha_parser::job_builder::effective_job_timeout_seconds(
+                        request.job_timeout_s,
+                    ) as u64;
                     if elapsed >= std::time::Duration::from_secs(job_timeout) {
                         // Conditional: only the first sweep flags the attempt.
                         let flagged = tx
@@ -426,6 +431,36 @@ impl PgBackend {
                 out.runner_idle += 1;
             }
         }
+        // Poll and lease ages, so a busy pool can be told from a wedged one.
+        // SQL returns the oldest instant; the age is computed here.
+        out.max_poll_age_seconds = client
+            .query_one(
+                concat!(
+                    "SELECT ",
+                    us!("min(last_seen_at)"),
+                    " FROM runner_sessions \
+                     WHERE runner_id IS NOT NULL AND last_seen_at IS NOT NULL"
+                ),
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .get::<_, Option<i64>>(0)
+            .map(|oldest| (now_us().saturating_sub(oldest).max(0) / 1_000_000) as u64);
+        out.max_lease_age_seconds = client
+            .query_one(
+                concat!(
+                    "SELECT ",
+                    us!("min(l.renewed_at)"),
+                    " FROM job_leases l JOIN job_requests q ON q.request_id = l.request_id \
+                     WHERE q.result IS NULL AND l.renewed_at IS NOT NULL"
+                ),
+                &[],
+            )
+            .await
+            .map_err(db)?
+            .get::<_, Option<i64>>(0)
+            .map(|oldest| (now_us().saturating_sub(oldest).max(0) / 1_000_000) as u64);
         out.runner_assignments = runner_assignments;
         // Oldest ready job with a known enqueue instant.
         let oldest = client

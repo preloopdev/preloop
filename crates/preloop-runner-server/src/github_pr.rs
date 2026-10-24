@@ -80,7 +80,7 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
         return Ok(false);
     }
 
-    let token = crate::github_push::push_token(shared, &repository)
+    let credential = crate::github_push::push_credential(shared, &repository)
         .await
         .ok_or_else(|| anyhow::anyhow!("no GitHub credentials configured"))?;
 
@@ -91,7 +91,8 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
     let query = serde_urlencoded::to_string([("head", head.as_str()), ("state", "open")])
         .expect("url-encoding cannot fail for str pairs");
     let existing = crate::github_push::github_json(
-        &token,
+        shared,
+        &credential,
         &repository,
         "GET",
         &format!("pulls?{query}"),
@@ -110,7 +111,8 @@ async fn maybe_open_pr_inner(shared: &Arc<SharedState>, run_id: RunId) -> anyhow
             .unwrap_or_else(|| "local server (no public URL configured)".to_owned())
     );
     let pr = crate::github_push::github_json(
-        &token,
+        shared,
+        &credential,
         &repository,
         "POST",
         "pulls",
@@ -144,9 +146,9 @@ fn auto_pr_candidate(run: &crate::models::RunRecord) -> Option<(String, String, 
     if run.conclusion.as_deref() != Some("success") || run.event != "push" {
         return None;
     }
-    // Only webhook-delivered runs carry a trust tier (the dispatcher stamps
-    // it). A native `/api/v1/runs` caller setting `event = "push"` is a local
-    // submission, not a GitHub push, and must not trigger auto-PR.
+    // Only durable webhook deliveries may trigger auto-PR. Trust-tier fields in
+    // a native submission are user input and do not prove webhook provenance.
+    run.webhook_delivery_id.as_ref()?;
     crate::events::trust_tier::tier_of(&run.submission)?;
     // Push-back runs are client-managed: `github_push.rs` owns their PR.
     if run.submission.push.is_some() {
@@ -455,10 +457,18 @@ mod tests {
                             [run_id.to_string()],
                         )
                         .unwrap();
-                        // The webhook dispatcher stamps the trust tier; native
-                        // submissions carry none and are never auto-PR'd.
+                        // The webhook dispatcher stamps both provenance and
+                        // trust tier; a native client controls neither.
                         tx.execute(
-                            "UPDATE run_submissions                              SET submission = json_set(submission, '$.trust_tier', 'internal')                              WHERE run_id = ?1",
+                            "UPDATE runs SET webhook_delivery_id = ?1, origin = 'webhook' \
+                             WHERE run_id = ?2",
+                            [format!("auto-pr-{run_id}"), run_id.to_string()],
+                        )
+                        .unwrap();
+                        tx.execute(
+                            "UPDATE run_submissions \
+                             SET submission = json_set(submission, '$.trust_tier', 'internal') \
+                             WHERE run_id = ?1",
                             [run_id.to_string()],
                         )
                         .unwrap();

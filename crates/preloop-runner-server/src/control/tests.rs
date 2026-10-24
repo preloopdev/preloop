@@ -503,6 +503,28 @@ pub(crate) mod suite {
             "a session-backed runner with no active request is idle"
         );
         assert_eq!((inputs.runner_busy, inputs.runner_stale), (0, 0));
+        // The ages are reported rather than left blank, and staleness
+        // follows the caller's window: the same session is idle capacity
+        // under the liveness window and gone under a zero-length one. That
+        // pair is what tells a busy pool apart from a dead one.
+        assert!(
+            inputs.max_poll_age_seconds.is_some_and(|age| age < 5),
+            "a session that just polled reports a small poll age, got {:?}",
+            inputs.max_poll_age_seconds
+        );
+        assert_eq!(
+            inputs.max_lease_age_seconds, None,
+            "nothing has been claimed, so no lease is held"
+        );
+        let zero_window = backend
+            .status_inputs(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            zero_window.runner_stale, 1,
+            "a zero-length window makes a session that has polled stale"
+        );
+        assert_eq!(zero_window.runner_idle, 0);
     }
 
     /// The pool's busy gauge counts only busy runners the pool proved: a
@@ -625,7 +647,6 @@ pub(crate) mod suite {
             .unwrap();
         assert_eq!(done.effective_status, ExecutionStatus::Success);
         assert!(done.newly_terminal_success);
-        assert_eq!(done.record.status, ExecutionStatus::Success);
         let stats = backend.queue_stats().await.unwrap();
         assert_eq!((stats.ready, stats.claimed), (0, 0));
         assert!(backend.live_assignments().await.unwrap().is_empty());
@@ -1108,6 +1129,139 @@ pub(crate) mod suite {
         assert!(backend.artifact_scopes(&[]).await.unwrap().is_empty());
     }
 
+    /// SARIF analyses: the insert is idempotent on `(run_id, dedupe_key)`, a
+    /// replay returns the original analysis with its findings intact, and the
+    /// read paths answer by id, by dedupe slot and by run on both backends.
+    pub(crate) async fn sarif_analyses_roundtrip_and_dedupe(backend: &dyn ControlBackend) {
+        let run_id = RunId::new();
+        let findings = vec![
+            SarifFinding {
+                fingerprint: "fp-1".to_owned(),
+                tool_name: "CodeQL".to_owned(),
+                rule_id: Some("js/sql-injection".to_owned()),
+                rule_name: Some("SQL injection".to_owned()),
+                level: "error".to_owned(),
+                message: "Query built from user input".to_owned(),
+                path: Some("src/db.js".to_owned()),
+                start_line: Some(12),
+                end_line: Some(14),
+                start_column: Some(3),
+                end_column: Some(20),
+                partial_fingerprint: Some("partial=1".to_owned()),
+                suppression: None,
+            },
+            SarifFinding {
+                fingerprint: "fp-2".to_owned(),
+                tool_name: "CodeQL".to_owned(),
+                rule_id: Some("js/unused-variable".to_owned()),
+                rule_name: None,
+                level: "note".to_owned(),
+                message: "Unused variable".to_owned(),
+                path: Some("src/util.js".to_owned()),
+                start_line: Some(4),
+                end_line: None,
+                start_column: None,
+                end_column: None,
+                partial_fingerprint: None,
+                suppression: Some("inSource".to_owned()),
+            },
+        ];
+        let analysis = NewSarifAnalysis {
+            analysis_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            run_id,
+            repository: "owner/repo".to_owned(),
+            commit_sha: "abc1234".to_owned(),
+            git_ref: "refs/heads/main".to_owned(),
+            tool_name: "CodeQL".to_owned(),
+            source: SarifAnalysisSource::Github,
+            uploader: "job-1".to_owned(),
+            dedupe_key: "dedupe-1".to_owned(),
+            storage_key: "11111111-1111-4111-8111-111111111111".to_owned(),
+            size_bytes: 512,
+            raw_size_bytes: 4096,
+            finding_count: 2,
+            errors: None,
+            checkout_uri: Some("file:///work/repo".to_owned()),
+            analysis_key: Some("codeql.yml:analyze".to_owned()),
+            environment: Some("{\"language\":\"javascript\"}".to_owned()),
+            started_at: Some("2026-10-21T09:00:00Z".to_owned()),
+        };
+        let (record, inserted) = backend
+            .put_sarif_analysis(analysis.clone(), findings.clone())
+            .await
+            .unwrap();
+        assert!(inserted, "the first upload inserts");
+        assert_eq!(record.analysis_id, analysis.analysis_id);
+        assert_eq!(record.status, SarifAnalysisStatus::Complete);
+        assert_eq!(record.finding_count, 2);
+        assert_eq!(record.size_bytes, 512);
+        assert!(record.completed_at_us.is_some());
+
+        // Re-uploading the same content with a new id/dedupe slot collision
+        // returns the original row and does not duplicate findings.
+        let mut replay = analysis.clone();
+        replay.analysis_id = "22222222-2222-4222-8222-222222222222".to_owned();
+        replay.storage_key = replay.analysis_id.clone();
+        replay.size_bytes = 999;
+        let (replayed, inserted) = backend
+            .put_sarif_analysis(replay, findings.clone())
+            .await
+            .unwrap();
+        assert!(!inserted, "a re-upload dedupes on the content key");
+        assert_eq!(replayed.analysis_id, analysis.analysis_id);
+        assert_eq!(replayed.size_bytes, 512, "the original row wins");
+
+        let by_id = backend
+            .sarif_analysis(&analysis.analysis_id)
+            .await
+            .unwrap()
+            .expect("stored analysis");
+        assert_eq!(by_id.dedupe_key, "dedupe-1");
+        assert_eq!(by_id.uploader, "job-1");
+        assert_eq!(
+            backend
+                .sarif_analysis_by_dedupe(run_id, "dedupe-1")
+                .await
+                .unwrap()
+                .map(|record| record.analysis_id),
+            Some(analysis.analysis_id.clone())
+        );
+        assert!(
+            backend
+                .sarif_analysis_by_dedupe(run_id, "missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .sarif_analysis("33333333-3333-4333-8333-333333333333")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let listed = backend.sarif_analyses(run_id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].analysis_id, analysis.analysis_id);
+        assert!(
+            backend
+                .sarif_analyses(RunId::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let stored = backend.sarif_findings(&analysis.analysis_id).await.unwrap();
+        assert_eq!(stored.len(), 2);
+        // `src/db.js` sorts before `src/util.js`.
+        assert_eq!(stored[0].fingerprint, "fp-1");
+        assert_eq!(stored[0].level, "error");
+        assert_eq!(stored[0].start_line, Some(12));
+        assert_eq!(stored[1].fingerprint, "fp-2");
+        assert_eq!(stored[1].suppression.as_deref(), Some("inSource"));
+    }
+
     pub(crate) async fn cancel_run_queues_cancellation(backend: &dyn ControlBackend) {
         let run_id = RunId::new();
         let runner = backend
@@ -1517,6 +1671,58 @@ pub(crate) mod suite {
         );
     }
 
+    /// The cancel result comes from the locked transition, not an earlier read
+    /// or the number of in-flight cancellation messages.
+    pub(crate) async fn cancel_outcome_tracks_locked_transition(backend: &dyn ControlBackend) {
+        let queued = RunId::new();
+        backend
+            .submit_run(submit_run(queued, vec![submit_job(queued, "build", 1)]))
+            .await
+            .unwrap();
+        let cancelled = backend.cancel_run(queued, None).await.unwrap();
+        assert!(cancelled.run_cancelled);
+        assert_eq!(
+            cancelled.cancellations, 0,
+            "queued jobs have no live runner"
+        );
+        assert_eq!(cancelled.record.unwrap().status, ExecutionStatus::Cancelled);
+        assert!(
+            !backend
+                .cancel_run(queued, None)
+                .await
+                .unwrap()
+                .run_cancelled
+        );
+
+        let completing = RunId::new();
+        backend
+            .submit_run(submit_run(
+                completing,
+                vec![submit_job(completing, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let resolved = backend.run_record(completing).await.unwrap();
+        assert!(!resolved.status.is_terminal());
+        backend
+            .complete_job(JobCompletionInput {
+                run_id: completing,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let after_completion = backend.cancel_run(resolved.run_id, None).await.unwrap();
+        assert!(!after_completion.run_cancelled);
+        assert_eq!(
+            after_completion.record.unwrap().conclusion.as_deref(),
+            Some("success")
+        );
+    }
+
     /// A starved run is finalized without releasing its workflow-level
     /// concurrency hold (the trait doc: `reap_sweep` step 1 performs no
     /// concurrency release). A run parked behind the group stays held.
@@ -1739,6 +1945,7 @@ pub(crate) mod suite {
             attempts: 0,
             lease_until_us: None,
             lease_token: None,
+            signer_app_id: None,
             last_error: None,
         };
         assert!(backend.enqueue_webhook_delivery(&delivery).await.unwrap());
@@ -3599,6 +3806,106 @@ pub(crate) mod suite {
         }
     }
 
+    /// A retry (runner death → `retry_attempt`) mints a fresh `agent_job_id`
+    /// and re-derives `plan.planId`, but the runner-visible
+    /// `system.orchestrationId` must be re-prefixed too. The runner sends
+    /// that value as the plan segment of `runnerresolve/actions`; a stale
+    /// prefix from the abandoned attempt makes the engine refuse the retried
+    /// job's own runtime token with HTTP 403.
+    ///
+    /// Backend-neutral: exercises the lite and pg retry paths.
+    pub(crate) async fn retry_reprefies_orchestration_id(backend: &dyn ControlBackend) {
+        use preloop_gha_protocol::azdo::VariableValue;
+
+        let run_id = RunId::new();
+        let agent_job_id = uuid::Uuid::new_v4();
+        let mut job = submit_job(run_id, "build", 1);
+        job.request = Some(request_record_with_agent(run_id, "build", 1, agent_job_id));
+        job.queued.message.job_id = agent_job_id;
+        job.queued.message.plan.plan_id = agent_job_id.to_string();
+        job.queued.message.variables.insert(
+            "system.orchestrationId".to_owned(),
+            VariableValue::new(format!("{agent_job_id}.build.__default")),
+        );
+        backend
+            .submit_run(submit_run(run_id, vec![job]))
+            .await
+            .unwrap();
+
+        let runner = backend
+            .register_runner(register_runner("r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => {
+                assert_eq!(claimed.request.agent_job_id, agent_job_id)
+            }
+            other => panic!("expected initial claim, got {other:?}"),
+        }
+
+        // The runner dies after claiming; recovery replaces the attempt.
+        backend.purge_runner(runner.runner.id).await.unwrap();
+
+        let runner2 = backend
+            .register_runner(register_runner("r2"))
+            .await
+            .unwrap();
+        let session2 = backend
+            .create_session(create_session(runner2.runner.id))
+            .await
+            .unwrap();
+        let retried = match backend
+            .poll_session(poll(&session2.session_id, runner2.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected retry claim, got {other:?}"),
+        };
+        let retry_agent_job_id = retried.request.agent_job_id;
+        assert_ne!(
+            retry_agent_job_id, agent_job_id,
+            "a retry must mint a fresh runtime identity"
+        );
+
+        let context = backend
+            .acquire_context(retried.request.request_id)
+            .await
+            .unwrap();
+        let message = context.message;
+        assert_eq!(message.job_id, retry_agent_job_id);
+        assert_eq!(message.plan.plan_id, retry_agent_job_id.to_string());
+        let orchestration = message
+            .variables
+            .get("system.orchestrationId")
+            .and_then(|value| value.value.as_deref())
+            .expect("the retried message keeps system.orchestrationId");
+        assert_eq!(
+            orchestration,
+            format!("{retry_agent_job_id}.build.__default"),
+            "the retried message must name the retry's plan prefix"
+        );
+        assert!(
+            crate::auth::results_identity_binds_job(
+                &crate::auth::ResultsIdentity::Job(crate::auth::ResultsJobIdentity {
+                    plan_id: retry_agent_job_id.to_string(),
+                    job_id: retry_agent_job_id,
+                }),
+                orchestration,
+                &retry_agent_job_id.to_string(),
+            ),
+            "the retried job's own token must bind to the orchestration path it sends"
+        );
+    }
+
     /// The job → check-run mapping: set reports whether it changed, a
     /// re-report of the same id is a no-op, clear is conditional on the id
     /// still recorded, and jobs outside the run are never mapped. Every
@@ -4049,8 +4356,11 @@ pub(crate) mod suite {
         // row the count missed can surface after the prune; rows never
         // vanish except by pruning. Hence `>=`: prune removed no more than it
         // reported.
+        // The count and the prune are separate snapshots on one cluster, so a
+        // row the count could not see (above the cluster-wide `xmin`) may be
+        // removed by the prune: `pruned` can legitimately exceed `before`.
         assert!(
-            outbox_len(backend).await >= before - pruned as usize,
+            outbox_len(backend).await >= before.saturating_sub(pruned as usize),
             "prune removes no more rows than it counted"
         );
 
@@ -4537,6 +4847,207 @@ pub(crate) mod suite {
         assert_eq!(claimed.queued.run_id, big);
     }
 
+    /// One row edit a seeded scenario needs because no `ControlBackend`
+    /// command writes it. `seed` translates it into the backend's own SQL
+    /// (`now_us()` microseconds on lite, `now() - interval` on pg) — the
+    /// escape hatch `swept_binding_is_reported` already uses for an aged
+    /// binding, and the only way to move a stamp that is written as "now".
+    pub(crate) enum SeedRow {
+        /// `jobs.enqueued_at`: `Some(secs)` moves it that far into the past,
+        /// `None` clears it (a job whose ready-enqueue was never recorded).
+        Enqueued {
+            run_id: RunId,
+            job_id: String,
+            age_seconds: Option<u64>,
+        },
+        /// Upsert the job's `job_assignments` row onto `runner_id`, timing
+        /// the two stamps separately: `None` is now, `Some(secs)` that far
+        /// back. Rebinding refreshes `assigned_at` and keeps
+        /// `first_assigned_at`, so the pair can diverge.
+        Binding {
+            run_id: RunId,
+            job_id: String,
+            runner_id: i64,
+            assigned_age_seconds: Option<u64>,
+            first_age_seconds: Option<u64>,
+        },
+        /// `provision_requests` (insert or refresh): the waitlist row a job
+        /// carries while no runner is bound to it.
+        Provision {
+            run_id: RunId,
+            job_id: String,
+            age_seconds: u64,
+        },
+        /// Park a ready job outside the ready queue (`claimed`) with its
+        /// binding left on the row — the dispatch leftover the sweep clears.
+        Park { run_id: RunId, job_id: String },
+        /// Drop both intent rows from a ready job — the leaked shape strict
+        /// assignments can never claim.
+        ClearIntent { run_id: RunId, job_id: String },
+    }
+
+    /// The claim-binding ceiling: a job that has been in the ready queue
+    /// longer than `CLAIM_BINDING_TTL` is claimable by ANY verified runner
+    /// even while a fresh reservation names someone else, so a single
+    /// reservation cannot park a job forever. A job with no recorded enqueue
+    /// time (`NULL` / 0) is never past the ceiling — nothing can age it — so
+    /// its reservation holds the job for its runner.
+    ///
+    /// Requires `set_config(true, false, _)`: each submission is reserved by
+    /// the idle pool-proven runner of its own block.
+    pub(crate) async fn claim_ceiling_opens_only_an_aged_reservation<F, Fut>(
+        backend: &dyn ControlBackend,
+        seed: F,
+    ) where
+        F: Fn(SeedRow) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let runner_b = backend.register_runner(register_runner("b")).await.unwrap();
+        let session_b = backend
+            .create_session(create_session(runner_b.runner.id))
+            .await
+            .unwrap();
+
+        // Enqueued past the ceiling: the reservation no longer counts.
+        let (aged_runner, _) = pool_proven_runner(backend, "aged").await;
+        let aged_run = RunId::new();
+        backend
+            .submit_run(submit_run(aged_run, vec![submit_job(aged_run, "build", 2)]))
+            .await
+            .unwrap();
+        seed(SeedRow::Enqueued {
+            run_id: aged_run,
+            job_id: "build".to_owned(),
+            age_seconds: Some(180),
+        })
+        .await;
+        let outcome = backend
+            .poll_session(poll(&session_b.session_id, runner_b.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a job enqueued past the ceiling frees its reservation, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.run_id, aged_run);
+        assert_eq!(claimed.runner_id, runner_b.runner.id);
+        // Settle it: a poller holding an unfinished attempt is handed that
+        // attempt back, not the next job.
+        backend
+            .complete_job(JobCompletionInput {
+                run_id: aged_run,
+                job_id: JobId("build".to_owned()),
+                agent_job_id: Some(claimed.request.agent_job_id),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner_b.runner.id),
+            })
+            .await
+            .unwrap();
+
+        // Retire the spent runner: the pairing hands each job to the lowest
+        // idle pool-proven runner, and this one must not take the next run's.
+        backend.purge_runner(aged_runner).await.unwrap();
+
+        // No recorded enqueue time: the job is not "old", only unrecorded.
+        let (never_enqueued_runner, session) = pool_proven_runner(backend, "never-enqueued").await;
+        let never_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                never_run,
+                vec![submit_job(never_run, "build", 3)],
+            ))
+            .await
+            .unwrap();
+        seed(SeedRow::Enqueued {
+            run_id: never_run,
+            job_id: "build".to_owned(),
+            age_seconds: None,
+        })
+        .await;
+        let outcome = backend
+            .poll_session(poll(&session_b.session_id, runner_b.runner.id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Empty),
+            "an unrecorded enqueue time is not a ceiling breach, got {outcome:?}"
+        );
+        // The reservation is live, not the job: its runner still takes it.
+        let outcome = backend
+            .poll_session(poll(&session, never_enqueued_runner))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("the reserved runner still claims its job, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.run_id, never_run);
+    }
+
+    /// A reservation that outlived `CLAIM_BINDING_TTL` binds nobody: any
+    /// verified runner may take the job. The window is measured on
+    /// `assigned_at` (the rebind stamp), so a stale reservation opens even
+    /// while `first_assigned_at` is still fresh — a rebind refreshes only
+    /// `assigned_at`, and the ladder must not read the abandoned first stamp
+    /// as a live hold.
+    ///
+    /// Requires `set_config(false, true, _)`: strict assignments keep a stale
+    /// binding in place (permissive mode drops it before the ladder reads
+    /// it). No command writes a stale stamp and the schema nulls a dead
+    /// runner's binding (`ON DELETE SET NULL`, plus the purge's own delete),
+    /// so this seeded row is the only way to reach the ladder's
+    /// `!assignment_fresh` arm at all.
+    pub(crate) async fn stale_reservation_reopens_a_bound_job<F, Fut>(
+        backend: &dyn ControlBackend,
+        seed: F,
+    ) where
+        F: Fn(SeedRow) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let runner_a = backend.register_runner(register_runner("a")).await.unwrap();
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let binding = |assigned_age_seconds: Option<u64>| SeedRow::Binding {
+            run_id,
+            job_id: "build".to_owned(),
+            runner_id: runner_a.runner.id,
+            assigned_age_seconds,
+            first_age_seconds: None,
+        };
+
+        // Control: a fresh reservation is exclusive to its runner. Runner B
+        // registers only now: strict mode pairs a job with any session that
+        // can serve it at enqueue, and the reservation under test is A's.
+        seed(binding(None)).await;
+        let runner_b = backend.register_runner(register_runner("b")).await.unwrap();
+        let session_b = backend
+            .create_session(create_session(runner_b.runner.id))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session_b.session_id, runner_b.runner.id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Empty),
+            "a fresh reservation belongs to its runner, got {outcome:?}"
+        );
+
+        // The reservation goes stale; the first-assignment stamp stays fresh.
+        seed(binding(Some(180))).await;
+        let outcome = backend
+            .poll_session(poll(&session_b.session_id, runner_b.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a stale reservation must open to any verified runner, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.run_id, run_id);
+        assert_eq!(claimed.runner_id, runner_b.runner.id);
+    }
+
     /// The claim reads the ready queue in ONE order across label sets: the
     /// pool key groups equal label sets for pruning, it never ranks them.
     /// `["",["preloop-cpane","self-hosted"]]` sorts before
@@ -4615,6 +5126,219 @@ pub(crate) mod suite {
             panic!("the remaining job must be dispatched, got {outcome:?}");
         };
         assert_eq!(claimed.queued.job_id, JobId("newer".to_owned()));
+    }
+
+    /// A claimed job whose runner is purged is requeued WITH dispatch intent:
+    /// under strict assignments a ready job with no assignment/provision row
+    /// is unclaimable, so the requeue must re-derive the enqueue mark.
+    /// Requires `set_config(false, true, _)` from the wrapper.
+    pub(crate) async fn purge_rebinds_a_requeued_job_under_strict_assignments(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("dying"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("the enqueue-bound job must be claimable, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.run_id, run_id);
+
+        // The runner dies: purge requeues its claimed job.
+        backend.purge_runner(runner.runner.id).await.unwrap();
+
+        // A replacement pairs the requeued job only when the requeue wrote a
+        // provision mark; strict mode then lets it claim the fresh binding.
+        let replacement = backend
+            .register_runner(register_runner("replacement"))
+            .await
+            .unwrap();
+        let replacement_session = backend
+            .create_session(create_session(replacement.runner.id))
+            .await
+            .unwrap();
+        backend.pair_runner(replacement.runner.id).await.unwrap();
+        let outcome = backend
+            .poll_session(poll(&replacement_session.session_id, replacement.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a replacement runner must claim the requeued job, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.run_id, run_id);
+        assert_eq!(claimed.runner_id, replacement.runner.id);
+    }
+
+    /// Strict assignments with the pool off: an enqueue with no free matching
+    /// runner must still write a provision mark, or the job is born
+    /// unclaimable and no later runner can ever pair it. Requires
+    /// `set_config(false, true, _)` from the wrapper.
+    pub(crate) async fn strict_without_pool_marks_a_job_for_a_later_runner(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        // No session exists: enqueue-time pairing has no candidate.
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+
+        let runner = backend
+            .register_runner(register_runner("later"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend.pair_runner(runner.runner.id).await.unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("a later runner must pair and claim the marked job, got {outcome:?}");
+        };
+        assert_eq!(claimed.queued.run_id, run_id);
+    }
+
+    /// A deferred matrix expansion materializes each leg as a ready job; every
+    /// leg must carry dispatch intent, or strict assignments leave it
+    /// unclaimable forever (the spec's F-3). Requires `set_config(false, true,
+    /// _)` from the wrapper.
+    pub(crate) async fn deferred_expansion_legs_are_claimable_under_strict(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "gen", 1), fan]))
+            .await
+            .unwrap();
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+
+        let claim = backend
+            .claim_expansion()
+            .await
+            .unwrap()
+            .expect("the deferred node must be leased");
+        assert_eq!(claim.job.job_id, JobId("fan".to_owned()));
+        let outcome = backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix {
+                    jobs: vec![
+                        super::built_matrix_leg(run_id, "fan-1", "fan", 1, 2),
+                        super::built_matrix_leg(run_id, "fan-2", "fan", 2, 2),
+                    ],
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.promoted, 2,
+            "both expansion legs must be promoted, got {outcome:?}"
+        );
+
+        let runner = backend
+            .register_runner(register_runner("matrix"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend.pair_runner(runner.runner.id).await.unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        let PollOutcome::Claimed(claimed) = outcome else {
+            panic!("an expanded leg must be claimable under strict assignments, got {outcome:?}");
+        };
+        assert!(
+            matches!(claimed.queued.job_id.0.as_str(), "fan-1" | "fan-2"),
+            "the claimed job must be an expansion leg, got {:?}",
+            claimed.queued.job_id
+        );
+    }
+
+    /// The periodic backstop repairs a ready job with no dispatch intent at
+    /// all and reports the repair count; a second pass has nothing to do (it
+    /// never re-stamps a live row). Requires `set_config(false, true, _)`.
+    pub(crate) async fn reconcile_repairs_a_missing_intent_row<F, Fut>(
+        backend: &dyn ControlBackend,
+        seed: F,
+    ) where
+        F: Fn(SeedRow) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "build", 1)]))
+            .await
+            .unwrap();
+        // Recreate the leaked shape: the strict submit wrote a row; drop both.
+        seed(SeedRow::ClearIntent {
+            run_id,
+            job_id: "build".to_owned(),
+        })
+        .await;
+
+        assert_eq!(
+            backend.reconcile_dispatch_intent().await.unwrap(),
+            1,
+            "the leaked job must be repaired"
+        );
+        assert_eq!(
+            backend.reconcile_dispatch_intent().await.unwrap(),
+            0,
+            "a repaired job must not be touched twice"
+        );
+
+        let runner = backend
+            .register_runner(register_runner("reconciled"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        backend.pair_runner(runner.runner.id).await.unwrap();
+        let outcome = backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Claimed(_)),
+            "the repaired job must be claimable, got {outcome:?}"
+        );
     }
 
     /// Claim the next job as `runner` and return `(run, job, agent job id)`.
@@ -5461,6 +6185,20 @@ pub(crate) mod suite {
         (runner.runner.id, session.session_id)
     }
 
+    /// A pool-proven runner with a live session: the only candidate the
+    /// enqueue pairing considers in pool mode (`pool_proven` alone is not
+    /// enough, the runner must hold a session). `(runner_id, session_id)`.
+    async fn pool_proven_runner(backend: &dyn ControlBackend, name: &str) -> (i64, String) {
+        let mut registration = register_runner(name);
+        registration.pool_proven = true;
+        let runner = backend.register_runner(registration).await.unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        (runner.runner.id, session.session_id)
+    }
+
     /// `submit_run` under an explicit namespace.
     fn submit_in(namespace: &str, run_id: RunId, jobs: Vec<SubmitJob>) -> SubmitRun {
         let mut submit = submit_run(run_id, jobs);
@@ -5781,6 +6519,107 @@ pub(crate) mod suite {
         assert!(backend.run_record(throttled).await.is_err());
     }
 
+    /// Chunked submit equivalence: a run larger than `SUBMIT_JOB_CHUNK_SIZE`
+    /// lands in the same final state a single-transaction submit produced —
+    /// every job row, its message, request correlation, step manifest, token
+    /// request and OIDC grant — while no single transaction holds the writer
+    /// for the whole insert. Runs against both backends via the shared suite.
+    pub(crate) async fn chunked_submit_matches_single_chunk_state(backend: &dyn ControlBackend) {
+        use crate::control::types::SUBMIT_JOB_CHUNK_SIZE;
+        let total = SUBMIT_JOB_CHUNK_SIZE + 50;
+        let run_id = RunId::new();
+        // The first three jobs carry the full truncate-family payload (token
+        // request, OIDC grant + context, declared step manifest); the rest
+        // are plain. Chunk 1 ends mid-list so jobs on both sides of a chunk
+        // boundary are covered.
+        let jobs: Vec<SubmitJob> = (0..total)
+            .map(|index| {
+                let job_id = format!("job-{index:04}");
+                if index < 3 {
+                    submit_job_full(run_id, &job_id, index as i64 + 1)
+                } else {
+                    submit_job(run_id, &job_id, index as i64 + 1)
+                }
+            })
+            .collect();
+        let outcome = backend
+            .submit_run(submit_run(run_id, jobs))
+            .await
+            .expect("chunked submit succeeds");
+        assert_eq!(outcome.queued_jobs, total, "every job admitted");
+        assert_eq!(outcome.status, ExecutionStatus::Queued);
+        assert!(
+            outcome.concluded.is_empty(),
+            "nothing concluded at submit: {:?}",
+            outcome.concluded
+        );
+        assert!(outcome.existing.is_none());
+
+        let record = backend.run_record(run_id).await.expect("run persisted");
+        assert_eq!(record.jobs.len(), total, "every job row persisted");
+        assert!(
+            record
+                .jobs
+                .values()
+                .all(|status| *status == ExecutionStatus::Queued),
+            "all jobs queued"
+        );
+        assert_eq!(record.status, ExecutionStatus::Queued);
+
+        // Request/message correlation round-trips for the full-payload jobs
+        // and for jobs on both sides of each chunk boundary. Request ids
+        // allocate sequentially from 1 on a fresh backend in submit order.
+        let boundary = SUBMIT_JOB_CHUNK_SIZE as i64;
+        for (request_id, job_id, full) in [
+            (1, "job-0000", true),
+            (2, "job-0001", true),
+            (3, "job-0002", true),
+            (
+                boundary,
+                &format!("job-{:04}", SUBMIT_JOB_CHUNK_SIZE - 1),
+                false,
+            ),
+            (
+                boundary + 1,
+                &format!("job-{:04}", SUBMIT_JOB_CHUNK_SIZE),
+                false,
+            ),
+            (total as i64, &format!("job-{:04}", total - 1), false),
+        ] {
+            let ctx = backend
+                .acquire_context(request_id)
+                .await
+                .unwrap_or_else(|_| panic!("request {request_id} persisted"));
+            assert_eq!(
+                ctx.message.request_id, request_id,
+                "message carries the allocated request id for {job_id}"
+            );
+            assert_eq!(ctx.request.job_id, JobId(job_id.to_owned()));
+            if full {
+                assert!(
+                    ctx.token_request.is_some(),
+                    "deferred token-mint request persisted for {job_id}"
+                );
+                assert_eq!(
+                    ctx.id_token_granted,
+                    Some(true),
+                    "OIDC grant persisted for {job_id}"
+                );
+            }
+        }
+
+        // Declared step manifests landed for exactly the three full jobs.
+        let manifests = backend
+            .run_step_manifests(run_id)
+            .await
+            .expect("step manifests readable");
+        assert_eq!(manifests.len(), 3, "one manifest per full job");
+        for steps in manifests.values() {
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0].name, "Build");
+        }
+    }
+
     /// A webhook-originated run is never refused by a namespace limit or a
     /// suspension (GitHub does not redeliver, so a refusal loses the push):
     /// it is recorded and waits at claim. Only a deleted namespace refuses
@@ -5892,6 +6731,238 @@ pub(crate) mod suite {
         assert_eq!(
             inputs.released_bindings, swept as u64,
             "a swept binding must be reported by the status inputs"
+        );
+    }
+
+    /// With pool assignments and strict assignments both off, the sweep
+    /// DELETES stale dispatch intent: a binding older than `ASSIGNMENT_TTL`
+    /// goes away (the job is unassigned work again, claimable by anyone) and
+    /// so does a provision request that old, while a fresh binding is left
+    /// binding its runner. The sweep reports every row it dropped.
+    ///
+    /// Requires `set_config(false, false, _)` (the default); no command
+    /// writes an aged stamp or an unpaired waitlist row, so `seed` does.
+    pub(crate) async fn sweep_without_pool_or_strict_deletes_stale_intent<F, Fut>(
+        backend: &dyn ControlBackend,
+        seed: F,
+    ) where
+        F: Fn(SeedRow) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let runner_a = backend.register_runner(register_runner("a")).await.unwrap();
+        let session_a = backend
+            .create_session(create_session(runner_a.runner.id))
+            .await
+            .unwrap();
+        let runner_b = backend.register_runner(register_runner("b")).await.unwrap();
+        let session_b = backend
+            .create_session(create_session(runner_b.runner.id))
+            .await
+            .unwrap();
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![submit_job(run_id, "aged", 1), submit_job(run_id, "kept", 2)],
+            ))
+            .await
+            .unwrap();
+        // ASSIGNMENT_TTL (600s) is the sweep's window in this mode.
+        let aged = 700;
+        seed(SeedRow::Binding {
+            run_id,
+            job_id: "aged".to_owned(),
+            runner_id: runner_a.runner.id,
+            assigned_age_seconds: Some(aged),
+            first_age_seconds: Some(aged),
+        })
+        .await;
+        seed(SeedRow::Binding {
+            run_id,
+            job_id: "kept".to_owned(),
+            runner_id: runner_a.runner.id,
+            assigned_age_seconds: None,
+            first_age_seconds: None,
+        })
+        .await;
+
+        let swept = backend.sweep_stale_bindings().await.unwrap();
+        assert_eq!(swept, 1, "only the binding past ASSIGNMENT_TTL is stale");
+        // The aged job is free work again: the first verified poller takes it.
+        let outcome = backend
+            .poll_session(poll(&session_b.session_id, runner_b.runner.id))
+            .await
+            .unwrap();
+        let claimed = match outcome {
+            PollOutcome::Claimed(claim) => Some((
+                claim.queued.run_id,
+                claim.queued.job_id.clone(),
+                claim.request.agent_job_id,
+            )),
+            PollOutcome::Empty => None,
+            other => panic!("expected a claim or nothing, got {other:?}"),
+        }
+        .expect("a deleted binding leaves the job unassigned");
+        assert_eq!(claimed.1, JobId("aged".to_owned()));
+        // Settle it: a poller holding an unfinished attempt is handed that
+        // attempt back, not the next job.
+        backend
+            .complete_job(JobCompletionInput {
+                run_id: claimed.0,
+                job_id: claimed.1.clone(),
+                agent_job_id: Some(claimed.2),
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: Some(runner_b.runner.id),
+            })
+            .await
+            .unwrap();
+        // The fresh binding survived: nobody else can take its job...
+        assert_eq!(
+            claimed_job(backend, &session_b.session_id, runner_b.runner.id).await,
+            None,
+            "a fresh binding survives the sweep"
+        );
+        // ...and its runner still can.
+        let claimed = claimed_job(backend, &session_a.session_id, runner_a.runner.id).await;
+        assert_eq!(
+            claimed.map(|(_, job_id, _)| job_id),
+            Some(JobId("kept".to_owned())),
+            "a binding inside ASSIGNMENT_TTL still binds its runner"
+        );
+
+        // A provision request ages on the same window and is swept too, on
+        // its own: nothing else is left to delete.
+        let waiting_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                waiting_run,
+                vec![submit_job(waiting_run, "build", 3)],
+            ))
+            .await
+            .unwrap();
+        seed(SeedRow::Provision {
+            run_id: waiting_run,
+            job_id: "build".to_owned(),
+            age_seconds: aged,
+        })
+        .await;
+        let swept = backend.sweep_stale_bindings().await.unwrap();
+        assert_eq!(swept, 1, "the aged provision request is swept");
+    }
+
+    /// In pool mode the sweep RELEASES a stale binding instead of deleting
+    /// it: the binding keeps its job, loses its runner, and the job re-enters
+    /// the provision queue (a fresh request), so provisioning can bind it
+    /// again. A binding inside `CLAIM_BINDING_TTL` is untouched, and the job
+    /// behind the fresh request is not claimable until it goes stale or the
+    /// enqueue ceiling passes.
+    ///
+    /// Requires `set_config(true, false, _)`: two idle pool-proven runners
+    /// reserve the two submissions at enqueue.
+    pub(crate) async fn sweep_in_pool_mode_releases_a_stale_binding<F, Fut>(
+        backend: &dyn ControlBackend,
+        seed: F,
+    ) where
+        F: Fn(SeedRow) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let (runner_a1, _) = pool_proven_runner(backend, "a1").await;
+        pool_proven_runner(backend, "a2").await;
+        let runner_b = backend.register_runner(register_runner("b")).await.unwrap();
+        let session_b = backend
+            .create_session(create_session(runner_b.runner.id))
+            .await
+            .unwrap();
+        let stale_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                stale_run,
+                vec![submit_job(stale_run, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let fresh_run = RunId::new();
+        backend
+            .submit_run(submit_run(
+                fresh_run,
+                vec![submit_job(fresh_run, "build", 2)],
+            ))
+            .await
+            .unwrap();
+        // CLAIM_BINDING_TTL (120s) is the sweep's window in this mode.
+        let stale = 180;
+        seed(SeedRow::Binding {
+            run_id: stale_run,
+            job_id: "build".to_owned(),
+            runner_id: runner_a1,
+            assigned_age_seconds: Some(stale),
+            first_age_seconds: Some(stale),
+        })
+        .await;
+
+        let swept = backend.sweep_stale_bindings().await.unwrap();
+        assert_eq!(
+            swept, 1,
+            "the stale binding is released, the fresh one is left alone"
+        );
+        // Released, not deleted: the job is back in the provision queue, and
+        // that fresh request blocks a claim (the other run is still bound).
+        let outcome = backend
+            .poll_session(poll(&session_b.session_id, runner_b.runner.id))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PollOutcome::Empty),
+            "a released job waits for provisioning, got {outcome:?}"
+        );
+    }
+
+    /// The pool-mode sweep also drops bindings whose job is no longer ready:
+    /// a reservation on a job nobody can claim is dead dispatch intent. The
+    /// dropped row is reported like any other, and a binding on a job that is
+    /// still ready survives the same sweep.
+    ///
+    /// Requires `set_config(true, false, _)`; no command leaves a binding
+    /// behind on a job that left the ready queue, so `seed` parks the job.
+    pub(crate) async fn sweep_in_pool_mode_drops_bindings_of_unready_jobs<F, Fut>(
+        backend: &dyn ControlBackend,
+        seed: F,
+    ) where
+        F: Fn(SeedRow) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let (runner_a, _) = pool_proven_runner(backend, "a").await;
+        let run_id = RunId::new();
+        backend
+            .submit_run(submit_run(
+                run_id,
+                vec![
+                    submit_job(run_id, "leaving", 1),
+                    submit_job(run_id, "ready", 2),
+                ],
+            ))
+            .await
+            .unwrap();
+        // The pairing reserved the first job; the second waits for a runner.
+        seed(SeedRow::Binding {
+            run_id,
+            job_id: "ready".to_owned(),
+            runner_id: runner_a,
+            assigned_age_seconds: None,
+            first_age_seconds: None,
+        })
+        .await;
+        seed(SeedRow::Park {
+            run_id,
+            job_id: "leaving".to_owned(),
+        })
+        .await;
+
+        let swept = backend.sweep_stale_bindings().await.unwrap();
+        assert_eq!(
+            swept, 1,
+            "only the leftover binding of the job no longer ready is dropped"
         );
     }
 
@@ -6028,6 +7099,85 @@ pub(crate) mod suite {
         for active in &mut inputs.active {
             active.session_live = false;
         }
+    }
+
+    /// Keep the lease arm of the sweep from firing at a synthetic sweep time:
+    /// the renewal instant is moved to just before `now`.
+    fn renew_just_before(inputs: &mut ReapInputs, now: std::time::SystemTime) {
+        for active in &mut inputs.active {
+            active.last_renewed_at = Some(now - std::time::Duration::from_secs(1));
+        }
+    }
+
+    /// The reaper honours a job's `timeout-minutes` up to GitHub's maximum and
+    /// no further. GitHub's service cancels a job at five days regardless of a
+    /// longer declaration, so a stored message that asks for more must be
+    /// cancelled *at* the ceiling — otherwise a fork's workflow keeps its
+    /// leased runner for as long as it asked. The message build and the token
+    /// mint are clamped at the same value (their own tests cover those); this
+    /// one covers the reaper, which reads a stored template directly.
+    pub(crate) async fn job_timeout_is_capped_at_the_github_maximum(backend: &dyn ControlBackend) {
+        use preloop_gha_parser::job_builder::MAX_JOB_TIMEOUT_SECONDS;
+
+        let max = MAX_JOB_TIMEOUT_SECONDS as u64;
+        let run_id = RunId::new();
+        let runner = backend
+            .register_runner(register_runner("cap-r1"))
+            .await
+            .unwrap();
+        let session = backend
+            .create_session(create_session(runner.runner.id))
+            .await
+            .unwrap();
+        let mut job = submit_job(run_id, "build", 1);
+        // Declared an hour past the ceiling: the reaper must stop at it.
+        job.queued.message.job_timeout = Some(MAX_JOB_TIMEOUT_SECONDS + 3600);
+        backend
+            .submit_run(submit_run(run_id, vec![job]))
+            .await
+            .unwrap();
+        let claimed = match backend
+            .poll_session(poll(&session.session_id, runner.runner.id))
+            .await
+            .unwrap()
+        {
+            PollOutcome::Claimed(claimed) => claimed,
+            other => panic!("expected a claim, got {other:?}"),
+        };
+        let inputs = backend.reap_inputs().await.unwrap();
+        let started = inputs
+            .active
+            .iter()
+            .find(|active| active.request_id == claimed.request.request_id)
+            .and_then(|active| active.started_at)
+            .expect("the claim stamps started_at");
+
+        // One second under the ceiling: the reaper must not fire early.
+        let early = started + std::time::Duration::from_secs(max - 1);
+        let mut early_inputs = inputs.clone();
+        renew_just_before(&mut early_inputs, early);
+        let outcome = backend
+            .reap_sweep(sweep_at(early, run_id, early_inputs))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.cancellations, 0,
+            "an hour-past-the-ceiling declaration must not cancel before the ceiling"
+        );
+
+        // One second past the ceiling: the declared timeout still has an hour
+        // to go, and the reaper must cancel anyway.
+        let capped = started + std::time::Duration::from_secs(max + 1);
+        let mut capped_inputs = inputs.clone();
+        renew_just_before(&mut capped_inputs, capped);
+        let outcome = backend
+            .reap_sweep(sweep_at(capped, run_id, capped_inputs))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.cancellations, 1,
+            "the reaper must cancel at GitHub's maximum, not at the declared value"
+        );
     }
 
     /// A worker that stops renewing while its session keeps polling is hung,
@@ -8059,6 +9209,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn sarif_analyses_roundtrip_and_dedupe() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::sarif_analyses_roundtrip_and_dedupe(&backend).await;
+    }
+
+    #[tokio::test]
     async fn status_events_are_stamped_with_row_versions() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -8284,6 +9442,14 @@ mod pg {
             return skip_no_postgres();
         };
         suite::cancel_of_terminal_run_preserves_conclusion(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_outcome_tracks_locked_transition() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::cancel_outcome_tracks_locked_transition(&backend).await;
     }
 
     #[tokio::test]
@@ -8520,6 +9686,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn retry_reprefies_orchestration_id() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::retry_reprefies_orchestration_id(&backend).await;
+    }
+
+    #[tokio::test]
     async fn check_run_mapping() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -8592,6 +9766,170 @@ mod pg {
             return skip_no_postgres();
         };
         suite::claim_scan_finds_a_matching_job_past_the_window(&backend).await;
+    }
+
+    /// [`suite::SeedRow`] → PostgreSQL SQL: the seeded scenarios move their
+    /// own stamps (`now_us()` microseconds do not exist here) and park their
+    /// own jobs, exactly as `swept_binding_is_reported` ages its binding.
+    async fn seed_row(backend: &PgBackend, row: suite::SeedRow) {
+        let at = |age_seconds: u64| format!("now() - interval '{age_seconds} seconds'");
+        let now = || "now()".to_owned();
+        let sql = match row {
+            suite::SeedRow::Enqueued {
+                run_id,
+                job_id,
+                age_seconds,
+            } => format!(
+                "UPDATE jobs SET enqueued_at = {} \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}'",
+                age_seconds.map_or_else(|| "NULL".to_owned(), at),
+            ),
+            suite::SeedRow::Binding {
+                run_id,
+                job_id,
+                runner_id,
+                assigned_age_seconds,
+                first_age_seconds,
+            } => {
+                let assigned = assigned_age_seconds.map_or_else(now, at);
+                let first = first_age_seconds.map_or_else(now, at);
+                format!(
+                    "INSERT INTO job_assignments (run_id, job_id, runner_id, assigned_at, \
+                     first_assigned_at) VALUES ('{run_id}', '{job_id}', {runner_id}, \
+                     {assigned}, {first}) \
+                     ON CONFLICT (run_id, job_id) DO UPDATE SET runner_id = {runner_id}, \
+                     assigned_at = {assigned}, first_assigned_at = {first}"
+                )
+            }
+            suite::SeedRow::Provision {
+                run_id,
+                job_id,
+                age_seconds,
+            } => format!(
+                "INSERT INTO provision_requests (run_id, job_id, namespace_id, pool_key, \
+                 labels, requested_at) \
+                 SELECT j.run_id, j.job_id, j.namespace_id, j.pool_key, j.runs_on, {at} \
+                 FROM jobs j WHERE j.run_id = '{run_id}' AND j.job_id = '{job_id}' \
+                 ON CONFLICT (run_id, job_id) DO UPDATE SET requested_at = EXCLUDED.requested_at",
+                at = at(age_seconds),
+            ),
+            suite::SeedRow::Park { run_id, job_id } => format!(
+                "UPDATE jobs SET queue_state = 'claimed' \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}'"
+            ),
+            suite::SeedRow::ClearIntent { run_id, job_id } => format!(
+                "WITH dropped AS (DELETE FROM job_assignments \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}') \
+                 DELETE FROM provision_requests \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}'"
+            ),
+        };
+        backend.test_execute(&sql).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_ceiling_opens_only_an_aged_reservation() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::claim_ceiling_opens_only_an_aged_reservation(&backend, |row| async move {
+            seed_row(db, row).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stale_reservation_reopens_a_bound_job() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::stale_reservation_reopens_a_bound_job(&backend, |row| async move {
+            seed_row(db, row).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn purge_rebinds_a_requeued_job_under_strict_assignments() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::purge_rebinds_a_requeued_job_under_strict_assignments(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn strict_without_pool_marks_a_job_for_a_later_runner() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::strict_without_pool_marks_a_job_for_a_later_runner(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_expansion_legs_are_claimable_under_strict() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::deferred_expansion_legs_are_claimable_under_strict(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_repairs_a_missing_intent_row() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::reconcile_repairs_a_missing_intent_row(&backend, |row| async move {
+            seed_row(db, row).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sweep_without_pool_or_strict_deletes_stale_intent() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(false, false, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::sweep_without_pool_or_strict_deletes_stale_intent(&backend, |row| async move {
+            seed_row(db, row).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sweep_in_pool_mode_releases_a_stale_binding() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::sweep_in_pool_mode_releases_a_stale_binding(&backend, |row| async move {
+            seed_row(db, row).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sweep_in_pool_mode_drops_bindings_of_unready_jobs() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::sweep_in_pool_mode_drops_bindings_of_unready_jobs(&backend, |row| async move {
+            seed_row(db, row).await;
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -8701,6 +10039,14 @@ mod pg {
             return skip_no_postgres();
         };
         suite::timeout_then_lease_expiry_settles_attempt(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn job_timeout_is_capped_at_the_github_maximum() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::job_timeout_is_capped_at_the_github_maximum(&backend).await;
     }
 
     #[tokio::test]
@@ -9117,6 +10463,14 @@ mod pg {
             db.test_execute(&sql).await.unwrap()
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn chunked_submit_matches_single_chunk_state() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::chunked_submit_matches_single_chunk_state(&backend).await;
     }
 
     #[tokio::test]
@@ -9572,6 +10926,12 @@ mod lite {
         backend.claim_expansion().await.unwrap().unwrap()
     }
 
+    #[tokio::test]
+    async fn sarif_analyses_roundtrip_and_dedupe() {
+        let backend = LiteBackend::in_memory().unwrap();
+        suite::sarif_analyses_roundtrip_and_dedupe(&backend).await;
+    }
+
     /// Cancelling an already-terminal run must not append a second
     /// `run.completed.v1` (pg emits it once, guarded).
     #[tokio::test]
@@ -9973,6 +11333,13 @@ mod lite {
         suite::webhook_replay_is_idempotent(&LiteBackend::in_memory().unwrap()).await;
     }
 
+    /// SQLite is one node: nothing else enqueues, so there is no hint stream.
+    #[test]
+    fn webhook_wakes_are_local_only() {
+        let backend = crate::control::Backend::Sqlite(LiteBackend::in_memory().unwrap());
+        assert!(backend.subscribe_webhook_wakes().is_none());
+    }
+
     #[tokio::test]
     async fn request_lookup_resolves_attempt_correlations() {
         suite::request_lookup_resolves_attempt_correlations(&LiteBackend::in_memory().unwrap())
@@ -10015,6 +11382,11 @@ mod lite {
     async fn cancel_of_terminal_run_preserves_conclusion() {
         suite::cancel_of_terminal_run_preserves_conclusion(&LiteBackend::in_memory().unwrap())
             .await;
+    }
+
+    #[tokio::test]
+    async fn cancel_outcome_tracks_locked_transition() {
+        suite::cancel_outcome_tracks_locked_transition(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
@@ -10218,6 +11590,11 @@ mod lite {
     #[tokio::test]
     async fn purge_requeues_ownerless_claim() {
         suite::purge_requeues_ownerless_claim(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn retry_reprefies_orchestration_id() {
+        suite::retry_reprefies_orchestration_id(&LiteBackend::in_memory().unwrap()).await;
     }
 
     #[tokio::test]
@@ -10446,6 +11823,157 @@ mod lite {
             .await;
     }
 
+    /// [`suite::SeedRow`] → SQLite SQL: the seeded scenarios move their own
+    /// stamps (the store keeps microseconds) and park their own jobs, exactly
+    /// as `swept_binding_is_reported` ages its binding.
+    fn seed_row(backend: &LiteBackend, row: suite::SeedRow) {
+        let at = |age_seconds: u64| {
+            let micros = i64::try_from(age_seconds)
+                .unwrap_or(i64::MAX / 1_000_000)
+                .saturating_mul(1_000_000);
+            crate::store::now_us().saturating_sub(micros)
+        };
+        let now = || crate::store::now_us();
+        let sql = match row {
+            suite::SeedRow::Enqueued {
+                run_id,
+                job_id,
+                age_seconds,
+            } => format!(
+                "UPDATE jobs SET enqueued_at = {} \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}'",
+                age_seconds.map_or_else(|| "NULL".to_owned(), |age| at(age).to_string()),
+            ),
+            suite::SeedRow::Binding {
+                run_id,
+                job_id,
+                runner_id,
+                assigned_age_seconds,
+                first_age_seconds,
+            } => {
+                let assigned = assigned_age_seconds.map_or_else(now, at);
+                let first = first_age_seconds.map_or_else(now, at);
+                format!(
+                    "INSERT INTO job_assignments (run_id, job_id, runner_id, assigned_at, \
+                     first_assigned_at) VALUES ('{run_id}', '{job_id}', {runner_id}, \
+                     {assigned}, {first}) \
+                     ON CONFLICT (run_id, job_id) DO UPDATE SET runner_id = {runner_id}, \
+                     assigned_at = {assigned}, first_assigned_at = {first}"
+                )
+            }
+            suite::SeedRow::Provision {
+                run_id,
+                job_id,
+                age_seconds,
+            } => format!(
+                "INSERT INTO provision_requests (run_id, job_id, namespace_id, pool_key, \
+                 labels, requested_at) \
+                 SELECT j.run_id, j.job_id, j.namespace_id, j.pool_key, j.runs_on, {at} \
+                 FROM jobs j WHERE j.run_id = '{run_id}' AND j.job_id = '{job_id}' \
+                 ON CONFLICT (run_id, job_id) DO UPDATE SET requested_at = excluded.requested_at",
+                at = at(age_seconds),
+            ),
+            suite::SeedRow::Park { run_id, job_id } => format!(
+                "UPDATE jobs SET queue_state = 'claimed' \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}'"
+            ),
+            suite::SeedRow::ClearIntent { run_id, job_id } => format!(
+                "DELETE FROM job_assignments \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}'; \
+                 DELETE FROM provision_requests \
+                 WHERE run_id = '{run_id}' AND job_id = '{job_id}'"
+            ),
+        };
+        backend.exec_for_test(&sql);
+    }
+
+    #[tokio::test]
+    async fn claim_ceiling_opens_only_an_aged_reservation() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::claim_ceiling_opens_only_an_aged_reservation(&backend, |row| async move {
+            seed_row(db, row);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stale_reservation_reopens_a_bound_job() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::stale_reservation_reopens_a_bound_job(&backend, |row| async move {
+            seed_row(db, row);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn purge_rebinds_a_requeued_job_under_strict_assignments() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::purge_rebinds_a_requeued_job_under_strict_assignments(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn strict_without_pool_marks_a_job_for_a_later_runner() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::strict_without_pool_marks_a_job_for_a_later_runner(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_expansion_legs_are_claimable_under_strict() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        suite::deferred_expansion_legs_are_claimable_under_strict(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_repairs_a_missing_intent_row() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, true, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::reconcile_repairs_a_missing_intent_row(&backend, |row| async move {
+            seed_row(db, row);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sweep_without_pool_or_strict_deletes_stale_intent() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(false, false, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::sweep_without_pool_or_strict_deletes_stale_intent(&backend, |row| async move {
+            seed_row(db, row);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sweep_in_pool_mode_releases_a_stale_binding() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::sweep_in_pool_mode_releases_a_stale_binding(&backend, |row| async move {
+            seed_row(db, row);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sweep_in_pool_mode_drops_bindings_of_unready_jobs() {
+        let backend = LiteBackend::in_memory().unwrap();
+        backend.set_config(true, false, std::time::Duration::from_secs(300));
+        let db = &backend;
+        suite::sweep_in_pool_mode_drops_bindings_of_unready_jobs(&backend, |row| async move {
+            seed_row(db, row);
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn claim_takes_the_oldest_job_across_label_sets() {
         suite::claim_takes_the_oldest_job_across_label_sets(&LiteBackend::in_memory().unwrap())
@@ -10570,6 +12098,12 @@ mod lite {
     }
 
     #[tokio::test]
+    async fn chunked_submit_matches_single_chunk_state() {
+        let backend = LiteBackend::in_memory().unwrap();
+        suite::chunked_submit_matches_single_chunk_state(&backend).await;
+    }
+
+    #[tokio::test]
     async fn webhook_runs_bypass_submit_quotas() {
         let backend = LiteBackend::in_memory().unwrap();
         let db = &backend;
@@ -10670,6 +12204,12 @@ mod lite {
     #[tokio::test]
     async fn timeout_then_lease_expiry_settles_attempt() {
         suite::timeout_then_lease_expiry_settles_attempt(&LiteBackend::in_memory().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn job_timeout_is_capped_at_the_github_maximum() {
+        suite::job_timeout_is_capped_at_the_github_maximum(&LiteBackend::in_memory().unwrap())
+            .await;
     }
 
     #[tokio::test]

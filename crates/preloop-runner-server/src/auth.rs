@@ -16,6 +16,23 @@ pub async fn require_protocol_bearer(
         ))
     }
 }
+/// Require the system credential or a Results job runtime token.
+///
+/// This is narrower than [`require_protocol_bearer`]: action-resolution
+/// endpoints must not admit runner-listen, registration, debug-worker, blob,
+/// or other locally signed JWT classes as bearer credentials.
+pub async fn require_results_protocol_bearer(
+    State(shared): State<Arc<SharedState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let bearer = bearer_token(&request)
+        .ok_or_else(|| ApiError::unauthorized("system or job runtime token required"))?;
+    let identity = results_identity(&shared.state, bearer)
+        .map_err(|_| ApiError::unauthorized("system or job runtime token required"))?;
+    request.extensions_mut().insert(identity);
+    Ok(next.run(request).await)
+}
 /// Require that a protocol reporting request is authenticated by the system
 /// credential or by the runtime token minted for the exact job request.
 ///
@@ -71,6 +88,33 @@ pub fn authorize_reporting_request(
     }
 }
 
+/// [`authorize_reporting_request`] plus the liveness rule: the caller must own
+/// the target *and* the attempt must still be live.
+///
+/// A settled attempt's runtime credential is spent — the rule the Results
+/// writes ([`require_live_results_job`]), the cache and artifact writes, and
+/// the live-log ingest all apply — so it must not keep mutating the run's
+/// records (timeline records, logs, console logs) after the attempt has
+/// settled. The credential is handed to workflow code and outlives the
+/// attempt, so without this a finished job could rewrite its own step records
+/// and annotations for the rest of the token's lifetime. Reads stay available,
+/// and the system identity bypasses exactly as it does everywhere else.
+pub async fn authorize_live_reporting_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: Option<&TaskAgentJobRequestRecord>,
+) -> Result<(), ApiError> {
+    authorize_reporting_request(state, headers, request)?;
+    if system_bearer_authorized(state, headers) {
+        return Ok(());
+    }
+    let Some(record) = request else {
+        // Unresolvable targets were refused above for a non-system caller.
+        return Ok(());
+    };
+    require_live_job(state, record.agent_job_id).await
+}
+
 pub async fn require_results_bearer(
     State(shared): State<Arc<SharedState>>,
     mut request: Request,
@@ -119,25 +163,40 @@ pub async fn require_results_bearer(
 
 /// Authorize `/twirp-blob/{kind}/{token}` requests.
 ///
-/// The blob endpoints are bearerless by protocol design — the Azure SDK in
+/// The blob endpoints are bearerless by protocol design: the Azure SDK in
 /// `actions/upload-artifact` / `actions/cache` PUTs to the signed upload URL
-/// without attaching the job bearer — so the gate cannot simply require a
+/// without attaching the job bearer, so the gate cannot simply require a
 /// bearer without breaking wire compatibility with the official toolkit.
-/// Instead it enforces three properties:
+/// Instead it enforces four properties:
 ///   1. the kind is allowlisted and the token is decode-then-validated, so no
 ///      request can address outside `<state_dir>/blobs/{kind}/`;
 ///   2. the token must be a server-signed blob JWT (`sub: preloop-blob`,
-///      `kind` matching the path) — arbitrary tokens address nothing, which
+///      `kind` matching the path) - arbitrary tokens address nothing, which
 ///      kills the unauthenticated PUT-to-anything repro, and minted URLs
 ///      survive engine restarts since validity is the signature, not a
 ///      registration map;
-///   3. writes require the owning job to still be live: the JWT's `job`
+///   3. the token's `op` claim pins the exact operation and `job` names the
+///      minting owner (never empty): a download URL (`read`) rejects PUT
+///      with 403 and an upload URL (`write`) rejects GET with 403 - a
+///      bearerless PUT to a signed download URL can no longer overwrite the
+///      finalized blob (round-3 finding 3);
+///   4. writes require the owning job to still be live: the JWT's `job`
 ///      claim names the owner recorded at mint time, so a completed job's
 ///      upload URL stops working immediately instead of at TTL sweep. A
-///      presented bearer is verified and must match the `job` claim.
+///      presented bearer is verified and must match the `job` claim. The
+///      `system` owner (control-plane-minted URLs) skips the liveness check,
+///      as it did when empty owners meant "system".
+///   5. diag uploads additionally require the token's `jti` to still be
+///      registered in `diag_upload_tokens`: the per-job cap evicts the
+///      oldest token, and eviction must invalidate — a signature alone
+///      cannot see eviction, so without this a live job could re-mint
+///      forever and accumulate unbounded staging directories. (Consequence:
+///      diag URLs no longer survive an engine restart; the map is
+///      in-memory only. Diag uploads happen immediately after minting, so a
+///      restart in between was already a lost upload.)
 ///
-/// Reads stay bearer-optional — the unguessable, server-minted URL is the
-/// credential, the same SAS-style model as `/replay/results/*` — because the
+/// Reads stay bearer-optional - the unguessable, server-minted URL is the
+/// credential, the same SAS-style model as `/replay/results/*` - because the
 /// download clients are equally bearerless.
 async fn authorize_blob_request(
     state: &AppState,
@@ -150,12 +209,50 @@ async fn authorize_blob_request(
     };
     let is_write = request.method() == axum::http::Method::PUT;
 
-    // The signed token is the credential: `job` is the owner recorded at
-    // mint time ("" = minted via the system credential).
+    // The signed token is the credential: `op` pins the exact operation and
+    // `job` names the minting owner (never empty).
     let Some(claims) = crate::blob_store::verify_blob_token(state, &kind, &token) else {
         return Err(ApiError::not_found("blob not found"));
     };
+    let op = crate::blob_store::blob_token_op(&claims);
     let owner = crate::blob_store::blob_token_job(&claims).unwrap_or_default();
+
+    // Operation binding (round-3 finding 3): a download URL must never
+    // accept a PUT, an upload URL must never serve a GET. Tokens minted
+    // before op binding (no `op` claim) or with an empty owner are rejected
+    // the same way.
+    let op_ok = if is_write {
+        op == Some(crate::blob_store::BLOB_OP_WRITE)
+    } else {
+        op == Some(crate::blob_store::BLOB_OP_READ)
+    };
+    if !op_ok || owner.is_empty() {
+        return Err(ApiError::forbidden(
+            "blob token is not valid for this operation",
+        ));
+    }
+
+    // Diag upload tokens are bearerless single-job reservations: the mint
+    // handler records the token's `jti` in `diag_upload_tokens` and evicts
+    // the oldest per job at the cap. A signature alone cannot see eviction,
+    // so an evicted (or never-registered) diag token's PUT must not upload —
+    // otherwise a live job could re-mint forever and accumulate unbounded
+    // staging directories. Membership in the live map is the credential for
+    // diag PUTs, on top of the signature and owner-job liveness checks.
+    if is_write && kind == "diag" {
+        let jti = crate::blob_store::blob_token_jti(&claims)
+            .ok_or_else(|| ApiError::bad_request("malformed blob token"))?;
+        let registered = state
+            .inner
+            .lock()
+            .await
+            .diag_upload_tokens
+            .contains_key(&jti);
+        if !registered {
+            warn!(jti, "rejected diag PUT for evicted or unknown upload token");
+            return Err(ApiError::not_found("blob not found"));
+        }
+    }
 
     match bearer_from_headers(request.headers()) {
         Some(bearer) if bearer == state.system_token => Ok(next.run(request).await),
@@ -165,7 +262,7 @@ async fn authorize_blob_request(
                 _ => return Err(ApiError::unauthorized("results-service job token required")),
             };
             if is_write {
-                if !owner.is_empty() && owner == job_id {
+                if owner == job_id {
                     Ok(next.run(request).await)
                 } else {
                     Err(ApiError::forbidden("blob token is not owned by this job"))
@@ -176,9 +273,11 @@ async fn authorize_blob_request(
         }
         // Bearerless Azure-SDK-style flow: the unguessable, server-minted URL
         // is the credential. Writes additionally require the owning job to be
-        // live — a completed job's minted URL must not keep accepting data.
+        // live - a completed job's minted URL must not keep accepting data.
+        // The `system` owner (control-plane-minted URLs) is not a job and
+        // skips this check.
         None => {
-            if is_write && !owner.is_empty() {
+            if is_write && owner != crate::blob_store::BLOB_SYSTEM_OWNER {
                 let job_uuid = owner
                     .parse::<uuid::Uuid>()
                     .map_err(|_| ApiError::forbidden("blob token owner is not a job"))?;
@@ -735,11 +834,26 @@ pub fn results_identity(
     Ok(ResultsIdentity::Job(ResultsJobIdentity { plan_id, job_id }))
 }
 
+/// Whether a Results path's plan segment names the token's plan. The bare plan
+/// id does, and so does the runner's `system.orchestrationId`
+/// (`{planId}.{jobId}.{suffix}`): the runner sends that value as the plan
+/// segment when it addresses its own job, with the plan id as its prefix.
+fn path_names_token_plan(path_plan: &str, token_plan: &str) -> bool {
+    !token_plan.is_empty()
+        && (path_plan == token_plan
+            || path_plan
+                .strip_prefix(token_plan)
+                .is_some_and(|rest| rest.starts_with('.')))
+}
+
+/// Whether a job token addresses the Results target `plan_id` / `job_id`. The
+/// job UUID must match exactly, so a token never reaches another job, and the
+/// plan segment must name the token's own plan (see [`path_names_token_plan`]).
 pub fn results_identity_binds_job(identity: &ResultsIdentity, plan_id: &str, job_id: &str) -> bool {
     match identity {
         ResultsIdentity::System => true,
         ResultsIdentity::Job(identity) => {
-            identity.plan_id == plan_id
+            path_names_token_plan(plan_id, &identity.plan_id)
                 && job_id
                     .parse::<uuid::Uuid>()
                     .is_ok_and(|job| job == identity.job_id)
@@ -778,6 +892,22 @@ pub fn require_canonical_results_job_id(
         .parse::<uuid::Uuid>()
         .map(|job| job.to_string())
         .unwrap_or_else(|_| job_id.to_owned()))
+}
+
+/// The plan a Results handler must key storage by: a job token's own plan.
+///
+/// A runner may address its own job with the plan segment spelled as its
+/// `system.orchestrationId` (`{planId}.{jobId}.__default`), which
+/// `path_names_token_plan` accepts for authorization. A replay path or
+/// metadata key built from that spelling names a namespace no reader resolves
+/// (logs are read back under the plan id, `runs.rs`), so handlers that write
+/// storage use the token's own plan instead. The system identity keeps the
+/// requested segment: engine callers address opaque backend ids.
+pub fn results_storage_plan_id(identity: &ResultsIdentity, requested_plan_id: &str) -> String {
+    match identity {
+        ResultsIdentity::System => requested_plan_id.to_owned(),
+        ResultsIdentity::Job(job) => job.plan_id.clone(),
+    }
 }
 
 /// Runner identity proven by a listen token on this request.
@@ -847,6 +977,34 @@ fn is_worker_debug_route(method: &axum::http::Method, path: &str) -> bool {
     method == Method::GET && debug_session_member(path, crate::routes::DEBUG_SESSION_VERDICT_SUFFIX)
 }
 
+/// The two read-only repository shapes a job's checkout issues against
+/// `/api/v3` when it cannot run Git: the default-branch lookup
+/// (`/repos/{o}/{r}`) and the archive download (`/repos/{o}/{r}/tarball/{ref}`,
+/// ref may contain `/`). Both handlers pin the caller to a job runtime token
+/// (`authorize_forge_relay` / snapshot token), so the socket surface can carry
+/// them without exposing the runner-management API — every other `/api/v3/*`
+/// shape stays refused.
+fn job_scoped_repo_read(method: &axum::http::Method, path: &str) -> bool {
+    if *method != axum::http::Method::GET {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix("/api/v3/repos/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    let (Some(owner), Some(repo)) = (segments.next(), segments.next()) else {
+        return false;
+    };
+    if owner.is_empty() || repo.is_empty() {
+        return false;
+    }
+    match segments.next() {
+        None => true,
+        Some("tarball") => segments.next().is_some(),
+        Some(_) => false,
+    }
+}
+
 fn debug_session_member(path: &str, suffix: &str) -> bool {
     path.strip_prefix(crate::routes::DEBUG_SESSIONS_PATH)
         .and_then(|rest| rest.strip_prefix('/'))
@@ -859,7 +1017,9 @@ fn debug_session_member(path: &str, suffix: &str) -> bool {
 /// refused there. Native management and GUI API prefixes have no legitimate
 /// use from a guest.
 pub async fn runner_surface_only(mut request: Request, next: Next) -> Result<Response, ApiError> {
-    const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/", "/repos/"];
+    // `/setup/*` is the operator's browser-facing App setup. A job VM that
+    // reached it could only ever see 404s, but the socket stays fail-closed.
+    const DENIED_PREFIXES: &[&str] = &["/internal/", "/runs/", "/repos/", "/setup/"];
     let path = request.uri().path();
     let worker_debug_route = is_worker_debug_route(request.method(), path);
     let denied = DENIED_PREFIXES
@@ -881,7 +1041,8 @@ pub async fn runner_surface_only(mut request: Request, next: Next) -> Result<Res
         // the runner's own registration: its handler requires the system
         // credential on this surface even when TCP registration is explicitly
         // permissive, so workflow code cannot use the carve-out to mint anything.
-        || (path.starts_with("/api/v3/") && path != "/api/v3/actions/runner-registration")
+        || (path.starts_with("/api/v3/") && path != "/api/v3/actions/runner-registration"
+            && !job_scoped_repo_read(request.method(), path))
         || (path.starts_with("/api/v1/")
             && !path.starts_with("/api/v1/actions/")
             && !worker_debug_route);
@@ -1107,4 +1268,108 @@ pub fn job_runtime_claims_from_headers(
 pub struct JobRuntimeClaims {
     pub plan_id: String,
     pub job_id: uuid::Uuid,
+}
+
+#[cfg(test)]
+mod job_scoped_repo_read_tests {
+    use super::*;
+
+    #[test]
+    fn job_scoped_repo_read_allows_only_the_checkout_shapes() {
+        // The two shapes a redirected checkout issues.
+        assert!(job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/valkey-io/valkey"
+        ));
+        assert!(job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/snapshots/7b116f3a-6973-4e4e-bcd1-213de9518ad1/tarball/de2d615e"
+        ));
+        assert!(job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/o/r/tarball/refs/heads/main"
+        ));
+        // Anything else under /api/v3 stays off the socket surface: the
+        // runner-management endpoints mint credentials.
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/actions/runners/registration-token"
+        ));
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/o"
+        ));
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos//r"
+        ));
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/o/r/tarball"
+        ));
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::GET,
+            "/api/v3/repos/o/r/actions/runners/registration-token"
+        ));
+        // Reads only: nothing may be created or mutated through the socket.
+        assert!(!job_scoped_repo_read(
+            &axum::http::Method::POST,
+            "/api/v3/repos/o/r/tarball/main"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod runner_surface_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn the_guest_socket_refuses_the_browser_setup_pages() {
+        let app = axum::Router::new()
+            .route("/setup/github", axum::routing::get(|| async { "form" }))
+            .route(
+                "/setup/github/callback",
+                axum::routing::get(|| async { "callback" }),
+            )
+            .route(
+                "/runner/message",
+                axum::routing::get(|| async { "message" }),
+            )
+            .layer(axum::middleware::from_fn(runner_surface_only));
+        for path in ["/setup/github", "/setup/github/callback"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be reachable from a job VM"
+            );
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/runner/message")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the runner protocol still passes"
+        );
+    }
 }

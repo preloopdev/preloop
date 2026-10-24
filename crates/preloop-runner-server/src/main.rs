@@ -80,7 +80,11 @@ async fn main() -> anyhow::Result<()> {
     // controls pretty/json/auto. The `Observability` handle will be cloned
     // into `AppState`; for now it is held for the life of `main`.
     let obs_config = preloop_observability::ObservabilityConfig::from_env()
-        .with_service_version(env!("CARGO_PKG_VERSION"));
+        .with_service_version(env!("CARGO_PKG_VERSION"))
+        // Pin OTLP export TLS to the same in-process roots every other client
+        // uses: the platform verifier can block on a hung macOS trust daemon
+        // with no deadline of its own.
+        .with_otel_client_builder(preloop_runner_server::shared_http::with_tls_roots_blocking);
     let (observability, observability_runtime) =
         preloop_observability::Observability::from_config(obs_config);
     observability_runtime.install_fmt_subscriber();
@@ -136,6 +140,9 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 pool_status: None,
                 observability: Some(observability.clone()),
+                // The standalone server has no runner pool to share with, so
+                // it keeps AppState's private funnel.
+                github: None,
                 systemd_socket_activation: false,
                 unix_socket,
                 state_dir,

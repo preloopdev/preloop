@@ -1,0 +1,55 @@
+digraph control_plane {
+  graph [rankdir=TB, bgcolor="white", splines=spline, nodesep=0.28, ranksep=0.55, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.12,0.07"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  subgraph cluster_clients {
+    label="Clients and triggers"; fontsize=13; fontcolor="#7c3aed"; style="rounded,dashed"; color="#7c3aed"; margin=12;
+    runner [label="Actions runner\n/_apis protocol or /broker\nregister, poll, report", fillcolor="#ede9fe"];
+    github [label="GitHub / GHES\nwebhook delivery and REST\ndispatch, checks", fillcolor="#ede9fe"];
+    cli [label="CLI and agents\nPOST /api/v1/runs\nstatus, logs, debug", fillcolor="#ede9fe"];
+    { rank=same; runner; github; cli; }
+  }
+
+  subgraph cluster_routes {
+    label="HTTP protocol surfaces (axum)"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    azdo [label="/_apis/...\nconnectionData, AgentPools\nsessions, messages, Timeline", fillcolor="#bae6fd"];
+    broker [label="/broker/{runner_id}/...\nacquirejob, renewjob, completejob", fillcolor="#bae6fd"];
+    native [label="/api/v1/...\nruns, logs, events, debug\nwebhooks and status", fillcolor="#bae6fd"];
+    results [label="/twirp/... + /_apis/artifactcache\nresults metadata, cache, artifacts\nsigned blob URLs", fillcolor="#bae6fd"];
+    { rank=same; azdo; broker; native; results; }
+  }
+
+  subgraph cluster_core {
+    label="Control-plane core"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    auth [label="Auth and identity\nBearer/runtime JWTs, runner tokens\nOIDC discovery + JWKS", fillcolor="#e0f2fe"];
+    backend [label="ControlBackend\nsubmit, poll, acquire, complete_job\nSQLite default / Postgres shared", fillcolor="#bae6fd"];
+    schedule [label="Scheduler and concurrency\ncron/workflow_dispatch\nconcurrency groups, max-parallel", fillcolor="#e0f2fe"];
+    outbox [label="Transactional outbox\noutbox_events → check_run_updates\nleased GitHub Checks sender", fillcolor="#e0f2fe"];
+    { rank=same; auth; backend; schedule; outbox; }
+  }
+
+  subgraph cluster_outputs {
+    label="Storage and outputs"; fontsize=13; fontcolor="#15803d"; style="rounded,dashed"; color="#22c55e"; margin=12;
+    db [label="Control database\nruns, jobs, sessions, queue\nembedded refinery migrations", fillcolor="#dcfce7"];
+    files [label="BlobStore\npreloop-cache + preloop-artifacts\nlogs, cache entries, artifacts", fillcolor="#dcfce7"];
+    checks [label="GitHub Checks API\ncoalesced check-run updates\nretry and backoff", fillcolor="#bbf7d0"];
+    { rank=same; db; files; checks; }
+  }
+
+  runner -> azdo [label="runner protocol"];
+  runner -> broker [label="modern broker"];
+  github -> native [label="webhook / REST"];
+  cli -> native [label="native bearer"];
+  runner -> results [label="results protocol"];
+  azdo -> auth;
+  broker -> auth;
+  native -> auth;
+  auth -> backend [label="authorized command"];
+  results -> files [label="blob data"];
+  backend -> schedule [label="queue decisions"];
+  backend -> outbox [label="state events"];
+  backend -> db [label="one short transaction"];
+  schedule -> db [label="gates and holds"];
+  outbox -> checks [label="leased sender"];
+}

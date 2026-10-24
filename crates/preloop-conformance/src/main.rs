@@ -452,7 +452,10 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<
     Ok(())
 }
 
-fn modify_workflow_for_local_run(workflow_path: &std::path::Path) -> anyhow::Result<String> {
+fn modify_workflow_for_local_run(
+    workflow_path: &std::path::Path,
+    source: &std::path::Path,
+) -> anyhow::Result<String> {
     let file = std::fs::File::open(workflow_path)?;
     let mut doc: serde_yaml::Value = serde_yaml::from_reader(file)?;
     if let Some(jobs) = doc.get_mut("jobs").and_then(|j| j.as_mapping_mut()) {
@@ -466,6 +469,14 @@ fn modify_workflow_for_local_run(workflow_path: &std::path::Path) -> anyhow::Res
                         true
                     }
                 });
+                let source = source.join(".").to_string_lossy().replace('\'', "'\"'\"'");
+                steps.insert(
+                    0,
+                    serde_yaml::to_value(serde_json::json!({
+                        "name": "Seed local conformance checkout",
+                        "run": format!("cp -R '{source}' ."),
+                    }))?,
+                );
             }
         }
     }
@@ -545,7 +556,7 @@ fn select_built_binary(name: &str) -> anyhow::Result<String> {
         (Some(_), None) => release,
         (None, Some(_)) => debug,
         (None, None) => anyhow::bail!(
-            "{name} not built: run `cargo build -p preloop-runner-server -p preloop-runner-client` \
+            "{name} not built: run `cargo build -p preloop-cli -p preloop-runner-server -p preloop-runner-client` \
              (looked in target/release and target/debug)"
         ),
     };
@@ -585,6 +596,7 @@ async fn run_runner_e2e(
 
     let server_bin = select_built_binary("preloop-server")?;
     let client_bin = select_built_binary("preloop-runner-client")?;
+    let engine_cli = select_built_binary("preloop")?;
 
     // Temporary directories
     let temp_dir = tempfile::TempDir::new()?;
@@ -592,6 +604,17 @@ async fn run_runner_e2e(
     let runner_root = temp_dir.path().join("runner-root");
     std::fs::create_dir_all(&state_dir)?;
     std::fs::create_dir_all(&runner_root)?;
+    let store = state_dir.join("preloop.db");
+    let migration = Command::new(engine_cli)
+        .env("PRELOOP_HOME", temp_dir.path())
+        .args(["store", "migrate", "--store"])
+        .arg(&store)
+        .status()
+        .await
+        .context("migrate the conformance control database")?;
+    if !migration.success() {
+        anyhow::bail!("conformance control database migration failed ({migration})");
+    }
 
     let system_token = format!("preloop-conformance-{}", uuid::Uuid::new_v4());
     // Pre-seed any private action references locally before starting the server
@@ -600,6 +623,8 @@ async fn run_runner_e2e(
     // Start server in background on the requested port
     let mut server_cmd = Command::new(server_bin);
     server_cmd
+        .env("PRELOOP_HOME", temp_dir.path())
+        .env("PRELOOP_STORE_URL", &store)
         .env("PRELOOP_PUBLIC_URL", &server_url)
         .env("PRELOOP_SYSTEM_TOKEN", &system_token)
         // The goldens carry real GitHub-issued registration tokens this
@@ -669,7 +694,7 @@ async fn run_runner_e2e(
             "--name",
             "e2e-runner",
             "--work",
-            "_work",
+            "work",
             "--no-externals",
             "--unattended",
             "--replace",
@@ -694,8 +719,9 @@ async fn run_runner_e2e(
         .map(|s| s.contains("live") || s.contains("ci") || s.contains("dogfood"))
         .unwrap_or(false);
     let submit_workflow_path = if is_live_workflow {
-        copy_workspace_code(&runner_root.join("_work/default/default"))?;
-        let modified = modify_workflow_for_local_run(&workflow)?;
+        let source = temp_dir.path().join("source");
+        copy_workspace_code(&source)?;
+        let modified = modify_workflow_for_local_run(&workflow, &source)?;
         let temp_wf = temp_dir.path().join("local-wf.yml");
         std::fs::write(&temp_wf, modified)?;
         temp_wf
@@ -706,7 +732,14 @@ async fn run_runner_e2e(
     // Submit workflow
     let submit_output = Command::new(client_bin)
         .env("PRELOOP_SYSTEM_TOKEN", &system_token)
-        .args(["--server", &server_url, "submit", "-W"])
+        .args([
+            "--server",
+            &server_url,
+            "submit",
+            "--repository",
+            "local/preloop",
+            "-W",
+        ])
         .arg(&submit_workflow_path)
         .output()
         .await?;
@@ -724,7 +757,7 @@ async fn run_runner_e2e(
         .to_string();
 
     // Loop runner until the run reaches a terminal status (handles multi-job workflows).
-    let terminal = ["completed", "success", "failed", "cancelled"];
+    let terminal = ["completed", "success", "failure", "failed", "cancelled"];
     let run_status_url = format!("{server_url}/api/v1/runs/{run_id}");
     let native_api_token = &system_token;
     let mut run_status = "unknown".to_string();

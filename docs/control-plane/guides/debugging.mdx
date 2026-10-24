@@ -1,0 +1,160 @@
+---
+title: Debugging failed jobs
+description: Pause a failed job, inspect its live VM, repair the workspace, and retry without starting over.
+---
+
+A debug run keeps the failed job and its microVM available for inspection. Attach with `preloop debug`, run shell commands in the guest, synchronize a fix, and retry the failed step or an earlier step. Use `--preserve-on-failure` instead when you need a post-mortem shell without pausing the worker for a verdict.
+
+![Debug session lifecycle: pause on failure, attach, then retry, continue, or abort](/diagrams/debug-session.svg)
+
+## Choose how a failure is held
+
+| Invocation | On failure |
+|---|---|
+| `preloop run --debug -f <workflow>` | Pauses at the failed step and offers an inline debugger prompt. |
+| `preloop run --debug --detach -f <workflow>` | Submits and returns; the failed job remains paused for `preloop debug` in another terminal. |
+| `preloop run --preserve-on-failure -f <workflow>` | Lets the job finish as failed and keeps the VM for `preloop shell`; it does not wait for a verdict. |
+| `preloop run -f <workflow>` in an interactive default-backend terminal | Retains the historical terminal-attached pause behavior. |
+| `preloop run -f <workflow>` from a pipe, CI, or detached invocation | Does not wait for an interactive debug prompt. Use `--debug` or `--preserve-on-failure` explicitly. |
+
+`--debug` and `--preserve-on-failure` are alternative failure modes. A plain run on the default backend keeps its terminal behavior for compatibility; explicit flags make scripts and agents unambiguous.
+
+## Attach to a paused job
+
+Run `preloop debug` without a reference when exactly one session is paused:
+
+```sh
+preloop debug
+```
+
+With multiple sessions, the command lists each session and prints an attach command. A session ID, run ID, or job name can select one directly:
+
+```sh
+preloop debug SESSION_ID
+preloop debug RUN_ID --json
+```
+
+`--json` prints the paused session projection for scripts. The failure banner includes the step command, exit code, workflow position, working directory, structured diagnostics, and a short log excerpt. The job and microVM remain paused while you inspect them.
+
+Anything entered without a leading colon runs as a non-login `sh -c` command in the failed job's workspace:
+
+```text
+$ git status --short
+$ env | sort
+$ ./scripts/reproduce-failure.sh
+```
+
+Keep credentials out of commands and output. DAP variables and debug logs use the same masking rules as normal job output.
+
+## Control the session
+
+At the `preloop debug` prompt, colon-prefixed commands control the session. Other input goes to the guest shell.
+
+| Command | Use |
+|---|---|
+| `:changes` | Show tracked and untracked changes made by the failed attempt. Ignored build caches are shown as preserved. |
+| `:steps` | Show the attempt journal and each retry's step state. |
+| `:retry` | Retry the failed step in the same VM. If the attempt changed files, choose whether to leave them, remove untracked files, or restore tracked files. |
+| `:retry --dirty` | Retry without reverting the failed attempt's workspace changes. |
+| `:retry --clean` | Remove untracked changes and restore tracked changes before retrying. Build caches remain. |
+| `:retry --sync` | Synchronize host changes into the VM, then retry. Add `--force` to overwrite conflicting VM-side source edits. |
+| `:retry --from STEP` | Synchronize only when requested, then retry from a 1-based step number or display name at or before the failed step. |
+| `:retry --from-start` | Retry from the first user step in the job. |
+| `:continue` | Accept the failure and run the remaining steps. The run remains a failure; it is not converted to a pass. |
+| `:abort` | Keep the failure and run normal cleanup steps. |
+| `:sync [--force]` | Copy host source changes into the VM as whole files while preserving guest build output. |
+| `:export [--patch-only]` | Write guest source edits to a patch in the current directory and apply it, or only write it with `--patch-only`. |
+| `:status`, `:log` | Refresh the session or show the recent guest runner log. |
+| `:detach` or `Ctrl-D` | Leave the job paused so another controller can attach. |
+
+The CLI exposes the same non-interactive decisions:
+
+```sh
+preloop debug SESSION_ID --verdict retry --revert untracked --from-start
+preloop debug SESSION_ID --verdict retry --from 2 --revert none
+preloop debug SESSION_ID --verdict retry --sync --revert none
+preloop debug SESSION_ID --verdict continue
+preloop debug SESSION_ID --verdict abort
+preloop debug SESSION_ID --export --patch-only
+```
+
+`--revert` accepts `none`, `untracked`, or `all`. A retry restores runner-managed state such as step outcomes and file-command contexts. It does not undo external API calls, processes outside the workspace, or other external side effects. A step accepts at most 25 attempts.
+
+## Preserve a VM for a shell
+
+Use this path when a completed failure is easier to diagnose from a normal shell than from a paused step:
+
+```sh
+preloop run --preserve-on-failure -f .github/workflows/ci.yml
+preloop shell
+```
+
+With exactly one preserved VM, `preloop shell` finds it automatically. If several VMs are held, use the name printed by the error:
+
+```sh
+preloop shell <preserved-vm-name>
+```
+
+The shell command reads the local preserved-VM records, so run it on the host that owns the VM. Exiting the shell releases the active attachment but keeps the VM discoverable for reattach; the hold is cleaned up after 10 minutes of idleness. A shell session is post-mortem access, not a live step verdict.
+
+## DAP debugging
+
+The DAP flow is useful when an agent or editor needs structured scopes and stack frames. Enable it on the run submission with the native API:
+
+```sh
+export PRELOOP_URL=http://127.0.0.1:9090
+export PRELOOP_TOKEN=...
+
+cat >/tmp/debug-run.json <<'JSON'
+{
+  "workflow_yaml": "name: debug\non: workflow_dispatch\njobs:\n  check:\n    runs-on: self-hosted\n    steps:\n      - run: ./scripts/check.sh",
+  "event": "workflow_dispatch",
+  "repository": "owner/repository",
+  "git_ref": "refs/heads/feature/debug",
+  "sha": "0123456789012345678901234567890123456789",
+  "enable_debugger": true,
+  "debugger_welcome_message": "Attach to inspect this run"
+}
+JSON
+
+RUN_ID=$(curl -fsS -X POST "$PRELOOP_URL/api/v1/runs" \
+  -H "Authorization: Bearer $PRELOOP_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data @/tmp/debug-run.json | jq -r .run_id)
+preloop dap "$RUN_ID"
+```
+
+The runner waits for a DAP client to connect and send `configurationDone`. The default connection window is 15 minutes; `ACTIONS_RUNNER_DAP_CONNECTION_TIMEOUT` changes that value in minutes. The built-in client supports:
+
+```text
+init   ready   wait   threads   source   scopes
+vars REF   eval EXPR   continue   quit
+```
+
+The adapter exposes `github`, `env`, `runner`, `job`, `steps`, and `secrets` scopes. Secret values are masked. `next`, `stepIn`, and `stepOut` resume like `continue`; execution stops at job step boundaries rather than inside a shell command. The client can inspect the final state after job completion before the DAP transport closes.
+
+`preloop dap RUN_ID` accepts `--url URL` and `--token TOKEN`. The endpoint is standard DAP over a WebSocket route, so a DAP-capable editor such as VS Code can use the same run endpoint with a WebSocket-capable adapter. The recorded omp workflow uses the small `dapctl` reference client; the same sequence is shown below.
+
+![An agent attaches to a failing run, inspects DAP context, and reruns it](/demo/dap/demo-highlight.gif)
+
+<video controls src="/demo/dap/demo-highlight.mp4" alt="Screen recording of an agent attaching to a failing run, inspecting DAP context, and rerunning it" aria-label="Screen recording of an agent attaching to a failing run, inspecting DAP context, and rerunning it" />
+
+The recording finds `github.event.inputs.target` in the `github` scope, identifies the wrong deployment input, and submits the corrected payload. It is a demonstration of the DAP inspection loop; use your own workflow and credentials for a real run.
+
+<Accordion title="Full DAP session recording">
+
+The complete recording shows the agent's whole session, from attaching to the paused run through the corrected rerun.
+
+<video controls src="/demo/dap/demo.mp4" alt="Full screen recording of an agent debugging a run over DAP from attach to corrected rerun" aria-label="Full screen recording of an agent debugging a run over DAP from attach to corrected rerun" />
+
+The same recording is available as an [animated GIF](https://github.com/preloopdev/preloop/blob/main/docs/demo/dap/demo.gif) and as asciinema casts (`docs/demo/dap/demo.cast`, `docs/demo/dap/demo-highlight.cast`) in the repository.
+
+</Accordion>
+
+## Session limits and clean verification
+
+A paused session has one controller at a time. The server records operations with an idempotency key and a session version, so a reconnecting controller does not execute a retry twice. A worker that stops polling for 90 seconds is no longer live, and a session with more than four hours of accumulated pause credit returns to ordinary timeout handling. These limits protect the job's normal timeout and the runner pool.
+
+A retry is evidence from the warm, already-mutated VM. It does not prove that a fresh VM can reproduce the result. After fixing the checkout, submit a new run for clean verification. A paused job also continues to use the workflow graph compiled for that run; edit workflow structure in the checkout and submit a new run rather than expecting the paused job to adopt it.
+
+For command details, see the [CLI reference](/control-plane/reference/cli) and [job lifecycle](/control-plane/architecture/job-lifecycle).

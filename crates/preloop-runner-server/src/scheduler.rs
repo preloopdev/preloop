@@ -400,30 +400,28 @@ impl Scheduler {
             );
             return;
         };
-        let client = crate::shared_http::CLIENT.clone();
         let api_base = shared.state.github_urls.api_url.trim_end_matches('/');
-        let metadata = match client
-            .get(format!("{api_base}/repos/{repository}"))
-            .header("User-Agent", "preloop")
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
+        // The startup scan is a workflow surface (it installs the repository's
+        // remote schedules) on the operator's static PAT (or an App token when
+        // one is configured), so it is observed under that credential's
+        // budget.
+        let credential = crate::github_breaker::GithubCredential::bearer(
+            token.as_str(),
+            crate::github_breaker::GithubCredentialBucket::Pat,
+        );
+        let metadata = match crate::github_breaker::send_github_json(
+            &shared.state,
+            &credential,
+            crate::github_breaker::GithubSubsystem::Workflows,
+            reqwest::Method::GET,
+            &format!("{api_base}/repos/{repository}"),
+            None,
+        )
+        .await
         {
-            Ok(response) if response.status().is_success() => response,
-            Ok(response) => {
-                warn!(status = %response.status(), "scheduler: remote repository metadata fetch failed");
-                return;
-            }
-            Err(error) => {
-                warn!(?error, "scheduler: remote repository metadata fetch failed");
-                return;
-            }
-        };
-        let metadata: serde_json::Value = match metadata.json().await {
             Ok(value) => value,
             Err(error) => {
-                warn!(?error, "scheduler: remote repository metadata parse failed");
+                warn!(?error, "scheduler: remote repository metadata fetch failed");
                 return;
             }
         };
@@ -435,28 +433,22 @@ impl Scheduler {
             .and_then(|value| value.as_str())
             .unwrap_or("main")
             .to_owned();
-        let sha = match client
-            .get(format!(
-                "{api_base}/repos/{repository}/commits/{default_branch}"
-            ))
-            .header("User-Agent", "preloop")
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => response
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|commit| {
-                    commit
-                        .get("sha")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_owned)
-                }),
-            _ => None,
-        };
+        let sha = crate::github_breaker::send_github_json(
+            &shared.state,
+            &credential,
+            crate::github_breaker::GithubSubsystem::Workflows,
+            reqwest::Method::GET,
+            &format!("{api_base}/repos/{repository}/commits/{default_branch}"),
+            None,
+        )
+        .await
+        .ok()
+        .and_then(|commit| {
+            commit
+                .get("sha")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        });
         if let Some(hb) = &heartbeat {
             hb.beat();
         }
@@ -752,6 +744,12 @@ async fn cron_loop(
             .get("after")
             .and_then(|value| value.as_str())
             .map(str::to_owned);
+        let ref_protected = crate::github::resolve_ref_protected(
+            &shared,
+            &repository,
+            &format!("refs/heads/{default_branch}"),
+        )
+        .await;
         let submission = WorkflowSubmission {
             workflow_yaml: workflow_yaml.clone(),
             event: "schedule".to_owned(),
@@ -766,6 +764,7 @@ async fn cron_loop(
             reusable_workflows: Default::default(),
             reusable_workflow_shas: Default::default(),
             enable_debugger: false,
+            triggering_actor: None,
             debugger_welcome_message: None,
             sha: resolved_sha.clone().unwrap_or_else(|| "0".repeat(40)),
             actor: "preloop-scheduler".to_owned(),
@@ -780,6 +779,7 @@ async fn cron_loop(
             changed_paths: vec![],
             changed_paths_known: true,
             filter_branch: None,
+            ref_protected,
             dispatch_inputs: Default::default(),
             dispatch_inputs_stringified: Default::default(),
             selected_jobs: vec![],
@@ -788,6 +788,9 @@ async fn cron_loop(
             debug_on_failure: false,
             push: None,
             push_tree: None,
+            no_merge: false,
+            prebuilt_merge: None,
+            git_bundle_id: None,
         };
         let (run_id, error) = match submit_run_inner(&shared, submission).await {
             Ok(accepted) => {

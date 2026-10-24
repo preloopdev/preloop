@@ -1,0 +1,32 @@
+digraph debug_session {
+  graph [rankdir=TB, bgcolor="white", splines=spline, nodesep=0.4, ranksep=0.55, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.14,0.08"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  /* ===== worker ===== */
+  subgraph cluster_wrk {
+    label="Runner worker"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    w_open [label="Step fails under debugging\nworker opens the session and\nlong-polls for a verdict", fillcolor="#fef3c7"];
+  }
+
+  /* ===== control plane session ===== */
+  subgraph cluster_state {
+    label="Debug session (control plane)"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    paused   [label="paused\nworker blocked; job timeout suspended", fillcolor="#bae6fd"];
+    retrying [label="retrying\nverdict issued, worker not yet\nresumed", fillcolor="#e0f2fe"];
+    resumed  [label="resumed\njob runs again", fillcolor="#e0f2fe"];
+    aborted  [label="aborted\njob fails, cleanup runs", fillcolor="#e0f2fe"];
+    dropped  [label="dropped by sweep\nworker silent for 90 s, or job ended\nno terminal state is written", fillcolor="#f8fafc", style="rounded,filled,dashed"];
+    { rank=same; retrying; aborted; dropped; }
+  }
+
+
+  w_open  -> paused   [label="worker opens session"];
+  paused  -> paused   [label="controller attaches\n(lease only)"];
+  paused  -> retrying [label="controller: retry\nor retry_from"];
+  paused  -> resumed  [label="controller: continue"];
+  paused  -> aborted  [label="controller: abort"];
+  paused  -> dropped  [label="sweep", style=dashed];
+  retrying -> resumed [label="worker takes verdict,\ncloses as resumed"];
+  resumed -> paused   [label="retried step fails again:\nworker reopens", constraint=false];
+}
