@@ -1429,8 +1429,22 @@ jobs:
         pack.starts_with(b"PACK"),
         "upload-pack response should contain a pack"
     );
+    // Git 2.53 no longer accepts `index-pack --stdin` outside an object
+    // database. Keep the pack validation identical while providing the
+    // disposable repository that newer Git requires.
+    let index_repo = temp.path().join("index-pack.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&index_repo)
+            .status()
+            .unwrap()
+            .success(),
+        "failed to initialize the disposable pack-validation repository"
+    );
     let mut index_pack = Command::new("git")
         .args(["index-pack", "--stdin"])
+        .current_dir(&index_repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

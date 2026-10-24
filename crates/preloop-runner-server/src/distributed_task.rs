@@ -170,6 +170,7 @@ async fn render_session_message(
         // a real GitHub credential. Without one the job's token surface stays
         // empty — never the job-scoped runtime token, which is an engine
         // credential (`broker_acquire_job` documents the full reasoning).
+        let mut credential_applied = false;
         if !fork_restricted && let Some(pat) = shared.state.static_github_pat() {
             // The PAT is embedded only when its OAuth scopes are verified
             // (fresh cache, or re-introspected here: the job may have queued
@@ -191,6 +192,7 @@ async fn render_session_message(
                         },
                         false,
                     );
+                    credential_applied = true;
                 }
                 None => {
                     msg.variables.insert(
@@ -201,6 +203,20 @@ async fn render_session_message(
                     );
                 }
             }
+        }
+        if !credential_applied {
+            // Match broker acquisition: direct AzDO delivery also needs to
+            // route eligible public checkouts through the anonymous forge
+            // relay when no App/PAT credential reaches the job.
+            let runtime_token = shared
+                .state
+                .mint_runtime_token(&msg.plan.plan_id, &msg.job_id);
+            crate::snapshots::reroute_forge_checkouts(
+                &mut msg,
+                &crate::broker::runner_base_url(),
+                &runtime_token,
+                false,
+            );
         }
         // The pinned snapshot checkout token and the origin-rewrite header
         // are minted at submission and blanked in the stored template; this

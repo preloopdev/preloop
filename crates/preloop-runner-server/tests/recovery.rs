@@ -2241,7 +2241,7 @@ async fn live_log_websocket_accepts_bearer_and_stores_lines() {
     });
     futures::SinkExt::send(
         &mut ws,
-        tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+        tokio_tungstenite::tungstenite::Message::Text(payload.to_string().into()),
     )
     .await
     .unwrap();
@@ -2331,7 +2331,7 @@ async fn live_log_websocket_accepts_own_job_token() {
     });
     futures::SinkExt::send(
         &mut ws,
-        tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+        tokio_tungstenite::tungstenite::Message::Text(payload.to_string().into()),
     )
     .await
     .unwrap();
@@ -2439,7 +2439,7 @@ async fn live_log_websocket_cross_job_attempt_preserves_history() {
     });
     futures::SinkExt::send(
         &mut ws,
-        tokio_tungstenite::tungstenite::Message::Text(payload.to_string()),
+        tokio_tungstenite::tungstenite::Message::Text(payload.to_string().into()),
     )
     .await
     .unwrap();
@@ -2618,7 +2618,7 @@ async fn live_log_websocket_survives_malformed_payload() {
     // Send invalid JSON — should not close the connection.
     futures::SinkExt::send(
         &mut ws,
-        tokio_tungstenite::tungstenite::Message::Text("not json".to_string()),
+        tokio_tungstenite::tungstenite::Message::Text("not json".to_string().into()),
     )
     .await
     .unwrap();
@@ -2632,7 +2632,7 @@ async fn live_log_websocket_survives_malformed_payload() {
     });
     futures::SinkExt::send(
         &mut ws,
-        tokio_tungstenite::tungstenite::Message::Text(valid.to_string()),
+        tokio_tungstenite::tungstenite::Message::Text(valid.to_string().into()),
     )
     .await
     .unwrap();
