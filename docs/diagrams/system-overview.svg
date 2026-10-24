@@ -144,9 +144,8 @@
 <g id="node8" class="node">
 <title>provider</title>
 <path fill="#fef3c7" stroke="#cbd5e1" d="M866.39,-184.53C866.39,-184.53 709.61,-184.53 709.61,-184.53 703.61,-184.53 697.61,-178.53 697.61,-172.53 697.61,-172.53 697.61,-150.45 697.61,-150.45 697.61,-144.45 703.61,-138.45 709.61,-138.45 709.61,-138.45 866.39,-138.45 866.39,-138.45 872.39,-138.45 878.39,-144.45 878.39,-150.45 878.39,-150.45 878.39,-172.53 878.39,-172.53 878.39,-178.53 872.39,-184.53 866.39,-184.53"/>
-<text xml:space="preserve" text-anchor="middle" x="788" y="-169.04" font-family="Helvetica,sans-Serif" font-size="11.00">VmProvider (preloop&#45;vm)</text>
-<text xml:space="preserve" text-anchor="middle" x="788" y="-157.04" font-family="Helvetica,sans-Serif" font-size="11.00">SmolVM default; AgentENV opt&#45;in</text>
-<text xml:space="preserve" text-anchor="middle" x="788" y="-145.04" font-family="Helvetica,sans-Serif" font-size="11.00">PRELOOP_VM_BACKEND</text>
+<text xml:space="preserve" text-anchor="middle" x="788" y="-163.54" font-family="Helvetica,sans-Serif" font-size="11.00">VmProvider (preloop&#45;sandbox)</text>
+<text xml:space="preserve" text-anchor="middle" x="788" y="-151.54" font-family="Helvetica,sans-Serif" font-size="11.00">SmolVM (public driver)</text>
 </g>
 <!-- pool&#45;&gt;provider -->
 <g id="edge8" class="edge">

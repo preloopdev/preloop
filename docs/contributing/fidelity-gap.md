@@ -6,9 +6,9 @@ and design notes; do not read every item below as a current support matrix.
 For current setup and host requirements, see [Self-hosting](../control-plane/operate/deploy.mdx)
 and [Preloop vs. other runners](../comparison.mdx).
 
-Preloop combines the control plane with a runner pool. The default product
-execution path uses SmolVM/libkrun microVMs; AgentENV is an optional Linux
-backend. The control-plane protocol is a separate component, but protocol
+Preloop combines the control plane with a runner pool. The product execution
+path uses SmolVM/libkrun microVMs. The control-plane protocol is a separate
+component, but protocol
 compatibility does not mean every alternative runner host is a supported or
 productized deployment. Remote-runner authentication and multi-host pool
 limitations are tracked in [the roadmap](../roadmap.md).
@@ -1182,7 +1182,7 @@ One binary. One control plane. Different trait impls selected by `preloop serve 
 
 | Concern       | `--profile local` (default)                                     | `--profile server`                                    |
 | ------------- | --------------------------------------------------------------- | ----------------------------------------------------- |
-| Runner host   | in-process: process/container/libkrun, ephemeral, scale-to-zero | remote: k8s/Firecracker/cloud pools, **or** BYO fleet |
+| Runner host   | in-process: process/container/libkrun, ephemeral, scale-to-zero | remote: k8s/cloud pools, **or** BYO fleet             |
 | Persistence   | `InMemory` `RunStore`                                           | `sqlx` `RunStore`                                     |
 | Auth/tenancy  | loopback / dev token, single tenant                             | OAuth + mTLS, namespaced tenants                      |
 | Networking    | `127.0.0.1`                                                     | routable base URL, token-scoped callbacks             |
@@ -1207,7 +1207,7 @@ preloop-providers/              ← separate repo (runner hosts)
 ├── preloop-provider-process      # spawn (fastest, least isolation)
 ├── preloop-provider-container    # docker / podman
 ├── preloop-provider-libkrun      # microVM (Preloop's default)
-└── preloop-provider-remote       # k8s / cloud VM / Firecracker / SSH
+└── preloop-provider-remote       # k8s / cloud VM / SSH
 
 preloop/                        ← the product that ties it together
 ├── preloop-cli                # CLI that wraps preloop-server + a provider

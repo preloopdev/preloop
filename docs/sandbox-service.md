@@ -99,17 +99,22 @@ are the service's.
   service generates a random token on first start into
   `<state>/sandbox-client-token` and `<state>/sandbox-provider-token` (mode
   0600) and reuses it on later starts; the local CLI and in-process agent read
-  the same files.
+  the same files. A standalone agent never generates one: it takes
+  `--provider-token` / `PRELOOP_SANDBOX_PROVIDER_TOKEN`, or reads the file on
+  the host whose service wrote it.
 * A listener bound to a loopback address rejects requests whose `Host` is not
   `localhost`, an address in `127.0.0.0/8`, or `::1`, so a DNS-rebound browser
   page cannot reach it by name. The port is ignored; the check covers the
   RPC routes and the ticket data plane.
-* The service that binds publishes its actual address to
-  `<state>/sandbox-endpoint` (mode 0600) and removes it on shutdown. A CLI
-  without an explicit `--service` uses that file and refuses to send its token
-  anywhere else.
+* The service that binds publishes its actual address and owner PID to
+  `<state>/sandbox-endpoint` (mode 0600) and removes it on shutdown. A failed
+  bind clears the file only when its owner is dead, so a live service's
+  endpoint stays usable. A CLI without an explicit `--service` uses that file
+  and refuses to send its token anywhere else.
 * Data-plane tickets are single-use, scoped to one sandbox and direction, and
-  short-lived; the URL carries its own token.
+  short-lived. `OpenStream` returns the stream URL and a separate `token`; the
+  caller sends it as `Authorization: Bearer <token>` on the upload or download,
+  so the URL alone is not enough.
 * `Report`/`ReportExec`/`Reconcile` are fenced by the provider's registration
   generation, and a provider may not report output for another provider's
   exec, nor destroy another provider's machine.
@@ -125,7 +130,10 @@ are the service's.
 The service keeps its working set in memory and writes through to its own
 store, the restart source: SQLite (`<state>/sandbox.db`, default) or a
 `sandbox` schema in Postgres (`PRELOOP_SANDBOX_STORE_URL=postgres://…`). It
-never references control tables.
+never references control tables. One process at a time holds
+`<state>/sandbox-service.lock` (flock): a second service, or a golden bake
+pointed at the same `PRELOOP_HOME`, fails instead of loading the store and
+reaping the running service's leases.
 
 ## How preloop uses it
 
@@ -136,6 +144,14 @@ through an in-process agent, and serves the API on `PRELOOP_SANDBOX_LISTEN`
 goldens are build sandboxes, forks are acquires from the golden's snapshot
 template, and deletes are releases. The pool keeps its golden, packed-artifact
 and debug-hold strategy; the machines under it are sandboxes.
+
+> **Single-host CI pool (current limitation).** The in-process handle ties the
+> pool to the engine's host: it mounts the runner bundle and externals from
+> engine paths, passes golden packs as engine file paths, sizes capacity from
+> the engine's disk and memory, and reaches the guest through a socket on that
+> host. Host agents on other machines can join a service and serve other
+> clients, but CI jobs from this engine run only on its own host. Running the
+> pool against a remote service is tracked in #776 (part of #773).
 
 | Variable | Effect |
 |---|---|
@@ -151,8 +167,9 @@ and debug-hold strategy; the machines under it are sandboxes.
 
 ```sh
 preloop sandbox serve --listen 0.0.0.0:9191            # standalone service (+ local SmolVM)
-preloop sandbox agent --service http://hub:9191        # join as a provider
-preloop sandbox template put --name alpine --image alpine:3.20
+preloop sandbox agent --service http://hub:9191        # join as a provider; off-host needs --provider-token
+# <digest> is a placeholder: substitute the image's real sha256 digest.
+preloop sandbox template put --name alpine --image alpine:3.20@sha256:<digest>
 preloop sandbox pool put --name alpine --template alpine --warm 2
 preloop sandbox acquire --pool alpine --env JOB=1      # → lease + sandbox JSON
 preloop sandbox exec sbx-… -- uname -a
