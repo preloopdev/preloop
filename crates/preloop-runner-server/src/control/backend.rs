@@ -2042,6 +2042,7 @@ impl ControlBackend for Backend {
         &self,
         completion: JobCompletionInput,
     ) -> Result<CompleteOutcome, ControlError> {
+        require_terminal_completion(completion.status)?;
         match self {
             Self::Sqlite(b) => b.complete_job(completion).await,
             Self::Postgres(b) => b.complete_job(completion).await,
@@ -3386,6 +3387,7 @@ impl ControlBackend for Backend {
         }
     }
     async fn settle_job(&self, settle: SettleJob) -> Result<SettleJobOutcome, ControlError> {
+        require_terminal_completion(settle.completion.status)?;
         match self {
             Self::Sqlite(b) => b.settle_job(settle).await,
             Self::Postgres(b) => b.settle_job(settle).await,

@@ -26,7 +26,7 @@ use crate::control::types::EnvironmentDeploymentRow;
 use crate::control::types::{
     AzdoPoll, AzdoPollOutcome, CancelOutcome, ClaimedJob, CompleteOutcome, ControlError,
     ExpansionClaim, JobSettled, PollOutcome, SessionMessage, SettleJob, SettleJobOutcome,
-    SubmitJob, SubmitOutcome, SubmitRun, status_str,
+    SubmitJob, SubmitOutcome, SubmitRun, require_terminal_completion, status_str,
 };
 use crate::models::{
     EnvironmentGateState, QueuedJob, RunRecord, RunnerCapabilities, TaskAgentJobRequestRecord,
@@ -1903,6 +1903,97 @@ async fn job_under_max_parallel(
     Ok(active < limit as i64)
 }
 
+/// Re-admits a cohort's waiters that `promote_waiter` parked at the cap.
+///
+/// A waiter that finds its cohort saturated is re-parked at its FIFO slot and
+/// its gate's holder row is cleared, so the gate is free and nothing wakes it:
+/// only a release of that gate reaches the waiter. Once a slot is free, retry
+/// only the cohort's own FIFO head. The current run is already locked by the
+/// completion/cancellation transaction, so this path deliberately does not
+/// lock foreign runs; a foreign FIFO head remains the responsibility of that
+/// run's command.
+async fn retry_cohort_waiters(
+    backend: &PgBackend,
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    base_id: &str,
+) -> Result<(), ControlError> {
+    let groups = tx
+        .query(
+            "SELECT w.namespace_id, w.repository, w.group_name \
+             FROM concurrency_waits w \
+             JOIN jobs j ON j.run_id = w.holder_run_id AND j.job_id = w.holder_job_id \
+             WHERE w.holder_run_id = $1::text::uuid AND w.holder_kind = 'job' \
+               AND j.base_id = $2 \
+               AND NOT EXISTS (SELECT 1 FROM concurrency_holds h \
+                    WHERE h.namespace_id = w.namespace_id AND h.repository = w.repository \
+                      AND h.group_name = w.group_name) \
+             GROUP BY w.namespace_id, w.repository, w.group_name \
+             ORDER BY MIN(w.wait_id)",
+            &[&run_id.0.to_string(), &base_id],
+        )
+        .await
+        .map_err(db)?;
+    for row in groups {
+        let namespace: String = row.get(0);
+        let key = (row.get::<_, String>(1), row.get::<_, String>(2));
+        // `lock_group` takes the group's mutex. A holder that landed meanwhile
+        // keeps the gate; its release retries the cohort.
+        let Some(group) = lock_group(tx, &namespace, &key, &run_id.0.to_string()).await? else {
+            continue;
+        };
+        if group.holder.is_some() {
+            continue;
+        }
+        // Preserve global FIFO: only admit this cohort when its own waiter is
+        // the head. In particular, do not promote a foreign run here.
+        let Some((wait_id, head)) = group.waiters.first() else {
+            unlock_group(tx, &namespace, &key).await?;
+            continue;
+        };
+        let concurrency::Holder::Job {
+            run_id: head_run,
+            job_id: head_job,
+        } = &head.holder
+        else {
+            unlock_group(tx, &namespace, &key).await?;
+            continue;
+        };
+        if *head_run != run_id {
+            unlock_group(tx, &namespace, &key).await?;
+            continue;
+        }
+        let head_base: Option<String> = tx
+            .query_opt(
+                "SELECT base_id FROM jobs \
+                 WHERE run_id=$1::text::uuid AND job_id=$2",
+                &[&run_id.0.to_string(), &head_job.0],
+            )
+            .await
+            .map_err(db)?
+            .map(|row| row.get(0));
+        if head_base.as_deref() != Some(base_id) {
+            unlock_group(tx, &namespace, &key).await?;
+            continue;
+        }
+        let holder = head.clone();
+        tx.execute("DELETE FROM concurrency_waits WHERE wait_id=$1", &[wait_id])
+            .await
+            .map_err(db)?;
+        promote_waiter(
+            backend,
+            tx,
+            &namespace,
+            &key,
+            *wait_id,
+            &holder.holder,
+            holder.jobset_id,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// A run-waiter promoted: the jobs it parked behind its own workflow gate go
 /// back to `blocked` and the normal promotion sweep decides what may run
 /// (needs, job-level gates, max-parallel) — mirroring lite's
@@ -2406,7 +2497,7 @@ async fn cancel_job_tx(
     let _ = reason;
     let row = tx
         .query_opt(
-            "SELECT status, queue_state, EXISTS (SELECT 1 FROM job_specs s \
+            "SELECT status, queue_state, base_id, EXISTS (SELECT 1 FROM job_specs s \
              WHERE s.run_id = jobs.run_id AND s.job_id = jobs.job_id \
              AND ((s.deferred_matrix IS NOT NULL AND s.deferred_matrix <> 'null') \
                   OR (s.reusable_call IS NOT NULL AND s.reusable_call <> 'null'::jsonb))) \
@@ -2418,8 +2509,9 @@ async fn cancel_job_tx(
     let Some(row) = row else { return Ok(0) };
     let status: String = row.get(0);
     let queue_state: String = row.get(1);
+    let base_id: String = row.get(2);
     let expandable: bool =
-        row.get::<_, bool>(2) || matches!(queue_state.as_str(), "pending_expansion" | "expanding");
+        row.get::<_, bool>(3) || matches!(queue_state.as_str(), "pending_expansion" | "expanding");
     let now = now_us();
     let mut count = 0;
     // Only a running attempt can be interrupted; queued/blocked jobs simply
@@ -2458,6 +2550,9 @@ async fn cancel_job_tx(
             .await?;
         }
         release_concurrency_for_job(backend, tx, run_id, job_id).await?;
+        // Cancellation frees a cohort slot just like a completion. Retry a
+        // waiter that was re-parked on a now-free gate.
+        retry_cohort_waiters(backend, tx, run_id, &base_id).await?;
     }
     // An expanded caller owns its callee subtree (matrix legs included —
     // they carry `parent_job_id` too); a cancelled caller cancels it.
@@ -3213,6 +3308,41 @@ impl<'a> Sweep<'a> {
             .any(|row| row.get::<_, String>(0) == "blocked" && row.get::<_, i32>(1) <= 0))
     }
 
+    /// Whether a settled leg freed a `max-parallel` slot that a parked leg of
+    /// its cohort can take: the cohort has a `blocked` leg with zero remaining
+    /// needs and fewer active legs than its cap. A parked leg names no sibling
+    /// in `job_needs`, so `refresh_remaining_needs` never reports it; the caller
+    /// treats `true` as a promotion trigger. The sweep that trigger runs loads
+    /// the run graph, so every such completion pays that load; admitting the
+    /// leg on a leg-scoped view instead is the follow-up.
+    pub(super) async fn cohort_has_admissible_leg(
+        tx: &Transaction<'_>,
+        run_id: RunId,
+        base_id: &str,
+    ) -> Result<bool, ControlError> {
+        let parked = tx
+            .query_one(
+                "SELECT EXISTS ( \
+                   SELECT 1 FROM jobs j \
+                   JOIN job_specs s ON s.run_id=j.run_id AND s.job_id=j.job_id \
+                   WHERE j.run_id=$1::text::uuid AND j.base_id=$2 \
+                     AND j.queue_state='blocked' AND j.remaining_needs <= 0 \
+                     AND j.status NOT IN \
+                       ('success','failure','cancelled','skipped','timed_out') \
+                     AND s.max_parallel IS NOT NULL \
+                     AND (SELECT count(*) FROM jobs a \
+                          WHERE a.run_id=j.run_id AND a.base_id=j.base_id \
+                            AND (a.status='in_progress' \
+                                 OR a.queue_state IN ('ready','claimed'))) \
+                         < s.max_parallel)",
+                &[&run_id.0.to_string(), &base_id],
+            )
+            .await
+            .map_err(db)?
+            .get::<_, bool>(0);
+        Ok(parked)
+    }
+
     /// Try to fold a reusable workflow caller when one of its inner jobs
     /// completes. If every inner job of one of its callers is terminal,
     /// resolves the caller's `outputs` from its `output_definitions` (the
@@ -3298,7 +3428,9 @@ impl<'a> Sweep<'a> {
                         .is_some_and(|(status, _)| status.is_terminal())
                 });
             if !all_complete {
-                return Ok(None);
+                // This caller still waits on inner jobs; a nested caller that
+                // shares these ids may be complete and must still fold.
+                continue;
             }
             // Expression context: `jobs.<inner-id-without-caller-prefix>
             // .outputs.<name>` plus the call's `with:` inputs.
@@ -6483,6 +6615,7 @@ impl PgBackend {
         &self,
         completion: JobCompletionInput,
     ) -> Result<CompleteOutcome, ControlError> {
+        require_terminal_completion(completion.status)?;
         let run_id = completion.run_id;
         let job_id = completion.job_id.clone();
         let mut client = self.writer().await?;
@@ -6533,6 +6666,7 @@ impl PgBackend {
         settle: SettleJob,
     ) -> Result<SettleJobOutcome, ControlError> {
         let comp = settle.completion.clone();
+        require_terminal_completion(comp.status)?;
         let run_id = comp.run_id;
         let job_id = comp.job_id.clone();
         let mut client = self.writer().await?;
@@ -6764,11 +6898,9 @@ impl PgBackend {
             current = caller.clone();
             outcome.folded_callers.push(caller);
         }
-        // 5. Refresh the dependents' `remaining_needs` for everything that just
-        // turned terminal: the job, its fail-fast siblings and the folded
-        // callers. A dependent that is now `blocked` with zero needs left is
-        // what the promotion sweep below picks up.
-        let mut promotable = Sweep::refresh_remaining_needs(tx, run_id, job_id, &base_id).await?;
+        // The bases this completion turned terminal in: the job's own, and each
+        // fail-fast sibling's and folded caller's.
+        let mut settled_bases = vec![(job_id.clone(), base_id.clone())];
         for settled in outcome
             .cancelled_siblings
             .iter()
@@ -6782,8 +6914,30 @@ impl PgBackend {
                 .await
                 .map_err(db)?
                 .get(0);
-            promotable |=
-                Sweep::refresh_remaining_needs(tx, run_id, settled, &settled_base).await?;
+            settled_bases.push((settled.clone(), settled_base));
+        }
+        // A settled leg may have freed a `max-parallel` slot that a waiter of
+        // its cohort was parked for behind a gate nothing else will release.
+        for (_, settled_base) in &settled_bases {
+            retry_cohort_waiters(self, tx, run_id, settled_base).await?;
+        }
+        // 5. Refresh the dependents' `remaining_needs` for everything that just
+        // turned terminal. A dependent that is now `blocked` with zero needs left
+        // is what the promotion sweep below picks up. A parked leg names no
+        // sibling in `job_needs`, so the refresh never reports it: the settled
+        // leg's cohort is checked for a parked leg the freed slot can take.
+        let mut promotable = false;
+        for (settled, settled_base) in &settled_bases {
+            promotable |= Sweep::refresh_remaining_needs(tx, run_id, settled, settled_base).await?;
+        }
+        let mut cohorts: Vec<&str> = settled_bases
+            .iter()
+            .map(|(_, cohort)| cohort.as_str())
+            .collect();
+        cohorts.sort_unstable();
+        cohorts.dedup();
+        for cohort in cohorts {
+            promotable |= Sweep::cohort_has_admissible_leg(tx, run_id, cohort).await?;
         }
         outcome.promotable_dependents = promotable;
         // 6. Run status via the DB aggregate; the caller holds the run lock.

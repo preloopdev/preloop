@@ -10885,7 +10885,7 @@ mod lite {
     use super::{built_matrix_leg, create_session, poll, register_runner, submit_job, submit_run};
     use crate::control::backend::{ControlBackend, ExpansionApply, JobCompletionInput};
     use crate::control::lite::LiteBackend;
-    use crate::control::types::PollOutcome;
+    use crate::control::types::{ControlError, PollOutcome, SettleJob};
     use preloop_gha_protocol::{ExecutionStatus, JobId, RunId};
     use std::collections::BTreeMap;
 
@@ -11173,6 +11173,65 @@ mod lite {
             total - consumed,
             "a reopened consumer must resume at the persisted bookmark"
         );
+    }
+
+    /// The `Backend` boundary rejects a non-terminal verdict before SQLite
+    /// writes anything, as the Postgres backend does. The rejected reports
+    /// leave the job completable: a terminal report settles it afterwards.
+    #[tokio::test]
+    async fn non_terminal_completion_is_rejected_at_the_backend_boundary() {
+        let backend = crate::control::Backend::Sqlite(LiteBackend::in_memory().unwrap());
+        let run = RunId::new();
+        backend
+            .submit_run(submit_run(run, vec![submit_job(run, "solo", 1)]))
+            .await
+            .unwrap();
+        let rejected = backend
+            .complete_job(JobCompletionInput {
+                run_id: run,
+                job_id: JobId("solo".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::InProgress,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .err();
+        assert!(
+            matches!(rejected, Some(ControlError::BadRequest(_))),
+            "a non-terminal completion must be a bad request, got {rejected:?}"
+        );
+        let rejected = backend
+            .settle_job(SettleJob {
+                completion: preloop_gha_protocol::JobCompletion {
+                    run_id: run,
+                    job_id: JobId("solo".to_owned()),
+                    agent_job_id: None,
+                    status: ExecutionStatus::Queued,
+                    outputs: preloop_gha_protocol::OutputMap::new(),
+                    annotations: Vec::new(),
+                    step_results: Vec::new(),
+                    environment_url: None,
+                },
+                settle: None,
+            })
+            .await
+            .err();
+        assert!(
+            matches!(rejected, Some(ControlError::BadRequest(_))),
+            "a non-terminal settle must be a bad request, got {rejected:?}"
+        );
+        backend
+            .complete_job(JobCompletionInput {
+                run_id: run,
+                job_id: JobId("solo".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::new(),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
