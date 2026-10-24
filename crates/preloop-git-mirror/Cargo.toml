@@ -1,0 +1,24 @@
+[package]
+name = "preloop-git-mirror"
+version.workspace = true
+edition.workspace = true
+# MIT: extracted from `preloop-runner-server` by the copyright holder, who
+# relicenses the moved code so the reusable primitives can ship in the public
+# repository alongside the MIT crates.
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+flate2.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -26,6 +26,7 @@ preloop-observability = { path = "../preloop-observability" }
 opentelemetry = { workspace = true }
 preloop-artifacts = { path = "../preloop-artifacts" }
 preloop-cache = { path = "../preloop-cache" }
+preloop-git-mirror = { path = "../preloop-git-mirror" }
 preloop-gha-parser = { path = "../preloop-gha-parser" }
 preloop-gha-expressions = { path = "../preloop-gha-expressions" }
 preloop-gha-protocol = { path = "../preloop-gha-protocol" }

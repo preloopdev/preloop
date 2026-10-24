@@ -12,6 +12,11 @@ Releases before v0.27.0 predate the changelog.
 - **Sandbox Service** (`preloop-sandbox`) replaces `preloop-vm`; the
   `preloop sandbox` CLI drives it and the CI pool obtains VMs through the
   service.
+- **MIT Git mirror primitives.** `preloop-git-mirror` exposes bare-repository
+  presence checks, provenance-tracked fetching, writer locks, tree inspection,
+  LFS storage helpers, and Smart HTTP request parsing for control-plane and
+  sandbox consumers. Run authentication and snapshot lifecycle remain in the
+  server; cache hits avoid a redundant upstream fetch.
 
 ### Fixed
 
