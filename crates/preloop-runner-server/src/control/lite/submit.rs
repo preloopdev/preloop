@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 impl LiteBackend {
     /// Insert a submitted run and its jobs. Idempotent on
-    /// `(webhook_delivery_id, workflow_path)`: a replay returns the existing
+    /// `(webhook_delivery_id, workflow_path, event)`: a replay returns the existing
     /// run instead of a duplicate.
     ///
     /// The insert is chunked: phase 1 commits admission plus the run row,
@@ -286,12 +286,13 @@ fn submit_run_head(
         let existing: Option<String> = tx
             .prepare_cached(
                 "SELECT run_id FROM runs WHERE webhook_delivery_id = ?1 \
-                 AND workflow_path = ?2",
+                 AND workflow_path = ?2 AND event = ?3",
             )
             .map_err(db)?
-            .query_row(params![delivery_id, record.workflow_path_str], |row| {
-                row.get(0)
-            })
+            .query_row(
+                params![delivery_id, record.workflow_path_str, record.event],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(db)?;
         if let Some(existing) = existing

@@ -1071,19 +1071,20 @@ impl PgBackend {
             .collect()
     }
 
-    /// `run_for_webhook_delivery`: indexed `(delivery_id, workflow_path)`
+    /// `run_for_webhook_delivery`: indexed `(delivery_id, workflow_path, event)`
     /// point read over live runs; `None` when no committed run exists yet.
     pub(super) async fn run_for_webhook_delivery(
         &self,
         delivery_id: &str,
         workflow_path: &str,
+        event: &str,
     ) -> Result<Option<RunId>, ControlError> {
         let client = self.reader().await?;
         client
             .query_opt(
                 "SELECT run_id::text FROM runs WHERE webhook_delivery_id = $1 \
-                 AND workflow_path = $2",
-                &[&delivery_id, &workflow_path],
+                 AND workflow_path = $2 AND event = $3",
+                &[&delivery_id, &workflow_path, &event],
             )
             .await
             .map_err(db)?

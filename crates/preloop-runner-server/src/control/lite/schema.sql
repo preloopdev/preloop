@@ -109,7 +109,7 @@ CREATE TABLE runs (
     completed_at            INTEGER
 );
 CREATE UNIQUE INDEX runs_number ON runs(namespace_id, repository, workflow_path, run_number, run_attempt);
-CREATE UNIQUE INDEX runs_delivery ON runs(webhook_delivery_id, workflow_path)
+CREATE UNIQUE INDEX runs_delivery ON runs(webhook_delivery_id, workflow_path, event)
     WHERE webhook_delivery_id IS NOT NULL;
 CREATE INDEX runs_namespace_recent ON runs(namespace_id, created_at DESC);
 CREATE INDEX runs_repo_ref ON runs(namespace_id, repository, ref, created_at DESC);

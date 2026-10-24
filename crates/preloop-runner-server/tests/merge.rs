@@ -433,6 +433,45 @@ async fn no_merge_tests_the_branch_alone() {
     assert!(record.workspace_snapshot.as_ref().unwrap().merge.is_none());
 }
 
+/// A remote engine has no workspace to merge from: it cannot read the
+/// submitting tree, and a clean commit is not bundled. It refuses the merge
+/// test rather than substituting the branch, and `no_merge` accepts the branch
+/// alone as the run that was meant.
+#[tokio::test]
+async fn remote_pull_request_without_a_workspace_refuses_the_merge_test() {
+    let fixture = MergeFixture::clean();
+    std::fs::create_dir_all(&fixture.state_dir).unwrap();
+    let state = AppState::new(fixture.state_dir.clone()).await.unwrap();
+    let app = app(state.clone(), CancellationToken::new());
+
+    let (status, body) = request_json_status(
+        &app,
+        Method::POST,
+        "/api/v1/runs",
+        fixture.submission(false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(message.contains("--no-merge"), "error: {message}");
+    assert!(state.test_tx().await.runs.is_empty());
+
+    let accepted = request_json(&app, Method::POST, "/api/v1/runs", fixture.submission(true)).await;
+    let run_id = accepted["run_id"].as_str().unwrap();
+    let inner = state.test_tx().await;
+    let record = inner
+        .runs
+        .values()
+        .find(|run| run.run_id.to_string() == run_id)
+        .expect("run record");
+    assert_eq!(
+        record.github["sha"],
+        serde_json::json!(fixture.head),
+        "no_merge tests the branch tip"
+    );
+    assert!(record.workspace_snapshot.is_none());
+}
+
 /// `push` events test the commit itself; they never grow a merge.
 #[tokio::test]
 async fn push_events_never_merge() {

@@ -39,14 +39,14 @@ preloop run --job test --secret TOKEN=x
 | `--push` | After a successful run, push the tested commit and publish the result. Requires a GitHub `origin`. |
 | `--create-pr` | Open a pull request for the branch when none is open. Implies `--push`. |
 | `--pr-draft[=BOOL]` | Open new pull requests as drafts. Default `true`. Use `--pr-draft=false` for ready-for-review pull requests. |
-| `--no-merge` | For `pull_request` events, test the branch alone instead of its merge with the base. |
+| `--no-merge` | For `pull_request` events, test the branch alone instead of its merge with the base. Required against a remote engine for a clean tree. |
 | `-m, --message <TEXT>` | Commit message for the commit `--push` creates from a dirty tree. Without it, `$EDITOR` opens in a terminal and a generated message is used otherwise. |
 
 **Local workspace.** A run snapshots your working tree, including uncommitted and untracked files that git does not ignore. The run never depends on what you pushed.
 
 **Interactive debugging.** In a terminal, a non-detached run on the default SmolVM backend pauses a failed job for `preloop debug`. Pass `--debug` to opt in for detached or non-interactive runs.
 
-**`pull_request` runs.** Like GitHub, a local `pull_request` run tests the merge of the base branch's current tip into your head; the base is fetched from `origin`. A conflicted pull request fails the submission with the conflicted files listed, and an unfetchable base fails loudly. `--no-merge` tests the branch alone in either case. `push` events are unaffected: they test the commit itself.
+**`pull_request` runs.** Like GitHub, a local `pull_request` run tests the merge of the base branch's current tip into your head; the base is fetched from `origin`. A conflicted pull request fails the submission with the conflicted files listed, and an unfetchable base fails loudly. A remote engine has no workspace to merge from, so a clean `--event pull_request` submit there is refused until `--no-merge` is given (a dirty submit is bundled and merged as usual). `--no-merge` tests the branch alone in every case. `push` events are unaffected: they test the commit itself.
 
 **Derived event data.** A local run fills in what git can answer: changed files (for `paths:` filters, from `git diff` against the base), the target branch for `branches:` filters, and the current branch or tag. It does not invent a pull request number, actor, or labels. Pass `--payload` when a workflow depends on those.
 

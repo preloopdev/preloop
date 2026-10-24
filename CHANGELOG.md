@@ -978,10 +978,13 @@ Releases before v0.27.0 predate the changelog.
 
 ### Changed
 
+- **`pull_request` submits to an engine without a workspace need `--no-merge`**: an engine builds a pull request's test merge only from a workspace it can merge the base into the head from. A remote engine has none: it cannot read the submitting tree, and a clean commit is not bundled. A clean submit used to test the branch alone without saying so; it is now refused with a message naming `no_merge` (`--no-merge` on the CLI), and `no_merge: true` tests the branch alone as before. Dirty `--push` submits, local engines and webhook `pull_request` runs (which already set `no_merge`) are unchanged.
 - **Dependencies**: the weekly batched updates for the Rust toolchain (#569),
   non-breaking crates (#570) and breaking crates (#572).
 
 ### Fixed
+
+- **Pull-request workflows that list both `pull_request` and `pull_request_target` run both events**: a `pull_request` webhook delivery projects to both events, but the webhook replay key was (delivery, workflow file), so the second event replayed the first run and its merge test never ran. The key now includes the event: `runs_delivery` is widened to (delivery, workflow path, event) by migration `V2026102401__runs_delivery_event`, which is additive and keeps existing rows. Redelivering the same delivery, workflow and event still creates no run.
 
 - **Diagnostic staging directories of expired upload tokens are reaped again**: the pending-upload sweep dropped each expired token from the map before the reaper collected its `blobs/diag/<jti>` directory, so the staged bytes stayed on disk until the age-based backstop, which is disabled when `diag_staging_max_age_seconds` is 0. The reaper now collects those directories before the sweep runs.
 
