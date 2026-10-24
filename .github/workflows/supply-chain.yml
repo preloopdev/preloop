@@ -8,10 +8,6 @@ env:
 
 on:
   pull_request:
-    # A labeled run re-checks the head after a maintainer applies the
-    # dependency-migration exception. synchronize runs never honor it, so
-    # every new push needs the label re-applied.
-    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
   schedule:
@@ -36,13 +32,16 @@ jobs:
       - name: Drop PR-shipped cargo config
         run: rm -f .cargo/config .cargo/config.toml
 
+      # The guard is a script, so its cases are a script's cases: run them
+      # here, where a change to the guard is exercised before the step below
+      # decides anything. This is the only CI entry point for the suite --
+      # `justfile` and `ci.yml` are outside the policy set, so a recipe or a
+      # ci.yml step has to arrive in its own (non-policy) PR.
+      - name: Guard policy files (self-test)
+        run: bash supply-chain/tests/guard-policy-files.test.sh
+
       - name: Guard policy files
         if: github.event_name == 'pull_request'
-        env:
-          # Honored only on the labeled event for this exact label, so the
-          # approval covers the head SHA that existed when a maintainer
-          # applied it. Later pushes (synchronize) fail until re-labeled.
-          DEPENDENCY_MIGRATION: ${{ github.event.action == 'labeled' && github.event.label.name == 'dependency-migration' && contains(github.event.pull_request.labels.*.name, 'dependency-migration') }}
         run: |
           set -euo pipefail
           base="${{ github.event.pull_request.base.sha }}"
@@ -50,51 +49,12 @@ jobs:
           # Ensure base and PR head are fetched for diff (fail closed on
           # network/fetch error)
           git fetch --no-tags origin "$base" "$pr_head"
-          # Diff the merge base against the PR head, not the merge-checkout
+          # The script owns the rule, so a contributor can run it locally:
+          #   supply-chain/guard-policy-files.sh <base> <head>
+          # It diffs the merge base against the PR head, not the merge-checkout
           # HEAD: HEAD is a synthetic merge commit, and identical changes on
           # both sides would cancel out of the diff and hide a policy touch.
-          merge_base="$(git merge-base "$base" "$pr_head")"
-          diff_files="$(git diff --name-only "$merge_base" "$pr_head")"
-
-          policy_files="$(echo "$diff_files" | grep -E '^(Cargo\.lock|deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' || true)"
-          non_policy_files="$(echo "$diff_files" | grep -vE '^(Cargo\.lock|deny\.toml|\.cargo/audit\.toml|supply-chain/|\.github/workflows/supply-chain\.yml)' | grep -v '^$' || true)"
-
-          # Adding a Rust dependency necessarily changes Cargo.lock *and* the
-          # manifests that declare it. Permit that dedicated PR shape, but no
-          # source changes or other policy files alongside the lockfile.
-          # Exception: a maintainer applying dependency-migration to the
-          # current head lets that head carry the source changes a breaking
-          # upgrade needs, as long as Cargo.lock is still its only policy
-          # file.
-          dependency_only=false
-          if [[ "$policy_files" == "Cargo.lock" && -n "$non_policy_files" && "$DEPENDENCY_MIGRATION" == "true" ]]; then
-            echo "dependency-migration label: Cargo.lock may ship with source changes"
-            dependency_only=true
-          elif [[ "$policy_files" == "Cargo.lock" && -n "$non_policy_files" ]]; then
-            dependency_only=true
-            while IFS= read -r file; do
-              if [[ "$file" != "Cargo.toml" && ! "$file" =~ ^crates/[^/]+/Cargo\.toml$ ]]; then
-                dependency_only=false
-                break
-              fi
-            done <<< "$non_policy_files"
-          fi
-          if [[ -n "$policy_files" && -n "$non_policy_files" && "$dependency_only" != true ]]; then
-            echo "ERROR: PR touches both supply-chain policy files and non-policy files." >&2
-            echo "Only Cargo.lock plus Cargo.toml manifests may share a dedicated dependency PR." >&2
-            echo "Modified policy files:" >&2
-            echo "$policy_files" >&2
-            echo "Modified non-policy files:" >&2
-            echo "$non_policy_files" >&2
-            exit 1
-          fi
-          if [[ "$dependency_only" == true ]]; then
-            echo "Dedicated dependency manifest + lockfile PR detected: OK"
-          elif [[ -n "$policy_files" ]]; then
-            echo "Dedicated supply-chain policy PR detected: OK"
-          else
-            echo "Policy file guard: OK (no policy files modified)"
-          fi
+          supply-chain/guard-policy-files.sh "$base" "$pr_head"
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:

@@ -56,6 +56,14 @@ pub struct ServerConfig {
     /// Observability handle to clone into AppState (heartbeat, limits).
     /// `None` falls back to `Observability::noop()` (tests).
     pub observability: Option<preloop_observability::Observability>,
+    /// The engine's outbound-GitHub funnel (breaker registry + accounting).
+    ///
+    /// The embedding CLI supplies its own and hands the same one to the runner
+    /// pool, so the pool's golden downloads — which happen before any VM boots
+    /// — resolve through the breakers the webhook path already tripped;
+    /// `None` builds a private funnel (the standalone `preloop-server`
+    /// binary, tests).
+    pub github: Option<crate::github_breaker::GithubFunnel>,
     /// `PRELOOP_REQUIRE_JOB_ASSIGNMENTS`: refuse to dispatch any job without
     /// a recorded assignment, including to external runners.
     pub require_job_assignments: bool,
@@ -264,8 +272,21 @@ pub async fn reap_once(shared: &Arc<SharedState>) {
     if inputs.has_bindings {
         match shared.state.backend.sweep_stale_bindings().await {
             Ok(0) => {}
-            Ok(swept) => debug!(swept, "swept stale job bindings"),
+            Ok(swept) => info!(swept, "swept stale job bindings"),
             Err(error) => warn!(?error, "stale-binding sweep failed"),
+        }
+    }
+    // Dispatch-intent backstop: under strict assignments a ready job with
+    // neither a `job_assignments` nor a `provision_requests` row is
+    // unclaimable forever. `has_bindings` cannot see that shape (there is no
+    // row at all), so this runs from the ready snapshot instead. A non-zero
+    // count means an enqueue/requeue/promote path is still leaking intent —
+    // the repair keeps the queue moving while that path is found.
+    if !inputs.ready.is_empty() {
+        match shared.state.backend.reconcile_dispatch_intent().await {
+            Ok(0) => {}
+            Ok(repaired) => info!(repaired, "repaired leaked dispatch intent for ready jobs"),
+            Err(error) => warn!(?error, "dispatch-intent reconcile failed"),
         }
     }
     // ── Node-local inputs: pool flags + start time ──────────────────────
@@ -854,7 +875,13 @@ type SnapshotInputs = crate::control::types::StatusInputs;
 async fn read_snapshot_inputs(state: &AppState) -> SnapshotInputs {
     match state
         .backend
-        .status_inputs(crate::runs::STALENESS_THRESHOLD)
+        // The runner tallies read "how many machines are dead", so the
+        // window is the session liveness the reaper prunes on. The sampler
+        // threshold used to be passed here, which made every runner mid-step
+        // count as stale on a fully busy pool.
+        .status_inputs(std::time::Duration::from_secs(
+            crate::distributed_task::DEAD_SESSION_LEASE_SECONDS,
+        ))
         .await
     {
         Ok(inputs) => inputs,
@@ -1197,8 +1224,8 @@ fn build_operational_snapshot_sync(
             idle: inputs.runner_idle,
             busy: inputs.runner_busy,
             stale: inputs.runner_stale,
-            max_poll_age_seconds: None,
-            max_lease_age_seconds: None,
+            max_poll_age_seconds: inputs.max_poll_age_seconds.map(|age| age as f64),
+            max_lease_age_seconds: inputs.max_lease_age_seconds.map(|age| age as f64),
             assignments: inputs.runner_assignments,
         },
         pool: pool_snapshot,
@@ -1482,6 +1509,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
         config.state_dir.clone(),
         crate::config::config_path(),
         config.store_url.as_deref(),
+        config.github.clone(),
     )
     .await?;
     // Wire observability if supplied (CLI/server will pass its handle).
@@ -1502,7 +1530,7 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     if state.github_app.is_none()
         && let Some(pat) = state.static_github_pat()
     {
-        crate::runs::warm_pat_scope_cache(&pat).await;
+        crate::runs::warm_pat_scope_cache(&state, &pat).await;
     }
     // Resolve the effective store URL exactly once, mirroring `open_store`
     // precedence: the explicit URL wins, then the environment, then SQLite at
@@ -1837,6 +1865,16 @@ pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
     tokio::spawn(async move {
         crate::snapshots::sweep_workspace_snapshots(&snapshot_sweep_shared).await;
     });
+    // The shared object cache is never garbage-collected in place (a live
+    // snapshot alternates to it), so its ceiling is enforced here and after
+    // each successful capture. The single-flight permit is taken before the
+    // spawn, so this startup request coalesces with a concurrent post-capture
+    // one instead of walking the cache twice.
+    crate::snapshots::spawn_snapshot_object_cache_sweep(
+        &shared.state.snapshot_object_cache_sweep,
+        shared.state.state_dir.clone(),
+        shared.state.snapshot_object_cache_max_bytes,
+    );
     let archive_shared = shared.clone();
     tokio::spawn(async move { run_history_archiver(archive_shared).await });
     let flusher_shared = shared.clone();
@@ -2109,14 +2147,19 @@ fn read_lock_record(file: &std::fs::File) -> std::io::Result<String> {
 pub enum EngineOrigin {
     /// Started in a terminal: `preloop serve`, or `preloop engine` run by hand.
     Foreground,
-    /// Spawned by a `preloop` client command that found no engine running.
+    /// Started with an explicit background marker (see [`ENGINE_ORIGIN_ENV`]),
+    /// as launchers that start the engine themselves set — including the
+    /// client-command auto-start that was removed in #658. The marker stays
+    /// honored so those launchers, and `serve.lock` records written by older
+    /// builds, still read correctly.
     Background,
     /// Started by systemd (`INVOCATION_ID` is set).
     Systemd,
 }
 
-/// Environment variable the CLI sets on the engine it autostarts, so that
-/// engine records itself as [`EngineOrigin::Background`].
+/// Environment variable a launcher sets on an engine it starts itself, so that
+/// engine records itself as [`EngineOrigin::Background`]. The CLI no longer
+/// autostarts an engine (#658) and so no longer sets it.
 pub const ENGINE_ORIGIN_ENV: &str = "PRELOOP_ENGINE_ORIGIN";
 
 impl EngineOrigin {
@@ -2148,9 +2191,9 @@ impl EngineOrigin {
 }
 
 /// [`EngineOrigin::current`] over explicit inputs, so both precedence rules can
-/// be tested. The explicit `background` marker wins: a client command started
-/// from inside a systemd unit inherits `INVOCATION_ID`, but the engine it
-/// autostarts is still a background engine.
+/// be tested. The explicit `background` marker wins: a process started from
+/// inside a systemd unit inherits `INVOCATION_ID`, but a launcher that marked
+/// it background is still recorded as such.
 fn origin_from(marker: Option<&str>, invoked_by_systemd: bool) -> EngineOrigin {
     if marker.map(str::trim) == Some(EngineOrigin::Background.as_str()) {
         EngineOrigin::Background
@@ -2344,7 +2387,7 @@ fn holder_message(holder: &LockHolder) -> String {
         .unwrap_or_default();
     let mut lines = vec![match holder.origin {
         EngineOrigin::Background => format!(
-            "a preloop engine is already running (pid {pid}{started}, in the background by a preloop command)"
+            "a preloop engine is already running (pid {pid}{started}, started in the background)"
         ),
         EngineOrigin::Systemd => format!(
             "a preloop engine is already running as a systemd service (preloop.service, pid {pid})"
@@ -2659,10 +2702,7 @@ mod tests {
                 )),
                 "{error}"
             );
-            assert!(
-                error.contains("in the background by a preloop command"),
-                "{error}"
-            );
+            assert!(error.contains("started in the background"), "{error}");
             assert!(
                 error.contains("It is serving http://127.0.0.1:9090"),
                 "{error}"
@@ -2892,5 +2932,79 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("It is serving"), "{message}");
+    }
+
+    /// The reaper's dispatch-intent backstop repairs a ready job with no
+    /// assignment and no pool-pending row in one tick and reports it at info.
+    /// The stale-binding sweep cannot see this shape (`has_bindings` is false
+    /// when no row exists), so the repair must run even with no bindings.
+    #[tokio::test]
+    async fn reap_repairs_a_ready_job_without_dispatch_intent() {
+        use crate::control::backend::ControlBackend as _;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        struct RecordingWriter(StdArc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = StdArc::new(StdMutex::new(Vec::new()));
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || RecordingWriter(sink.clone()))
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::new(temp.path().to_path_buf()).await.unwrap();
+        // Enqueue under the default policy: on_job_enqueued writes nothing,
+        // leaving the exact leaked shape strict assignments cannot claim.
+        state
+            .backend
+            .set_config(false, false, Duration::from_secs(300));
+        let run_id = RunId::new();
+        state
+            .backend
+            .submit_run(crate::control::tests::submit_run(
+                run_id,
+                vec![crate::control::tests::submit_job(run_id, "build", 1)],
+            ))
+            .await
+            .unwrap();
+        let shared = Arc::new(SharedState {
+            state: state.clone(),
+            shutdown: CancellationToken::new(),
+        });
+
+        // The effective config now requires assignments: one reaper tick must
+        // derive the missing intent.
+        state
+            .backend
+            .set_config(false, true, Duration::from_secs(300));
+        reap_once(&shared).await;
+
+        let key = (run_id, JobId("build".to_owned()));
+        let working = state.backend.test_working_set().await.unwrap();
+        assert!(
+            working.job_assignments.contains_key(&key) || working.pool_pending.contains_key(&key),
+            "the reaper must write dispatch intent for the leaked ready job"
+        );
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("repaired leaked dispatch intent"),
+            "the repair must be visible at info level, got: {logs}"
+        );
+        assert!(
+            logs.contains("repaired=1"),
+            "the log must carry the repair count, got: {logs}"
+        );
     }
 }

@@ -10,8 +10,13 @@
 //! This module collapses that into one command by binding a single-use HTTP
 //! listener on loopback and using it as the manifest's `redirect_url`. The
 //! listener is the security boundary: the private key never leaves the
-//! machine (unlike the server-side `/api/v1/github/register` page, which can
-//! only display it), and the callback is reachable only from this host.
+//! machine (unlike the engine-hosted setup, which stores it on the engine),
+//! and the callback is reachable only from this host.
+//!
+//! Over SSH the browser is on the laptop, which cannot reach this host's
+//! loopback. The listener then binds a fixed port that the operator forwards
+//! with `ssh -L`; the forward carries both trips, the form page and GitHub's
+//! redirect.
 //!
 //! Three routes, one shot each:
 //!
@@ -26,26 +31,20 @@ use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::get;
+use preloop_runner_server::github_app_setup::{
+    AppCredentials, FormPage, convert_manifest_code, creation_url, error_page, form_page, manifest,
+    random_nonce, success_page,
+};
 use serde::Deserialize;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 
-/// Default permissions of the generated App.
-///
-/// The floor a workflow needs to check out code and report status: GitHub
-/// always grants `metadata: read`, `contents: read` backs `actions/checkout`,
-/// `pull_requests: read` backs PR-triggered runs, and `checks: write` lets
-/// the engine publish check runs. Anything beyond that is a decision the
-/// operator should make in the App's settings, not one this flow makes for
-/// them — an installation token is capped by the App's grant, so a narrow
-/// default cannot silently widen a job's authority.
-const DEFAULT_PERMISSIONS: &[(&str, &str)] = &[
-    ("checks", "write"),
-    ("contents", "read"),
-    ("metadata", "read"),
-    ("pull_requests", "read"),
-];
+/// Where the loopback flow creates Apps. The engine-hosted setup uses the
+/// engine's configured GitHub host instead.
+/// GitHub's web root, for a manifest-driven App by default. GHES engines
+/// configure their own host in `github.server_url`.
+pub(crate) const GITHUB_WEB: &str = "https://github.com";
 
 /// How long to wait for the operator to finish in the browser.
 const BROWSER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -57,53 +56,13 @@ const BROWSER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600)
 /// setup.
 const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Credentials GitHub returns from a manifest conversion.
-#[derive(Deserialize)]
-pub(crate) struct AppCredentials {
-    /// Numeric App id (the JWT `iss`).
-    pub id: u64,
-    /// URL slug, for the installation link.
-    #[serde(default)]
-    pub slug: Option<String>,
-    /// PKCS#1 private key.
-    pub pem: String,
-    /// `X-Hub-Signature-256` secret; absent when the manifest disabled hooks.
-    #[serde(default)]
-    pub webhook_secret: Option<String>,
-    /// Human-facing App page.
-    #[serde(default)]
-    pub html_url: Option<String>,
-}
+/// The listener port over SSH when `--port` is not given. A forward needs a
+/// port the operator can name before the flow starts, so the default is fixed
+/// rather than random.
+pub(crate) const SSH_FORWARD_PORT: u16 = 8765;
 
-/// Manual `Debug`: this carries the App's private key and webhook secret,
-/// either of which a single `debug!(?credentials)` would otherwise disclose.
-impl std::fmt::Debug for AppCredentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AppCredentials")
-            .field("id", &self.id)
-            .field("slug", &self.slug)
-            .field("pem", &"<redacted>")
-            .field(
-                "webhook_secret",
-                &self.webhook_secret.as_ref().map(|_| "<redacted>"),
-            )
-            .field("html_url", &self.html_url)
-            .finish()
-    }
-}
-
-impl AppCredentials {
-    /// Where the operator installs the App on their repositories.
-    ///
-    /// Prefers the slug-based path, which lands directly on the repository
-    /// picker; falls back to the App page when GitHub omitted the slug.
-    pub(crate) fn install_url(&self) -> Option<String> {
-        self.slug
-            .as_ref()
-            .map(|slug| format!("https://github.com/apps/{slug}/installations/new"))
-            .or_else(|| self.html_url.clone())
-    }
-}
+/// Says where GitHub's result goes. The loopback page writes to the local config.
+const DELIVERY_NOTE: &str = "GitHub returns the credentials to this page, which writes them to your local config — the private key never leaves this machine.";
 
 /// Everything the flow learned, in order of arrival.
 #[derive(Debug)]
@@ -115,70 +74,12 @@ pub(crate) struct Registration {
     pub installation_id: Option<u64>,
 }
 
-/// Where the App is created: a personal account or an organization.
-pub(crate) fn creation_url(org: Option<&str>, state: &str) -> String {
-    match org {
-        Some(org) => format!(
-            "https://github.com/organizations/{org}/settings/apps/new?state={state}",
-            org = urlencode(org),
-            state = urlencode(state),
-        ),
-        None => format!(
-            "https://github.com/settings/apps/new?state={state}",
-            state = urlencode(state)
-        ),
-    }
-}
-
-/// The manifest GitHub renders as a pre-filled App-creation form.
-///
-/// `hook_attributes` is only meaningful when GitHub can reach the engine, so
-/// a loopback-only setup ships the App with no webhook configured rather
-/// than pointing one at an address that will never resolve from GitHub's
-/// side. GitHub rejects any `hook_attributes.url` it cannot reach over the
-/// public Internet — including an `active: false` one — so the field is
-/// omitted entirely.
-pub(crate) fn manifest(
-    name: &str,
-    redirect_url: &str,
-    public_url: Option<&str>,
-) -> serde_json::Value {
-    let permissions: serde_json::Map<String, serde_json::Value> = DEFAULT_PERMISSIONS
-        .iter()
-        .map(|(scope, access)| ((*scope).to_owned(), serde_json::Value::from(*access)))
-        .collect();
-    let mut manifest = serde_json::json!({
-        "name": name,
-        "url": public_url.unwrap_or("https://github.com/preloop-dev/preloop"),
-        "redirect_url": redirect_url,
-        "setup_url": format!("{}/installed", redirect_url.trim_end_matches("/callback")),
-        "setup_on_update": false,
-        "public": false,
-        "default_permissions": permissions,
-    });
-    if let Some(public) = public_url {
-        manifest["hook_attributes"] = serde_json::json!({
-            "url": format!("{}/api/v1/github/webhooks", public.trim_end_matches('/')),
-            "active": true,
-        });
-        manifest["default_events"] =
-            serde_json::json!(preloop_runner_server::github::manifest_default_events());
-    }
-    // With no public URL there is no webhook at all: GitHub validates hook URL
-    // reachability even for inactive hooks and rejects loopback addresses.
-    // Omitting the object means no `webhook_secret` is minted, so a later
-    // `--public-url` has to add the secret when enabling the hook in App
-    // settings.
-    manifest
-}
-
 /// Shared state of the one-shot listener.
 struct Flow {
     /// CSRF nonce echoed by GitHub; a callback carrying anything else did not
     /// originate from the form this process served.
     state: String,
     name: String,
-    public_url: Option<String>,
     redirect_url: String,
     api_base: String,
     /// Install URL, published by the callback for the `/installed` page.
@@ -208,11 +109,14 @@ struct InstalledQuery {
 /// waiting for the optional installation redirect. GitHub returns the private
 /// key only once, so waiting for installation before saving it would let a
 /// timeout or Ctrl-C lose the key.
+///
+/// `guidance`, when given, replaces the plain "open this URL" lines. It is
+/// printed once the listener is bound, so it can name the port it reached.
 pub(crate) async fn register_with_persist<F, T>(
     name: &str,
     org: Option<&str>,
     port: u16,
-    public_url: Option<&str>,
+    guidance: Option<&str>,
     open_browser: bool,
     persist: F,
 ) -> Result<(Registration, T)>
@@ -226,16 +130,25 @@ where
         .local_addr()
         .context("reading the local listener address")?;
     let base = format!("http://127.0.0.1:{}", local.port());
-    println!("Open this URL to create the GitHub App:\n  {base}");
-    if open_browser && open_in_browser(&base).is_err() {
-        println!("(could not open a browser automatically — open the URL above)");
+    match guidance {
+        Some(text) => println!("{text}"),
+        None => println!("Open this URL to create the GitHub App:\n  {base}"),
     }
-    println!("Waiting for GitHub to redirect back…");
     let api_base = std::env::var("PRELOOP_GITHUB_API_URL")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "https://api.github.com".to_owned());
-    register_on_with_persist(listener, name, org, public_url, &api_base, persist).await
+    // The listener is bound, but nothing answers on it until the server task
+    // starts inside `register_on_with_persist` — so the browser is opened from
+    // there. Otherwise a browser that connects immediately could wait on a
+    // socket no one is serving yet.
+    register_on_with_persist(listener, name, org, &api_base, persist, |base| {
+        if open_browser && open_in_browser(base).is_err() {
+            println!("(could not open a browser automatically — open the URL above)");
+        }
+        println!("Waiting for GitHub to redirect back…");
+    })
+    .await
 }
 
 /// [`register_with_persist`] against an already-bound listener, so a test can
@@ -245,25 +158,28 @@ async fn register_on(
     listener: tokio::net::TcpListener,
     name: &str,
     org: Option<&str>,
-    public_url: Option<&str>,
     api_base: &str,
 ) -> Result<Registration> {
     let (registration, ()) =
-        register_on_with_persist(listener, name, org, public_url, api_base, |_| Ok(())).await?;
+        register_on_with_persist(listener, name, org, api_base, |_| Ok(()), |_| {}).await?;
     Ok(registration)
 }
 
 /// [`register_on`] with immediate persistence of the converted credentials.
-async fn register_on_with_persist<F, T>(
+///
+/// `announce` runs once the listener is actually being served, so a caller
+/// that opens a browser can do it after the page it asks for can be answered.
+async fn register_on_with_persist<F, T, A>(
     listener: tokio::net::TcpListener,
     name: &str,
     org: Option<&str>,
-    public_url: Option<&str>,
     api_base: &str,
     persist: F,
+    announce: A,
 ) -> Result<(Registration, T)>
 where
     F: FnOnce(&AppCredentials) -> Result<T>,
+    A: FnOnce(&str),
 {
     let local = listener
         .local_addr()
@@ -272,9 +188,8 @@ where
     let (credentials_tx, credentials_rx) = oneshot::channel();
     let (installed_tx, installed_rx) = oneshot::channel();
     let flow = Arc::new(Flow {
-        state: nonce(),
+        state: random_nonce(),
         name: name.to_owned(),
-        public_url: public_url.map(str::to_owned),
         redirect_url: format!("{base}/callback"),
         api_base: api_base.to_owned(),
         install_url: Mutex::new(None),
@@ -297,6 +212,8 @@ where
                 .await
         }
     });
+
+    announce(&base);
 
     let credentials = match tokio::time::timeout(BROWSER_TIMEOUT, credentials_rx).await {
         Ok(Ok(result)) => result?,
@@ -334,45 +251,21 @@ where
 /// The form page: GitHub only accepts a manifest as a form POST, so this is
 /// a self-submitting form rather than a link.
 async fn page_form(State((flow, org)): State<(Arc<Flow>, Option<String>)>) -> impl IntoResponse {
-    let manifest = manifest(&flow.name, &flow.redirect_url, flow.public_url.as_deref());
-    let action = creation_url(org.as_deref(), &flow.state);
-    let scope = match &org {
-        Some(org) => format!("the <strong>{}</strong> organization", escape(org)),
-        None => "your personal account".to_owned(),
-    };
-    let webhooks = match &flow.public_url {
-        Some(public) => format!("Webhooks deliver to {}.", escape(public)),
-        None => "Webhooks are off — this engine is not reachable from GitHub.".to_owned(),
-    };
-    Html(format!(
-        r#"<!DOCTYPE html>
-<html>
-<head><title>Create the preloop GitHub App</title></head>
-<body style="font-family: system-ui, sans-serif; padding: 40px; max-width: 640px; margin: auto;">
-  <h1>Create the preloop GitHub App</h1>
-  <p>This creates a private App named <strong>{name}</strong> on {scope}, with
-     permissions {permissions}. {webhooks}</p>
-  <p>GitHub returns the credentials to this page, which writes them to your
-     local config — the private key never leaves this machine.</p>
-  <form id="manifest-form" action="{action}" method="post">
-    <input type="hidden" name="manifest" value='{manifest}'>
-    <button type="submit" style="font-size: 16px; padding: 10px 20px; cursor: pointer; background: #2da44e; color: white; border: none; border-radius: 6px; font-weight: bold;">Create on GitHub</button>
-  </form>
-</body>
-</html>"#,
-        name = escape(&flow.name),
-        scope = scope,
-        permissions = escape(
-            &DEFAULT_PERMISSIONS
-                .iter()
-                .map(|(scope, access)| format!("{scope}: {access}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        webhooks = webhooks,
-        action = escape(&action),
-        manifest = escape_attr(&manifest.to_string()),
-    ))
+    let setup_url = format!(
+        "{}/installed",
+        flow.redirect_url.trim_end_matches("/callback")
+    );
+    let manifest = manifest(&flow.name, &flow.redirect_url, None, Some(&setup_url));
+    let action = creation_url(GITHUB_WEB, org.as_deref(), &flow.state);
+    Html(form_page(&FormPage {
+        name: &flow.name,
+        org: org.as_deref(),
+        action: &action,
+        manifest: &manifest,
+        public_url: None,
+        delivery: DELIVERY_NOTE,
+        auto_submit: false,
+    }))
 }
 
 /// GitHub's redirect target: converts the one-time code, then sends the
@@ -391,11 +284,11 @@ async fn page_callback(
         )
             .into_response();
     }
-    let converted = convert(&flow.api_base, &query.code).await;
+    let converted = convert_manifest_code(&flow.api_base, &query.code).await;
     let install_url = converted
         .as_ref()
         .ok()
-        .and_then(AppCredentials::install_url);
+        .and_then(|credentials| credentials.install_url(GITHUB_WEB));
     let response = match &converted {
         Ok(_) => match &install_url {
             Some(url) => {
@@ -436,31 +329,126 @@ async fn page_installed(
     ))
 }
 
-/// Exchange the one-time manifest code for the App's credentials.
-async fn convert(api_base: &str, code: &str) -> Result<AppCredentials> {
-    let url = format!("{}/app-manifests/{}/conversions", api_base, urlencode(code));
-    // Not `crate::build_client()`: that one targets the engine's native API
-    // surface, and this call goes to api.github.com.
-    let response = reqwest::Client::new()
-        .post(&url)
-        .header("User-Agent", "preloop")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .context("calling GitHub's manifest conversion endpoint")?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    anyhow::ensure!(
-        status.is_success(),
-        "GitHub rejected the manifest conversion ({status}): {}",
-        body.trim()
-    );
-    serde_json::from_str(&body).context("parsing GitHub's manifest conversion response")
+/// Everything an SSH operator needs to reach the listener from a laptop: the
+/// login name and address the session arrived on, and the port `sshd` listens
+/// on when it is not 22.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SshTarget {
+    pub user: String,
+    pub host: String,
+    pub port: Option<u16>,
 }
 
-/// Open `url` in the platform browser. Failure is not fatal — the URL is
-/// always printed first.
+impl SshTarget {
+    /// Build the target from `SSH_CONNECTION` (`client_ip client_port
+    /// server_ip server_port`), the login name, and the machine's hostname.
+    ///
+    /// `server_ip` is the address the laptop connected to, so the laptop can
+    /// reach it by definition. The hostname only stands in when the variable
+    /// is missing.
+    pub(crate) fn from_env(connection: Option<&str>, user: Option<&str>, hostname: &str) -> Self {
+        let fields: Vec<&str> = connection
+            .map(|value| value.split_whitespace().collect())
+            .unwrap_or_default();
+        let (host, port) = match fields.as_slice() {
+            [_, _, server_ip, server_port] => (
+                ipv4_mapped_to_v4(server_ip).to_owned(),
+                server_port.parse::<u16>().ok(),
+            ),
+            _ => (hostname.to_owned(), None),
+        };
+        let user = user
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("<user>")
+            .to_owned();
+        Self { user, host, port }
+    }
+
+    /// The command to run in a second terminal on the laptop. The port on both
+    /// sides is `port`, so the browser's `127.0.0.1:port` reaches this
+    /// listener.
+    pub(crate) fn forward_command(&self, port: u16) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        let ssh_port = match self.port {
+            Some(ssh_port) if ssh_port != 22 => format!(" -p {ssh_port}"),
+            _ => String::new(),
+        };
+        format!(
+            "ssh -L {port}:127.0.0.1:{port}{ssh_port} {user}@{host}",
+            user = self.user
+        )
+    }
+}
+
+/// `::ffff:203.0.113.5` is the IPv4 address `sshd` reports for an IPv4 client
+/// on a dual-stack socket; the laptop should be given the plain address.
+fn ipv4_mapped_to_v4(address: &str) -> &str {
+    address
+        .strip_prefix("::ffff:")
+        .filter(|rest| rest.parse::<Ipv4Addr>().is_ok())
+        .unwrap_or(address)
+}
+
+/// Whether this process runs inside an SSH session. `sshd` sets
+/// `SSH_CONNECTION` for every session and `SSH_TTY` once a terminal is
+/// allocated; either means the browser is not on this machine.
+pub(crate) fn ssh_session_from_env(get: impl Fn(&str) -> Option<String>) -> bool {
+    ["SSH_CONNECTION", "SSH_TTY"]
+        .iter()
+        .any(|key| get(key).is_some_and(|value| !value.trim().is_empty()))
+}
+
+/// This machine's hostname, for the forward command when `SSH_CONNECTION` is
+/// absent. `<host>` stands in when the hostname cannot be read.
+pub(crate) fn local_hostname() -> String {
+    std::process::Command::new("hostname")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "<host>".to_owned())
+}
+
+/// The text printed over SSH before the listener waits: the forward to run on
+/// the laptop, then the address to open once it is up.
+pub(crate) fn forwarded_guidance(target: &SshTarget, port: u16) -> String {
+    format!(
+        "This host is reached over SSH, so GitHub's redirect can only come back through a port forward.\n\
+         In a second terminal on your laptop, run:\n\n  {command}\n\n\
+         Use the name you normally connect with if it differs, for example an ~/.ssh/config alias.\n\
+         Keep that terminal open, then open this address in your laptop's browser:\n\n  http://127.0.0.1:{port}\n",
+        command = target.forward_command(port),
+    )
+}
+
+/// Open `url` in a browser. Failure is not fatal — the URL is always printed first.
+///
+/// `$BROWSER` is tried first, as `xdg-open` and most tools do: a
+/// colon-separated list of commands, each run with the URL as its last
+/// argument or in place of `%s`. VS Code and Cursor set it to a helper that
+/// opens the URL on the user's machine and forwards the port, which is what
+/// makes the remote-terminal case work. The platform opener is the fallback.
 pub(crate) fn open_in_browser(url: &str) -> Result<()> {
+    if let Some(spec) = std::env::var("BROWSER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        for argv in browser_commands(&spec, url) {
+            if run_browser_command(&argv).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     let (program, args): (&str, Vec<&str>) = ("open", vec![url]);
     #[cfg(target_os = "windows")]
@@ -468,81 +456,122 @@ pub(crate) fn open_in_browser(url: &str) -> Result<()> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let (program, args): (&str, Vec<&str>) = ("xdg-open", vec![url]);
 
-    let status = std::process::Command::new(program)
+    // Started, not waited on, for the same reason `$BROWSER` is: the opener
+    // may hold the terminal until the browser exits.
+    std::process::Command::new(program)
         .args(args)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .spawn()
         .with_context(|| format!("spawning {program}"))?;
-    anyhow::ensure!(status.success(), "{program} exited with {status}");
     Ok(())
 }
 
-/// 128 bits of CSRF nonce, hex-encoded.
-fn nonce() -> String {
-    let bytes: [u8; 16] = rand::random();
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+/// Expand a `$BROWSER` value into argument vectors, one per colon-separated
+/// entry. Each entry is split into words the way a shell would, so a quoted
+/// path or argument stays one word (`"/opt/Remote Browser/bin/open" %s` names
+/// `/opt/Remote Browser/bin/open`, not `"/opt/Remote`); `%s` in any word is
+/// replaced by the URL, and when no word has one the URL is appended. Blank
+/// entries and entries with an unterminated quote are skipped. The URL is
+/// always a single argument, and no shell ever sees any of it.
+fn browser_commands(spec: &str, url: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    for entry in spec.split(':') {
+        let Some(words) = split_browser_words(entry) else {
+            continue;
+        };
+        if words.is_empty() {
+            continue;
+        }
+        let mut substituted = false;
+        let mut argv: Vec<String> = words
+            .into_iter()
+            .map(|word| {
+                if word.contains("%s") {
+                    substituted = true;
+                    word.replace("%s", url)
+                } else {
+                    word
+                }
+            })
+            .collect();
+        if !substituted {
+            argv.push(url.to_owned());
+        }
+        commands.push(argv);
+    }
+    commands
 }
 
-/// Percent-encode everything outside the unreserved set, so a slug or nonce
-/// cannot break out of the query string it is spliced into.
-fn urlencode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
+/// Split one `$BROWSER` entry into words, honouring single and double quotes
+/// and backslash escapes the way a shell does. `None` means the entry cannot
+/// be read (a trailing backslash or an unterminated quote): a helper whose
+/// command line cannot be reconstructed is not one to guess at, so it is
+/// skipped and the next entry — or the platform opener — is tried.
+fn split_browser_words(entry: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = entry.chars();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(open) if ch == open => quote = None,
+            Some(_) => {
+                word.push(ch);
+                started = true;
             }
-            _ => out.push_str(&format!("%{byte:02X}")),
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    started = true;
+                }
+                '\\' => {
+                    let escaped = chars.next()?;
+                    word.push(escaped);
+                    started = true;
+                }
+                _ if ch.is_whitespace() => {
+                    if started {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                _ => {
+                    word.push(ch);
+                    started = true;
+                }
+            },
         }
     }
-    out
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
 }
 
-/// Escape HTML text content.
-fn escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// Escape a value destined for a single-quoted HTML attribute. The manifest
-/// is JSON, so it is full of double quotes: the attribute is single-quoted
-/// and only the single quote (and `&`/`<`) needs escaping.
-fn escape_attr(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('\'', "&#39;")
-}
-
-fn success_page(title: &str, detail: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
-<html><head><title>{title}</title></head>
-<body style="font-family: system-ui, sans-serif; padding: 40px; max-width: 640px; margin: auto;">
-  <h1 style="color: #2da44e;">{title}</h1>
-  <p>{detail}</p>
-</body></html>"#,
-        title = escape(title),
-        detail = escape(detail)
-    )
-}
-
-fn error_page(title: &str, detail: &str) -> String {
-    format!(
-        r#"<!DOCTYPE html>
-<html><head><title>{title}</title></head>
-<body style="font-family: system-ui, sans-serif; padding: 40px; max-width: 640px; margin: auto;">
-  <h1 style="color: #cf222e;">{title}</h1>
-  <p>{detail}</p>
-  <p>Re-run <code>preloop setup github --via app</code> to try again.</p>
-</body></html>"#,
-        title = escape(title),
-        detail = escape(detail)
-    )
+/// Start a browser command without waiting for it to exit.
+///
+/// A browser outlives the setup command by design, and `$BROWSER` in a remote
+/// terminal is a helper that keeps running. Waiting for its lifetime would
+/// stall the flow around it: in the loopback flow the setup page cannot be
+/// served while the CLI waits for the browser, and the browser waits for the
+/// page. What matters here is only whether the program could be started at
+/// all, which is what `spawn` reports.
+fn run_browser_command(argv: &[String]) -> Result<()> {
+    let (program, args) = argv.split_first().context("empty BROWSER entry")?;
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning {program}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -586,14 +615,13 @@ mod tests {
             .unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let flow =
-            tokio::spawn(
-                async move { register_on(listener, "preloop-local", None, None, &api).await },
-            );
+            tokio::spawn(async move { register_on(listener, "preloop-local", None, &api).await });
 
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
+        let client = preloop_runner_server::shared_http::with_tls_roots(
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+        )
+        .build()
+        .unwrap();
         let form = client
             .get(&base)
             .send()
@@ -602,6 +630,10 @@ mod tests {
             .text()
             .await
             .unwrap();
+        assert!(
+            form.contains(r#"name="manifest" value='"#),
+            "the manifest must be a hidden form field: {form}"
+        );
         assert!(
             form.contains(r#"action="https://github.com/settings/apps/new?state="#),
             "the form must post the manifest to GitHub: {form}"
@@ -613,8 +645,18 @@ mod tests {
             .expect("state nonce in the form action")
             .to_owned();
         assert!(
+            form.contains(&format!(
+                r#"action="https://github.com/settings/apps/new?state={state}""#
+            )),
+            "the action carries the extracted state nonce: {form}"
+        );
+        assert!(
             form.contains("127.0.0.1") && form.contains("/callback"),
             "the manifest must redirect back to this listener"
+        );
+        assert!(
+            !form.contains("<script>"),
+            "the loopback form waits for the operator's click, as it always has"
         );
 
         // A callback that did not come from this form is refused, and the
@@ -642,6 +684,13 @@ mod tests {
             Some("https://github.com/apps/preloop-local/installations/new"),
             "the browser is sent straight to the install page"
         );
+        let callback_body = callback.text().await.unwrap();
+        assert!(
+            !callback_body.contains("conversion-code")
+                && !callback_body.contains("BEGIN RSA PRIVATE KEY")
+                && !callback_body.contains("hook-secret"),
+            "the callback page must not echo code, PEM, or webhook secret: {callback_body}"
+        );
 
         client
             .get(format!(
@@ -654,13 +703,18 @@ mod tests {
         let registration = flow.await.unwrap().unwrap();
         assert_eq!(registration.credentials.id, 424242);
         assert_eq!(
-            registration.credentials.webhook_secret.as_deref(),
+            registration
+                .credentials
+                .webhook_secret
+                .as_ref()
+                .map(|secret| secret.expose()),
             Some("hook-secret")
         );
         assert!(
             registration
                 .credentials
                 .pem
+                .expose()
                 .contains("BEGIN RSA PRIVATE KEY")
         );
         assert_eq!(registration.installation_id, Some(99));
@@ -692,11 +746,11 @@ mod tests {
             axum::serve(api_listener, router).await
         });
         let flow =
-            tokio::spawn(
-                async move { register_on(listener, "preloop-local", None, None, &api).await },
-            );
+            tokio::spawn(async move { register_on(listener, "preloop-local", None, &api).await });
 
-        let client = reqwest::Client::new();
+        let client = preloop_runner_server::shared_http::with_tls_roots(reqwest::Client::builder())
+            .build()
+            .unwrap();
         let form = client
             .get(&base)
             .send()
@@ -719,90 +773,183 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
 
         let error = flow.await.unwrap().unwrap_err();
+        let error = format!("{error:#}");
         assert!(
-            format!("{error:#}").contains("code expired"),
-            "GitHub's reason must reach the operator: {error:#}"
+            error.contains("422 Unprocessable Entity"),
+            "the operator learns GitHub refused, with its status: {error}"
         );
-    }
-
-    #[test]
-    fn manifest_disables_webhooks_without_a_public_url() {
-        let manifest = manifest("preloop", "http://127.0.0.1:4000/callback", None);
         assert!(
-            manifest.get("hook_attributes").is_none(),
-            "GitHub rejects hook URLs it cannot reach over the public \
-             Internet (127.0.0.1), even when the hook is inactive; no \
-             public URL must mean no webhook configured"
-        );
-        assert!(manifest.get("default_events").is_none());
-        assert_eq!(
-            manifest["setup_url"], "http://127.0.0.1:4000/installed",
-            "the post-install redirect must return to this listener"
-        );
-        assert_eq!(manifest["public"], false);
-        assert_eq!(manifest["default_permissions"]["contents"], "read");
-    }
-
-    #[test]
-    fn manifest_points_webhooks_at_a_public_url() {
-        let manifest = manifest(
-            "preloop",
-            "http://127.0.0.1:4000/callback",
-            Some("https://ci.example.com/"),
-        );
-        assert_eq!(
-            manifest["hook_attributes"]["url"],
-            "https://ci.example.com/api/v1/github/webhooks"
-        );
-        assert_eq!(manifest["hook_attributes"]["active"], true);
-        let events = manifest["default_events"].as_array().unwrap();
-        assert!(events.iter().any(|e| e == "push"));
-        assert!(events.iter().any(|e| e == "pull_request"));
-    }
-
-    #[test]
-    fn creation_url_targets_the_org_when_given() {
-        assert_eq!(
-            creation_url(Some("acme"), "abc123"),
-            "https://github.com/organizations/acme/settings/apps/new?state=abc123"
-        );
-        assert_eq!(
-            creation_url(None, "abc123"),
-            "https://github.com/settings/apps/new?state=abc123"
+            !error.contains("code expired"),
+            "GitHub's response body stays in the log, not in the operator's error: {error}"
         );
     }
 
     #[test]
-    fn install_url_prefers_the_slug() {
-        let credentials = AppCredentials {
-            id: 7,
-            slug: Some("my-app".to_owned()),
-            pem: String::new(),
-            webhook_secret: None,
-            html_url: Some("https://github.com/apps/my-app".to_owned()),
-        };
+    fn browser_spec_splits_on_colons_and_places_the_url() {
+        let url = "http://127.0.0.1:8765";
         assert_eq!(
-            credentials.install_url().as_deref(),
-            Some("https://github.com/apps/my-app/installations/new")
+            browser_commands("helper.sh", url),
+            vec![vec!["helper.sh".to_owned(), url.to_owned()]],
+            "without %s the URL is the last argument"
         );
-        let without_slug = AppCredentials {
-            slug: None,
-            ..credentials
-        };
         assert_eq!(
-            without_slug.install_url().as_deref(),
-            Some("https://github.com/apps/my-app")
+            browser_commands("open -a Safari %s:firefox", url),
+            vec![
+                vec![
+                    "open".to_owned(),
+                    "-a".to_owned(),
+                    "Safari".to_owned(),
+                    url.to_owned()
+                ],
+                vec!["firefox".to_owned(), url.to_owned()],
+            ],
+            "%s is replaced in place, and each colon-separated entry is its own command"
         );
-    }
-
-    #[test]
-    fn manifest_attribute_escaping_cannot_close_the_attribute() {
-        let escaped = escape_attr(r#"{"name":"it's <b>"}"#);
-        assert!(!escaped.contains('\''), "single quotes must be escaped");
-        assert!(!escaped.contains('<'), "tags must be escaped");
         assert!(
-            escaped.contains(r#""name""#),
-            "double quotes stay literal inside a single-quoted attribute"
+            browser_commands(" : ", url).is_empty(),
+            "blank entries are skipped"
+        );
+        assert_eq!(
+            browser_commands("browser.sh --url=%s", "http://h/?a=1&b=2"),
+            vec![vec![
+                "browser.sh".to_owned(),
+                "--url=http://h/?a=1&b=2".to_owned()
+            ]],
+            "the URL stays one argument, never shell-parsed"
+        );
+    }
+
+    #[test]
+    fn browser_spec_honours_quotes_and_escapes() {
+        let url = "http://127.0.0.1:8765";
+        assert_eq!(
+            browser_commands("\"/opt/Remote Browser/bin/open\" %s", url),
+            vec![vec![
+                "/opt/Remote Browser/bin/open".to_owned(),
+                url.to_owned()
+            ]],
+            "a quoted path with a space is one program, not a token with quotes in it"
+        );
+        assert_eq!(
+            browser_commands("helper.sh '--url %s':firefox", url),
+            vec![
+                vec!["helper.sh".to_owned(), format!("--url {url}")],
+                vec!["firefox".to_owned(), url.to_owned()],
+            ],
+            "single quotes group a flag and its value, so the URL stays in place"
+        );
+        assert_eq!(
+            browser_commands(r"my\ helper %s", url),
+            vec![vec!["my helper".to_owned(), url.to_owned()]],
+            "a backslash escape joins words"
+        );
+        assert_eq!(
+            browser_commands("open -a \"Safari\"", url),
+            vec![vec![
+                "open".to_owned(),
+                "-a".to_owned(),
+                "Safari".to_owned(),
+                url.to_owned()
+            ]],
+            "quotes are removed from the argument they group"
+        );
+        assert!(
+            browser_commands("unterminated \"quote %s:firefox", url).len() == 1,
+            "an entry that cannot be parsed is skipped, not guessed at"
+        );
+        assert_eq!(
+            browser_commands("unterminated \"quote %s:firefox", url),
+            vec![vec!["firefox".to_owned(), url.to_owned()]],
+            "the next entry still gets its chance"
+        );
+    }
+
+    #[test]
+    fn ssh_target_is_the_address_the_laptop_connected_to() {
+        let target = SshTarget::from_env(
+            Some("203.0.113.7 40000 203.0.113.5 22"),
+            Some("alice"),
+            "build-box",
+        );
+        assert_eq!(target.host, "203.0.113.5");
+        assert_eq!(target.user, "alice");
+        assert_eq!(
+            target.forward_command(8765),
+            "ssh -L 8765:127.0.0.1:8765 alice@203.0.113.5",
+            "port 22 needs no -p"
+        );
+    }
+
+    #[test]
+    fn ssh_target_names_a_non_default_port_and_falls_back_without_the_variable() {
+        let target = SshTarget::from_env(
+            Some("203.0.113.7 40000 203.0.113.5 2222"),
+            Some("alice"),
+            "build-box",
+        );
+        assert_eq!(
+            target.forward_command(8765),
+            "ssh -L 8765:127.0.0.1:8765 -p 2222 alice@203.0.113.5"
+        );
+
+        let fallback = SshTarget::from_env(None, Some("bob"), "build-box");
+        assert_eq!(fallback.host, "build-box");
+        assert_eq!(fallback.port, None);
+        assert_eq!(
+            fallback.forward_command(8765),
+            "ssh -L 8765:127.0.0.1:8765 bob@build-box"
+        );
+
+        let anonymous = SshTarget::from_env(None, None, "build-box");
+        assert_eq!(anonymous.user, "<user>", "a placeholder, never a guess");
+    }
+
+    #[test]
+    fn ssh_target_brackets_ipv6_and_unmaps_ipv4() {
+        let v6 = SshTarget::from_env(Some("2001:db8::9 5000 2001:db8::5 22"), Some("a"), "h");
+        assert_eq!(
+            v6.forward_command(8765),
+            "ssh -L 8765:127.0.0.1:8765 a@[2001:db8::5]"
+        );
+        let mapped = SshTarget::from_env(
+            Some("::ffff:203.0.113.7 5000 ::ffff:203.0.113.5 22"),
+            Some("a"),
+            "h",
+        );
+        assert_eq!(mapped.host, "203.0.113.5");
+    }
+
+    #[test]
+    fn ssh_is_detected_from_either_variable() {
+        assert!(ssh_session_from_env(|name| {
+            (name == "SSH_CONNECTION").then(|| "x".to_owned())
+        }));
+        assert!(ssh_session_from_env(|name| {
+            (name == "SSH_TTY").then(|| "x".to_owned())
+        }));
+        assert!(!ssh_session_from_env(|_| None));
+        assert!(
+            !ssh_session_from_env(|name| (name == "SSH_TTY").then(|| "  ".to_owned())),
+            "a blank value counts as unset"
+        );
+    }
+
+    #[test]
+    fn guidance_names_the_forward_and_the_address_to_open() {
+        let target = SshTarget::from_env(
+            Some("203.0.113.7 40000 203.0.113.5 22"),
+            Some("alice"),
+            "build-box",
+        );
+        let text = forwarded_guidance(&target, SSH_FORWARD_PORT);
+        assert!(
+            text.contains("ssh -L 8765:127.0.0.1:8765 alice@203.0.113.5"),
+            "{text}"
+        );
+        assert!(text.contains("http://127.0.0.1:8765"), "{text}");
+        assert!(
+            text.contains("~/.ssh/config"),
+            "the host may need adjusting: {text}"
         );
     }
 }

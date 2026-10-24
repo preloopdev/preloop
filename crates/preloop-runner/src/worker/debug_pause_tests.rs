@@ -171,6 +171,7 @@ fn refresh_snapshot_tokens_replaces_only_pinned_steps() {
             env: Default::default(),
             raw: json!({}),
             is_background: false,
+            post_of: Vec::new(),
         },
         Step {
             id: "00000000-0000-0000-0000-000000000031".to_owned(),
@@ -186,6 +187,7 @@ fn refresh_snapshot_tokens_replaces_only_pinned_steps() {
             env: Default::default(),
             raw: json!({}),
             is_background: false,
+            post_of: Vec::new(),
         },
     ];
 

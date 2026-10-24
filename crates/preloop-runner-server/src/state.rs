@@ -758,6 +758,32 @@ pub type ActionResolvedUses =
 /// [`ActionResolvedUses`].
 pub const MAX_RESOLVED_USES_PER_RUN: usize = 4096;
 
+/// Nested `uses:` of composite manifests read through the GitHub contents API
+/// for runs without a workspace snapshot: (`owner/repo` lowercased, commit,
+/// composite directory) → the manifest's nested references, or `None` when the
+/// commit has no readable manifest there. Only definitive reads are memoised;
+/// a transient failure is retried on the next adjudication.
+pub type LocalCompositeNestedUses = std::sync::Mutex<
+    std::collections::HashMap<
+        (String, String, String),
+        Option<(std::collections::BTreeSet<String>, Vec<String>)>,
+    >,
+>;
+
+/// Maximum entries in [`LocalCompositeNestedUses`]. A full memo is cleared
+/// rather than evicted entry by entry; clearing only costs re-reads.
+pub const MAX_LOCAL_COMPOSITE_MEMO: usize = 4096;
+
+/// Remote actions a run's local composites reach, per run. A run's answer is
+/// fixed by its immutable commit, so a traversal that reached a definitive
+/// answer is remembered; see `local_composite_declared_for_run`.
+pub type LocalCompositeDeclared =
+    std::sync::Mutex<std::collections::HashMap<RunId, Arc<std::collections::BTreeSet<String>>>>;
+
+/// Maximum runs in [`LocalCompositeDeclared`]. A full memo is cleared, which
+/// only costs a re-traversal.
+pub const MAX_LOCAL_COMPOSITE_DECLARED_RUNS: usize = 1024;
+
 /// (slug, PAT fingerprint) → repository metadata with the instant it was
 /// recorded. The fingerprint keeps a PAT-scoped answer (e.g. private
 /// visibility) from leaking into a later anonymous lookup for the same
@@ -869,8 +895,7 @@ pub struct AppState {
     /// Per-subsystem consumption accounting for outbound GitHub traffic
     /// (requests, bytes, rate limits, breaker-blocked attempts). Only the
     /// labeled sender ([`crate::github_breaker::send_observed_labeled`])
-    /// records here; the unlabeled [`crate::github_breaker::send_observed`]
-    /// covers only pre-`AppState` bootstrap reads and records nothing.
+    /// records here.
     pub github_consumption: Arc<crate::github_breaker::GithubConsumption>,
     /// Live status published by the delivery watchdog and App webhook health
     /// monitor.
@@ -952,6 +977,17 @@ pub struct AppState {
     /// checkouts before housekeeping deletes it. Zero discards immediately.
     /// Env: `PRELOOP_SNAPSHOT_RETENTION_SECONDS` (default 1800).
     pub snapshot_retention_seconds: u64,
+    /// Ceiling, in bytes, for the shared snapshot object cache under
+    /// `<state_dir>/snapshot-object-cache`. This cache is never garbage
+    /// collected in place (a live snapshot alternates to it), so the size
+    /// sweep is what keeps it bounded. Entries referenced by a snapshot or
+    /// locked by a capture are never evicted. `0` disables the sweep.
+    /// Env: `PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES` (default 100 GiB).
+    pub snapshot_object_cache_max_bytes: u64,
+    /// Single-flight ownership of the object-cache sweep, scoped to this
+    /// engine's state directory. Startup and post-capture sweeps share it; a
+    /// second engine (or test state) is not suppressed by this one.
+    pub snapshot_object_cache_sweep: Arc<crate::snapshots::SnapshotObjectCacheSweep>,
     /// Run/check/status retention, in days, mirroring GitHub's Actions
     /// retention setting. The retention sweep deletes terminal runs (plus
     /// their checks, statuses, artifacts, and logs) older than this.
@@ -1042,6 +1078,12 @@ pub struct AppState {
     /// Per-run ledger of already-resolved (`owner/repo`, `ref`) triples;
     /// see [`ActionResolvedUses`].
     pub action_resolved_uses: Arc<ActionResolvedUses>,
+    /// Memo for composite manifests read through the GitHub contents API for
+    /// runs without a workspace snapshot; see [`LocalCompositeNestedUses`].
+    pub local_composite_nested_uses: Arc<LocalCompositeNestedUses>,
+    /// Remote actions reached through a run's local composites, per run; see
+    /// [`LocalCompositeDeclared`].
+    pub local_composite_declared: Arc<LocalCompositeDeclared>,
     /// Short-TTL cache of GitHub repository metadata (`slug`, PAT
     /// fingerprint) → `(repository_id, private)` with the instant it was
     /// recorded. Keeps local snapshot creation from paying a forge API call
@@ -1081,11 +1123,20 @@ pub struct AppState {
     /// to one file for its whole life and cannot be retargeted underneath
     /// itself by a later environment change.
     pub config_path: PathBuf,
+    /// Engine-hosted GitHub App setup: the one live setup session, its
+    /// one-time link, and the browser-route rate limit. Node-local and
+    /// in-memory by design: a setup lasts minutes, and a restart ends it.
+    pub github_setup: Arc<crate::github_app_setup::session::SetupSessions>,
     /// `GITHUB_TOKEN` permissions ceiling loaded from the config file at
     /// startup. `None` (absent table) = no ceiling; today's behavior is
     /// unchanged. A config change takes effect on restart, like the other
     /// policy tables in the config file.
     pub token_permissions_ceiling: Option<crate::config::TokenPermissionsCeiling>,
+    /// OIDC immutable-subject override loaded from the config file's
+    /// `[oidc]` table at startup. `None` = GitHub's creation-date rollout
+    /// policy decides the subject format. A config change takes effect on
+    /// restart, like the other policy tables in the config file.
+    pub oidc_immutable_subject_claims: Option<bool>,
     /// Fork pull-request workflow policy loaded from the config file at
     /// startup. Empty by default: fork-PR workflows run as today until the
     /// operator writes `[fork_policy]` rules. A config change takes effect
@@ -1307,7 +1358,7 @@ impl AppState {
     /// whole life, and lets tests point at a temp file without mutating
     /// process-wide environment state that other tests race against.
     pub async fn new_with_config(state_dir: PathBuf, config_path: PathBuf) -> anyhow::Result<Self> {
-        Self::new_with_store(state_dir, config_path, None).await
+        Self::new_with_store(state_dir, config_path, None, None).await
     }
 
     /// [`AppState::new_with_config`] against an explicit store URL.
@@ -1321,6 +1372,7 @@ impl AppState {
         state_dir: PathBuf,
         config_path: PathBuf,
         store_url: Option<&str>,
+        github: Option<crate::github_breaker::GithubFunnel>,
     ) -> anyhow::Result<Self> {
         // Test binaries share one process env: a sibling test mutating
         // `PRELOOP_STORE_URL` must not silently retarget a state built for a
@@ -1466,23 +1518,24 @@ impl AppState {
         let max_jobs_per_run = crate::config::max_jobs_per_run(&config)?;
         let diag_staging_max_age_seconds =
             crate::config::diag_staging_max_age_hours(&config)?.saturating_mul(3600);
-        let github_apps = crate::github_app::load_from(&config)?;
+        // The process's outbound-GitHub funnel. The embedding engine supplies
+        // its own (`ServerConfig::github`) so the runner pool's golden
+        // downloads resolve through the same breakers and accounting as the
+        // webhook path; the standalone server and tests get a private one.
+        let github = github.unwrap_or_default();
+        let github_breakers = Arc::clone(&github.breakers);
+        let github_consumption = Arc::clone(&github.consumption);
+        // Attached before `github_app` is cloned from the registry, so the
+        // legacy field reports through the same breaker and accounting.
+        let github_apps = crate::github_app::load_from(&config)?
+            .map(|apps| apps.with_github_accounting(&github_breakers, &github_consumption));
         let github_app = github_apps
             .as_ref()
             .map(|registry| registry.default_app().clone());
         // Env wins over the config file, matching every other credential
         // here. An empty value in either source counts as unset: a blank
         // export must not disable signature verification silently.
-        let webhook_secret = env::var("PRELOOP_WEBHOOK_SECRET")
-            .ok()
-            .filter(|secret| !secret.is_empty())
-            .or_else(|| {
-                config
-                    .github
-                    .webhook_secret()
-                    .filter(|secret| !secret.is_empty())
-                    .map(str::to_owned)
-            });
+        let webhook_secret = crate::config::webhook_secret_from_env_or_config(&config);
         // Env wins over the config file, matching every other `PRELOOP_GITHUB_*`
         // override. An empty value in either source counts as unset.
         let github_pat = env::var("PRELOOP_GITHUB_TOKEN")
@@ -1670,8 +1723,8 @@ impl AppState {
             message_notify,
             sampler_notify,
             webhook_queue_notify: Arc::new(Notify::new()),
-            github_breakers: Arc::new(crate::github_breaker::GithubBreakerRegistry::default()),
-            github_consumption: Arc::new(crate::github_breaker::GithubConsumption::default()),
+            github_breakers,
+            github_consumption,
             webhook_status: Arc::new(crate::webhook_status::WebhookResilienceStatus::default()),
             webhook_retry_backoff: crate::github::WEBHOOK_RETRY_BACKOFF.to_vec(),
             fresh_merge_poll: crate::github::FreshMergePoll::default(),
@@ -1705,6 +1758,11 @@ impl AppState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30 * 60),
+            snapshot_object_cache_max_bytes: env::var("PRELOOP_SNAPSHOT_OBJECT_CACHE_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100 * 1024 * 1024 * 1024),
+            snapshot_object_cache_sweep: crate::snapshots::SnapshotObjectCacheSweep::new(),
             retention_days,
             max_jobs_per_run,
             diag_staging_max_age_seconds,
@@ -1739,8 +1797,16 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             action_resolved_uses: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            local_composite_nested_uses: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            local_composite_declared: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             config_path,
+            github_setup: Arc::new(crate::github_app_setup::session::SetupSessions::new()),
             token_permissions_ceiling: config.token_permissions_ceiling.clone(),
+            oidc_immutable_subject_claims: config.oidc.immutable_subject_claims,
             fork_policy: config.fork_policy.clone(),
             execution_protection: config.execution_protection.clone(),
             pending_registrations: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
@@ -2189,6 +2255,18 @@ pub struct InnerState {
     /// secrets on each log chunk.
     pub plan_secret_masker: BTreeMap<String, Arc<Vec<String>>>,
     pub plan_secret_masker_pending: BTreeMap<String, (Arc<Vec<String>>, std::time::Instant)>,
+    /// Runtime-minted mask values (today: the OIDC `id_token`, registered at
+    /// mint by [`crate::timeline_logs::register_runtime_mask_value`]), keyed
+    /// by the same plan/run scope keys as `plan_secret_masker`. Provider
+    /// secrets never change after submit, but these arrive while the job is
+    /// already logging, so they are tracked separately and merged into every
+    /// scope write (`plan_secret_masker`/`plan_secret_masker_pending`) and
+    /// into every cold resolution — a resolution that raced a registration
+    /// must never cache a scope that predates it. Each scope holds at most
+    /// `MAX_RUNTIME_MASKS_PER_SCOPE` values (oldest dropped first: a job may
+    /// mint a token per call), and a run's entries are dropped with the run
+    /// (see `memory_caps::remove_run_everywhere`).
+    pub plan_runtime_masks: BTreeMap<String, Vec<String>>,
     /// Chunk-boundary-safe streaming log maskers for the AzDO append path,
     /// keyed by log key (`{plan_id}/{log_id}`). Each masker holds a
     /// trailing-overlap buffer so a secret split across two appends is
@@ -2199,14 +2277,14 @@ pub struct InnerState {
     /// withheld tail from the lossy in-memory preview.
     ///
     /// The masker is built from the secret list resolved at the log's first
-    /// append and never reseeded: run secrets are immutable, and the only
-    /// alternative first-append resolution (the negative-cache union) is a
-    /// superset of the real list, so the masker can only over-mask, never
-    /// under-mask.
-    pub log_stream_maskers: BTreeMap<
-        String,
-        std::sync::Arc<tokio::sync::Mutex<preloop_gha_protocol::masking::StreamingMasker>>,
-    >,
+    /// append and only widened afterward (`PlanLogMasker::extend`): run
+    /// secrets are immutable, the only alternative first-append resolution
+    /// (the negative-cache union) is a superset of the real list, and a
+    /// runtime-registered value (see `plan_runtime_masks`) rebuilds the
+    /// masker from its own source list — so the masker can only over-mask,
+    /// never under-mask.
+    pub log_stream_maskers:
+        BTreeMap<String, std::sync::Arc<tokio::sync::Mutex<crate::timeline_logs::PlanLogMasker>>>,
     /// Reaper starvation marks (node-local): when this node
     /// first saw each ready job that no registered runner matches. Cleared
     /// once a runner matches, while a pool is preparing, or when the job
@@ -2247,6 +2325,14 @@ pub struct InnerState {
     pub diag_upload_tokens: BTreeMap<String, DiagUploadToken>,
     /// Artifact v2 finalized registry: registry_key → metadata.
     pub artifact_v2_registry: BTreeMap<String, ArtifactV2Entry>,
+    /// OIDC repository `created_at` cache: repository ID → creation time
+    /// (Unix seconds). In-memory only, per process: a restart starts
+    /// empty and simply re-fetches, which is safe because an ID's
+    /// creation date never changes. Keyed by ID, never by name: a
+    /// deleted-and-recreated repository gets a new ID and must never
+    /// inherit its predecessor's cached date. Entries never expire; the
+    /// map is a pure cache (a miss costs one GitHub API call).
+    pub oidc_repo_created_at: BTreeMap<String, i64>,
     /// Monotonic artifact v2 ID counter.
     pub next_artifact_v2_id: u64,
     /// OIDC issuer URL used in the `iss` claim and discovery document.

@@ -1,0 +1,347 @@
+// Preloop Sandbox Service contract, v1.
+//
+// Two services share one package:
+//   * Sandboxes — what callers (the CI fleet adapter, code review, agents,
+//     the `preloop sandbox` CLI) use to obtain and drive machines.
+//   * Providers — what capacity owners (host agents, connectors, third
+//     parties) dial into: register, heartbeat, long-poll for work, report.
+//
+// Wire: the Connect protocol, JSON codec (`application/json` for unary,
+// `application/connect+json` enveloped frames for server streaming). Every
+// RPC is unary or server-streaming so the whole API works over HTTP/1.1
+// (proxies, Tailscale Funnel, NAT'd hosts dialing out). Bulk bytes never
+// travel inside RPCs: `OpenStream` returns a short-lived ticket and the
+// bytes move as a tar stream over plain HTTP `PUT`/`GET`.
+//
+// The Rust types in `crates/preloop-sandbox/src/api.rs` mirror this file
+// field-for-field using the proto3 JSON mapping: lowerCamelCase names,
+// enums as their value names (`"DESTROY"`), bytes as base64, oneof members
+// as optional fields of which at most one is set.
+syntax = "proto3";
+
+package preloop.sandbox.v1;
+
+// ─── Shared model ─────────────────────────────────────────────────────
+
+// What a driver can do. Placement filters on this; nothing branches on
+// driver names.
+message Capabilities {
+  string os = 1;                    // linux | macos | windows
+  repeated string arch = 2;         // x86_64 | aarch64
+  repeated string features = 3;     // docker, display, simulator, xcode, …
+  bool pause = 4;
+  bool snapshot = 5;                // capture a sandbox as a new template
+  bool fork = 6;
+  bool socket_mounts = 7;           // host Unix sockets into the guest
+  bool host_mounts = 8;             // live host directories
+  repeated NetworkMode network_modes = 9;
+  uint32 slots = 10;                // max concurrent sandboxes on this owner
+  bool native_pool = 11;            // backend keeps its own warm pool
+  bool one_shot = 12;               // one command per sandbox (require `multi_exec` to avoid)
+}
+
+enum NetworkMode {
+  NETWORK_MODE_UNSPECIFIED = 0;
+  DISABLED = 1;
+  UNRESTRICTED = 2;
+  PUBLIC_ONLY = 3;                  // internet, no private/loopback ranges
+  RESTRICTED = 4;                   // allow-list of hosts/CIDRs
+}
+
+message NetworkPolicy {
+  NetworkMode mode = 1;
+  repeated string hosts = 2;
+  repeated string cidrs = 3;
+}
+
+message Shape {
+  uint32 cpus = 1;
+  uint32 memory_mib = 2;
+  uint32 disk_gib = 3;
+}
+
+message Requirements {
+  string os = 1;
+  string arch = 2;
+  repeated string features = 3;
+  repeated string capabilities = 4; // pause | snapshot | fork | socket_mounts | host_mounts | multi_exec
+  string driver = 5;                // escape hatch; normally empty
+}
+
+message Mount {
+  string host = 1;
+  string guest = 2;
+  bool readonly = 3;
+}
+
+message SocketMount {
+  string host = 1;
+  string guest = 2;
+}
+
+// A logical image. Backends materialize it in their own format.
+message TemplateSpec {
+  string name = 1;
+  string os = 2;
+  oneof source {
+    string image = 3;               // OCI reference (digest-pinned)
+    string recipe = 4;              // opaque recipe interpreted by the driver
+    string snapshot_of = 5;         // sandbox id captured by Snapshot
+  }
+  map<string, string> images_by_arch = 6; // per-arch OCI digests
+  Requirements requires = 7;
+  map<string, string> labels = 8;
+}
+
+message Template {
+  TemplateSpec spec = 1;
+  string digest = 2;                // sha256 of the canonical spec
+  string provider_id = 3;           // set for snapshots: where it can start
+  string native_ref = 4;            // set for snapshots
+  int64 created_at = 5;
+  string driver = 6;                // set for snapshots
+}
+
+message PoolSpec {
+  string name = 1;
+  string template = 2;
+  Shape shape = 3;
+  NetworkPolicy network = 4;
+  uint32 warm = 5;                  // idle ready sandboxes to keep
+  uint32 max = 6;                   // 0 = unbounded
+  Requirements requires = 7;
+  repeated Mount mounts = 8;
+  repeated SocketMount sockets = 9;
+  map<string, string> options = 10; // driver hints (dns, rosetta, …)
+  uint64 lease_ttl_secs = 11;
+}
+
+enum Purpose {
+  PURPOSE_UNSPECIFIED = 0;
+  RUNNER = 1;
+  EXEC = 2;
+  SESSION = 3;
+  BUILD = 4;                        // template bake; started snapshot-capable
+}
+
+message FileSpec {
+  string path = 1;
+  bytes data = 2;                   // base64 in JSON
+  uint32 mode = 3;                  // octal; 0 = 0600 (guest owner only)
+}
+
+message Inject {
+  map<string, string> env = 1;
+  repeated FileSpec files = 2;
+}
+
+enum SandboxState {
+  SANDBOX_STATE_UNSPECIFIED = 0;
+  PROVISIONING = 1;
+  READY = 2;                        // warm, unleased
+  LEASED = 3;
+  PAUSED = 4;
+  STOPPED = 9;                      // powered off, disk retained
+  PRESERVED = 5;
+  TERMINATING = 6;
+  GONE = 7;
+  FAILED = 8;
+}
+
+message Sandbox {
+  string id = 1;
+  string template = 2;
+  string pool = 3;
+  string provider_id = 4;
+  string driver = 5;
+  string native_ref = 6;
+  uint64 incarnation = 7;
+  SandboxState state = 8;
+  Purpose purpose = 9;
+  string lease_id = 10;
+  string error = 11;
+  int64 created_at = 12;
+  string name = 13;
+  int64 preserve_until = 14;
+  SandboxState prior_state = 15;    // state before Pause/Stop; Resume/Start restores it
+  string pool_revision = 16;        // pool+template configuration this member was built for
+}
+
+message Lease {
+  string id = 1;
+  string sandbox_id = 2;
+  string pool = 3;
+  string idempotency_key = 4;
+  int64 expires_at = 5;
+  map<string, string> env = 6;      // merged into every Exec on this lease
+  uint64 requested_ttl_secs = 7;    // caller's TTL; delivery restores it
+}
+
+// ─── Sandboxes (callers) ──────────────────────────────────────────────
+
+service Sandboxes {
+  rpc PutTemplate(PutTemplateRequest) returns (Template);
+  rpc ListTemplates(ListRequest) returns (ListTemplatesResponse);
+  rpc DeleteTemplate(DeleteTemplateRequest) returns (Empty);
+  rpc PutPool(PutPoolRequest) returns (PoolSpec);
+  rpc ListPools(ListRequest) returns (ListPoolsResponse);
+  rpc DeletePool(DeletePoolRequest) returns (Empty);
+  rpc Acquire(AcquireRequest) returns (AcquireResponse);
+  rpc Renew(RenewRequest) returns (Lease);
+  rpc Release(ReleaseRequest) returns (Empty);
+  rpc Get(GetRequest) returns (Sandbox);
+  rpc List(ListRequest) returns (ListSandboxesResponse);
+  rpc Exec(ExecRequest) returns (stream ExecEvent);
+  rpc OpenStream(OpenStreamRequest) returns (Ticket);
+  rpc Snapshot(SnapshotRequest) returns (Template);
+  rpc Stop(GetRequest) returns (Empty);
+  rpc Start(StartRequest) returns (Empty);
+  rpc Pause(GetRequest) returns (Empty);
+  rpc Resume(GetRequest) returns (Empty);
+  rpc ListProviders(ListRequest) returns (ListProvidersResponse);
+}
+
+message Empty {}
+message ListRequest {}
+message PutTemplateRequest { TemplateSpec template = 1; }
+message ListTemplatesResponse { repeated Template templates = 1; }
+message DeleteTemplateRequest { string name = 1; }
+message PutPoolRequest { PoolSpec pool = 1; }
+message ListPoolsResponse { repeated PoolSpec pools = 1; }
+message DeletePoolRequest { string name = 1; }
+
+message AcquireRequest {
+  string idempotency_key = 1;       // required; same key → same lease
+  string pool = 2;                  // either pool …
+  string template = 3;              // … or template (+ shape/requires)
+  Shape shape = 4;
+  Requirements requires = 5;
+  Purpose purpose = 6;
+  uint64 ttl_secs = 7;
+  Inject inject = 8;
+  NetworkPolicy network = 9;
+  repeated Mount mounts = 10;
+  repeated SocketMount sockets = 11;
+  map<string, string> options = 12;
+  uint64 wait_secs = 13;            // block until the sandbox is ready
+  string name = 14;                 // optional, unique among live sandboxes
+}
+message AcquireResponse { Lease lease = 1; Sandbox sandbox = 2; }
+message RenewRequest { string lease_id = 1; uint64 ttl_secs = 2; }
+
+enum ReleaseMode {
+  RELEASE_MODE_UNSPECIFIED = 0;
+  DESTROY = 1;
+  PRESERVE = 2;                     // keep for debugging until ttl
+}
+message ReleaseRequest { string lease_id = 1; ReleaseMode mode = 2; uint64 preserve_ttl_secs = 3; }
+message GetRequest { string sandbox_id = 1; }
+message ListSandboxesResponse { repeated Sandbox sandboxes = 1; }
+
+message ExecRequest {
+  string sandbox_id = 1;
+  repeated string argv = 2;
+  map<string, string> env = 3;
+  string workdir = 4;
+  string user = 5;
+  uint64 timeout_secs = 6;
+  bytes stdin = 7;
+}
+message ExecEvent {
+  oneof event {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    int32 exit_code = 3;
+  }
+}
+
+enum StreamKind {
+  STREAM_KIND_UNSPECIFIED = 0;
+  UPLOAD = 1;                       // client PUTs a tar, extracted at path
+  DOWNLOAD = 2;                     // client GETs a tar of path
+}
+message OpenStreamRequest { string sandbox_id = 1; StreamKind kind = 2; string path = 3; }
+message Ticket { string url = 1; string token = 2; int64 expires_at = 3; }
+message SnapshotRequest { string sandbox_id = 1; string name = 2; }
+message StartRequest { string sandbox_id = 1; bool forkable = 2; }
+message ListProvidersResponse { repeated Provider providers = 1; }
+
+// ─── Providers (capacity owners) ──────────────────────────────────────
+
+service Providers {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (Empty);
+  rpc Poll(PollRequest) returns (PollResponse);   // long-poll
+  rpc Report(ReportRequest) returns (Empty);      // fenced by generation
+  rpc ReportExec(ReportExecRequest) returns (Empty);
+  rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+}
+
+message DriverInfo { string driver = 1; Capabilities capabilities = 2; }
+
+message Provider {
+  string id = 1;
+  string name = 2;
+  uint64 generation = 3;
+  repeated DriverInfo drivers = 4;
+  int64 last_seen = 5;
+}
+
+message RegisterRequest { string name = 1; repeated DriverInfo drivers = 2; }
+message RegisterResponse { string provider_id = 1; uint64 generation = 2; }
+message HeartbeatRequest { string provider_id = 1; uint64 generation = 2; }
+message PollRequest { string provider_id = 1; uint64 generation = 2; uint64 wait_secs = 3; }
+
+message CreateWork {
+  string sandbox_id = 1;
+  uint64 incarnation = 2;
+  string driver = 3;
+  Template template = 4;
+  Shape shape = 5;
+  NetworkPolicy network = 6;
+  repeated Mount mounts = 7;
+  repeated SocketMount sockets = 8;
+  map<string, string> options = 9;
+  bool snapshot_capable = 10;
+  string name = 11;                 // caller-chosen; used as the native name
+}
+message SandboxWork { string sandbox_id = 1; string driver = 2; string native_ref = 3; }
+message ExecWork { string exec_id = 1; SandboxWork target = 2; ExecRequest request = 3; }
+message CopyWork { SandboxWork target = 1; string ticket = 2; string path = 3; StreamKind kind = 4; }
+message SnapshotWork { SandboxWork target = 1; string template = 2; }
+message StartWork { SandboxWork target = 1; bool forkable = 2; }
+
+message WorkItem {
+  string id = 1;
+  oneof work {
+    CreateWork create = 2;
+    SandboxWork destroy = 3;
+    ExecWork exec = 4;
+    CopyWork copy = 5;
+    SnapshotWork snapshot = 6;
+    SandboxWork pause = 7;
+    SandboxWork resume = 8;
+    SandboxWork stop = 9;
+    StartWork start = 10;
+  }
+}
+message PollResponse { repeated WorkItem work = 1; }
+
+message ReportRequest {
+  string provider_id = 1;
+  uint64 generation = 2;
+  string work_id = 3;
+  bool ok = 4;
+  string error = 5;
+  string native_ref = 6;            // create / snapshot result
+}
+message ReportExecRequest {
+  string provider_id = 1;
+  uint64 generation = 2;
+  string exec_id = 3;
+  repeated ExecEvent events = 4;
+}
+
+message Observed { string driver = 1; string native_ref = 2; string sandbox_id = 3; uint64 incarnation = 4; }
+message ReconcileRequest { string provider_id = 1; uint64 generation = 2; repeated Observed sandboxes = 3; }
+message ReconcileResponse { repeated SandboxWork destroy = 1; }

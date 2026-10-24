@@ -701,6 +701,28 @@ impl LiteBackend {
                     }
                 }
             }
+            // Poll and lease ages, so a busy pool can be told from a wedged
+            // one: the snapshot used to leave both blank. SQL returns the
+            // oldest instant; the age is computed against this read's clock.
+            inputs.max_poll_age_seconds = tx
+                .prepare_cached(
+                    "SELECT MIN(last_seen_at) FROM runner_sessions \
+                     WHERE runner_id IS NOT NULL AND last_seen_at IS NOT NULL",
+                )
+                .map_err(db)?
+                .query_row([], |row| row.get::<_, Option<i64>>(0))
+                .map_err(db)?
+                .map(|oldest| (now_us().saturating_sub(oldest).max(0) / 1_000_000) as u64);
+            inputs.max_lease_age_seconds = tx
+                .prepare_cached(
+                    "SELECT MIN(l.renewed_at) FROM job_leases l \
+                     JOIN job_requests q ON q.request_id = l.request_id \
+                     WHERE q.result IS NULL AND l.renewed_at IS NOT NULL",
+                )
+                .map_err(db)?
+                .query_row([], |row| row.get::<_, Option<i64>>(0))
+                .map_err(db)?
+                .map(|oldest| (now_us().saturating_sub(oldest).max(0) / 1_000_000) as u64);
             // Live runner -> job pairings: the same rows the status page's
             // `live_assignments` reads (a live session must still own the
             // attempt).

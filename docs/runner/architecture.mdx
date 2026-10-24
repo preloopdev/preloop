@@ -1,0 +1,60 @@
+---
+title: Runner architecture
+description: How preloop-runner's listener and per-job worker processes poll, execute, cancel, and report GitHub Actions jobs.
+---
+
+`preloop-runner` contains the two responsibilities that the official runner separates into `Runner.Listener` and `Runner.Worker`. The listener owns the long-lived connection and starts one worker child process for each job. The worker owns the job lease, step execution, and result reporting.
+
+![Runner listener, worker, and job flow](/diagrams/runner-listener-worker.svg)
+
+## Listener process
+
+When `preloop-runner run` starts, the listener:
+
+1. Loads `.runner`, `.credentials`, and `.credentials_rsaparams` from the runner root.
+2. Uses the stored RSA key to request an OAuth access token. It refreshes the token before its server-reported expiry.
+3. Creates a runner session and long-polls for messages. The default `broker` path uses the current job service. `--via azdo` selects the older distributed-task session and message path.
+4. Acknowledges a job request, then acquires the complete payload from its run-service URL when one is provided. Local messages can already contain the full payload. It starts a worker child for the job.
+5. Keeps polling while the worker runs. Polls advertise `Online` when idle and `Busy` while a worker is active, so cancellation messages can arrive during a job.
+6. Deletes the session when it stops.
+
+The listener owns one active worker at a time. If a new job request arrives while one is active, it asks the existing worker to cancel, waits for it to drain or kills it after the cancellation window, and then dispatches the new request.
+
+## Worker process
+
+The listener starts the hidden worker command from the same binary. It sends newline-delimited JSON over the worker's standard input:
+
+- `job` contains the acquired job payload.
+- `cancel` asks the worker to stop with a timeout.
+- `shutdown` asks it to finish the current job and exit.
+
+The worker reads the job, then keeps a separate stdin reader open for cancellation and shutdown messages. The listener drains and forwards the worker's output while retaining a bounded tail for crash diagnostics.
+
+For each job, the worker:
+
+1. Renews the job lease before touching the workspace. If the first renewal cannot establish a valid lease, it runs no steps and reports the job as abandoned or canceled.
+2. Creates the workspace below the runner root, prepares remote actions, and builds the job environment and GitHub context.
+3. Runs the workflow steps in order. Shell `run:` steps execute as child processes; `uses:` steps dispatch according to their action manifest:
+   - Node actions use the bundled Node 20 or Node 24 runtime.
+   - Composite actions expand into nested steps.
+   - Docker actions and job containers use the `docker` CLI.
+4. Renews the job lease in the background while steps run. Losing the lease stops normal execution and reports the failure.
+
+The worker is a separate process so a worker failure does not directly terminate the listener. The listener checks both the worker exit status and the worker's completion report before treating a job as complete. If the worker exits without an acknowledged completion, the listener force-fails the job when it can still reach the service.
+
+## Logs, timelines, and completion
+
+The worker reports through the service advertised in the job payload:
+
+- Step transitions go through the workflow-step results service on the broker path, or timeline records on the AzDO path.
+- Console output is sent to a live results WebSocket on a best-effort basis.
+- Step and job logs are uploaded through signed blob URLs. These uploads are the durable log record even when live streaming is unavailable.
+- The final `completejob` request carries the job conclusion, step results, annotations, and outputs. The worker logs whether the server acknowledged that request.
+
+## Cancellation and shutdown
+
+A server `JobCancellation` message is matched to the active job ID and forwarded once to the worker. The runner uses the supplied timeout, defaults an absent timeout to 300 seconds, and clamps shorter values to 60 seconds. It hard-kills the worker 15 seconds before the effective timeout; the kill covers the worker's process tree so child shell and action processes do not remain behind.
+
+Ctrl-C, SIGTERM, and a service `RunnerShutdown` message use a separate 60-second graceful shutdown window. The listener asks the worker to shut down, waits for completion, then kills it if it does not exit in time and force-completes it as canceled. A worker-reported failure is force-completed as failed. It removes the broker session before exiting.
+
+`--once` and a runner configured with `--ephemeral` return after the first job completes. The listener still performs the normal completion and session cleanup path before returning.

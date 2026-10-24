@@ -400,30 +400,28 @@ impl Scheduler {
             );
             return;
         };
-        let client = crate::shared_http::CLIENT.clone();
         let api_base = shared.state.github_urls.api_url.trim_end_matches('/');
-        let metadata = match client
-            .get(format!("{api_base}/repos/{repository}"))
-            .header("User-Agent", "preloop")
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
+        // The startup scan is a workflow surface (it installs the repository's
+        // remote schedules) on the operator's static PAT (or an App token when
+        // one is configured), so it is observed under that credential's
+        // budget.
+        let credential = crate::github_breaker::GithubCredential::bearer(
+            token.as_str(),
+            crate::github_breaker::GithubCredentialBucket::Pat,
+        );
+        let metadata = match crate::github_breaker::send_github_json(
+            &shared.state,
+            &credential,
+            crate::github_breaker::GithubSubsystem::Workflows,
+            reqwest::Method::GET,
+            &format!("{api_base}/repos/{repository}"),
+            None,
+        )
+        .await
         {
-            Ok(response) if response.status().is_success() => response,
-            Ok(response) => {
-                warn!(status = %response.status(), "scheduler: remote repository metadata fetch failed");
-                return;
-            }
-            Err(error) => {
-                warn!(?error, "scheduler: remote repository metadata fetch failed");
-                return;
-            }
-        };
-        let metadata: serde_json::Value = match metadata.json().await {
             Ok(value) => value,
             Err(error) => {
-                warn!(?error, "scheduler: remote repository metadata parse failed");
+                warn!(?error, "scheduler: remote repository metadata fetch failed");
                 return;
             }
         };
@@ -435,28 +433,22 @@ impl Scheduler {
             .and_then(|value| value.as_str())
             .unwrap_or("main")
             .to_owned();
-        let sha = match client
-            .get(format!(
-                "{api_base}/repos/{repository}/commits/{default_branch}"
-            ))
-            .header("User-Agent", "preloop")
-            .header("Authorization", format!("Bearer {token}"))
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => response
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|commit| {
-                    commit
-                        .get("sha")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_owned)
-                }),
-            _ => None,
-        };
+        let sha = crate::github_breaker::send_github_json(
+            &shared.state,
+            &credential,
+            crate::github_breaker::GithubSubsystem::Workflows,
+            reqwest::Method::GET,
+            &format!("{api_base}/repos/{repository}/commits/{default_branch}"),
+            None,
+        )
+        .await
+        .ok()
+        .and_then(|commit| {
+            commit
+                .get("sha")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        });
         if let Some(hb) = &heartbeat {
             hb.beat();
         }

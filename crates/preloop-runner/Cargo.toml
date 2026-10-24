@@ -44,7 +44,7 @@ tokio-tungstenite.workspace = true
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
-webpki-roots = "0.26"
+webpki-roots = "1.0.10"
 percent-encoding = "2"
 tracing-subscriber.workspace = true
 uuid.workspace = true

@@ -1,0 +1,114 @@
+---
+title: Pull requests without webhooks
+description: Submit CI directly, then publish the exact tested commit and optionally open a pull request.
+---
+
+Submit-driven CI is useful when a GitHub webhook cannot reach the control plane, when a branch needs a check before its first push, or when you want to test a working-tree snapshot before opening a pull request. The run starts from the CLI; GitHub access is still needed for operations such as loading actions, checking out private repositories, publishing checks, and creating a pull request.
+
+## Before you start
+
+Use a feature branch with a GitHub `origin`. Push-back uses your local Git credentials; the control plane never receives permission to push. The branch must be a real `refs/heads/...` branch, and push-back refuses the repository's default branch.
+
+For reliable Check Run reporting, configure a GitHub App with `checks: write`. Creating a pull request also needs `pull_requests: write`. Configure `PRELOOP_PUBLIC_URL` with an address that GitHub viewers can reach if Check Runs should link back to the run page. A local-only URL leaves the check summary without a public details link.
+
+## Choose a command
+
+| Command | Result |
+|---|---|
+| `preloop run -f .github/workflows/ci.yml` | Submit and run CI without publishing a branch or pull request. |
+| `preloop run --push -f .github/workflows/ci.yml` | After a terminal result, push the tested commit and report its checks. An existing pull request for the branch is updated; no new one is requested by this command. |
+| `preloop run --push --create-pr -f .github/workflows/ci.yml` | Push the tested commit and create a pull request when the branch has none. New pull requests are drafts by default. |
+| `preloop run --push --create-pr --pr-draft=false -f .github/workflows/ci.yml` | Create a ready-for-review PR instead of a draft. |
+| `preloop push RUN_ID` | Publish a completed `--push` run from the checkout where it was submitted. The operation is idempotent. |
+| `preloop push` | Publish the control plane's most recent run. Pass an ID on a shared engine so another user's run is not selected. |
+
+`--create-pr` implies `--push`. A plain `preloop run` does not request push-back, although workflow loading and job actions can still use GitHub or other network services.
+
+## Submit and publish
+
+<Steps>
+<Step title="Submit from the feature branch">
+
+Run the workflow from the checkout that owns the branch:
+
+```sh
+preloop run --push --create-pr -f .github/workflows/ci.yml
+```
+
+The CLI prints a run ID. A clean checkout records the current commit. A dirty checkout is snapshotted at submission, so CI tests the uncommitted tree as well. The dirty-tree snapshot does not change your index or working tree.
+
+</Step>
+<Step title="Let the run reach a terminal result">
+
+The run executes without a webhook trigger. Follow it with `preloop status RUN_ID` or inspect output with `preloop logs RUN_ID --job JOB_ID`.
+
+For a non-interactive submit, use `--detach` and save the printed run ID:
+
+```sh
+preloop run --detach --push -f .github/workflows/ci.yml
+preloop status RUN_ID --json
+```
+
+Detached submission returns after acceptance. It does not perform the local Git push after the run finishes; publish later from the submitting checkout with `preloop push RUN_ID`.
+
+</Step>
+<Step title="Publish the tested tree">
+
+When the run is terminal, the CLI pushes the exact tested commit to `origin` and calls the control plane's publish endpoint:
+
+```text
+POST /api/v1/runs/RUN_ID/push
+```
+
+The local Git operation is a branch creation, an already-equal update, or a fast-forward. A diverged remote branch is refused rather than force-pushed. The server then verifies the pushed commit's tree, reuses the branch's pull request, creates one when requested, and reports any missing Check Runs.
+
+</Step>
+</Steps>
+
+### Dirty working trees
+
+For a dirty `--push` run, a successful result lets the CLI materialize a commit whose tree exactly matches the snapshot tested by CI. The commit is parented on the submitted base commit and uses your local Git identity. If the working tree changed after submission, materialization stops and the CLI asks for a new submission. A failed dirty-tree run is not materialized or pushed.
+
+On a terminal, a dirty push without `--create-pr` can ask whether to open a PR. The explicit `--create-pr` flag takes precedence. Otherwise the head commit's message labels are honored: `[no-pr]` suppresses creation, while `[pr]` or `[draft]` requests creation; a non-interactive explicit `--push` pushes without opening a new PR unless a label requests one.
+
+Clean-tree push-back can publish red Check Runs after a failed run. This records the tested result without pretending that the run passed. Dirty-tree push-back only materializes after success.
+
+## Run IDs and retries
+
+The submit output, `preloop status`, and error messages expose the run ID. Use the explicit ID when replaying a publish:
+
+```sh
+preloop push 3c9759be-0000-4000-8000-000000000000
+```
+
+The CLI retries transient publish failures after 1 minute, 5 minutes, and 15 minutes. Pressing `Ctrl-C` stops the wait; running `preloop push RUN_ID` later resumes the same idempotent operation. The server does not retry its own GitHub reads: a transport or 5xx failure is returned as a gateway error and the push-back is recorded as blocked with the upstream message, while other failures are returned as client errors.
+
+## Checks on the pull request
+
+Check Runs move through `queued`, `in_progress`, and `completed` with the job conclusion. Push-back creates missing checks against the effective published commit, including the materialized commit for a dirty-tree run. The push webhook echo for that same published commit is recognized, so the workflow is not run a second time merely because push-back published it.
+
+The control plane verifies the tested tree before publishing checks. If the GitHub branch points at a different tree, the publish is blocked. The server also refuses the default branch as a push-back target; keep the default branch on the normal webhook flow.
+
+## Troubleshooting
+
+| Message or symptom | Fix |
+|---|---|
+| `run was not submitted with --push` | Submit again with `preloop run --push`, or publish a different run that recorded push-back. |
+| `commit ... is not present in this checkout` | Run `preloop push RUN_ID` from the checkout used for submission; the tested commit must exist locally. |
+| `refusing to push branch ... default branch` | Use a feature branch. Push-back never publishes the repository's default branch. |
+| `has commits that are not ancestors` | Rebase the branch onto the remote (or reset to the tested commit) and submit a new run. Push-back never force-pushes. |
+| `tested tree ... does not match pushed commit tree` | Do not change the branch between testing and publishing. Re-submit the current tree. |
+| `no GitHub credentials configured` | Configure a GitHub App or the supported GitHub token on the control plane. |
+| Check Runs are missing or return 403 | Grant the App `checks: write`. A PAT-only setup can still allow some repository operations while leaving Check Runs unpublished. |
+| PR creation returns 403 | Grant the App or token `pull_requests: write`. |
+| The branch is pushed but no PR appears | Include `--create-pr`, use `[pr]`/`[draft]` in the head commit message, or create the pull request separately. An existing pull request for the branch is reused. |
+| GitHub transport error | Keep the run ID and retry with `preloop push RUN_ID` from the submitting checkout. The sync is idempotent, and a branch push that already landed is a no-op. |
+
+Verify the branch and PR after a successful publish:
+
+```sh
+git ls-remote origin "refs/heads/$BRANCH"
+gh pr list --head "$BRANCH"
+```
+
+See [GitHub App setup](/control-plane/github/app), [GitHub tokens](/control-plane/github/tokens), and the [CLI reference](/control-plane/reference/cli) for credential and command details.

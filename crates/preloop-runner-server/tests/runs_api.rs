@@ -3276,6 +3276,115 @@ jobs:
     );
 }
 
+/// Regression for #649, through the real handlers. A local `preloop run`
+/// submission (its snapshot is taken from the workspace by the submit path)
+/// whose workflow calls a local composite. The composite names `jdx/mise-action`,
+/// which the workflow does not declare. The runner resolves that nested action
+/// with its job's runtime token, and the plan segment it sends is the job's
+/// `system.orchestrationId` (`{planId}.{jobId}.__default`), not the bare plan id.
+/// That batch must resolve, while the same token is refused for another plan and
+/// for another job.
+#[tokio::test]
+async fn local_run_resolves_a_composites_nested_action_with_the_job_token() {
+    // Held for the whole test: `PRELOOP_GITHUB_API_URL` is process-global.
+    let _env = crate::state::GITHUB_ENV_LOCK.lock().await;
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+    let mock = axum::Router::new().route(
+        "/repos/{owner}/{repo}/commits/{git_ref}",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"sha": "abc123def456abc123def456abc123def456abc1"}))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(api_listener, mock).await.unwrap();
+    });
+    let _api_url = crate::state::TestEnvVar::set("PRELOOP_GITHUB_API_URL", &api_base);
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let composite = workspace.join(".github/actions/common-setup/action.yml");
+    std::fs::create_dir_all(composite.parent().unwrap()).unwrap();
+    std::fs::write(
+        &composite,
+        "runs:\n  using: composite\n  steps:\n    - uses: jdx/mise-action@v4\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "test"]);
+    git(&["config", "user.email", "test@example.invalid"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "workspace"]);
+
+    let mut state = AppState::new(temp.path().join("state")).await.unwrap();
+    state.local_workspace = Some(workspace);
+    let app = app(state.clone(), CancellationToken::new());
+    let (run_id, plan_id, agent_job_id) = submit_run_first_job(
+        &app,
+        &state,
+        "name: Build & Publish\non: push\njobs:\n  app:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v7\n      - uses: ./.github/actions/common-setup\n",
+    )
+    .await;
+    // The exact plan segment the runner sends: the job message's
+    // `system.orchestrationId`.
+    let orchestration = {
+        let inner = state.test_tx().await;
+        let message = queued_message_for(&inner, &run_id);
+        variable_value(&message, "system.orchestrationId")
+            .expect("the job message carries system.orchestrationId")
+            .to_owned()
+    };
+    let token = state.mint_runtime_token(&plan_id, &agent_job_id);
+    let batch = json!({"actions": [{"action": "jdx/mise-action", "version": "v4"}]});
+    let forbidden = axum::http::StatusCode::FORBIDDEN;
+
+    let runner_path =
+        format!("/actions/build/{orchestration}/jobs/{agent_job_id}/runnerresolve/actions");
+    let status =
+        request_status_with_bearer(&app, Method::POST, &runner_path, batch.clone(), &token).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "the job token must resolve its nested action on the runner's path {runner_path}"
+    );
+
+    let job_segment = orchestration
+        .split_once('.')
+        .map(|(_, rest)| rest.to_owned())
+        .expect("orchestration id carries a job segment");
+    let other_plan_path = format!(
+        "/actions/build/00000000-0000-0000-0000-000000000000.{job_segment}/jobs/{agent_job_id}/runnerresolve/actions"
+    );
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &other_plan_path, batch.clone(), &token)
+            .await,
+        forbidden,
+        "a job token must not address another plan"
+    );
+    let other_job_path = format!(
+        "/actions/build/{orchestration}/jobs/{}/runnerresolve/actions",
+        uuid::Uuid::new_v4()
+    );
+    assert_eq!(
+        request_status_with_bearer(&app, Method::POST, &other_job_path, batch, &token).await,
+        forbidden,
+        "a job token must not address another job"
+    );
+}
+
 /// The action-download oracle is closed: tickets are minted only for actions
 /// declared in the run's workflow `uses:`. A batch naming an undeclared
 /// `owner/repo` — alone or mixed with declared actions — is a 403 that

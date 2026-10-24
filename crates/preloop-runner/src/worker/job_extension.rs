@@ -43,10 +43,10 @@ pub fn setup_workspace(job_message: &serde_json::Value) -> anyhow::Result<String
             preloop_gha_protocol::workspace_dir_for_repository(repository)
                 .map(|p| p.to_string_lossy().into_owned())
         })
-        .unwrap_or_else(|| "_work/default/default".to_owned());
+        .unwrap_or_else(|| "work/default/default".to_owned());
 
     // The runner owns everything below its working directory — its root,
-    // where `_work` and `.runner` live (the worker is spawned with
+    // where `work` and `.runner` live (the worker is spawned with
     // `current_dir(runner_root)`). A crafted job payload must never make the
     // runner delete arbitrary paths: workspace="/" or "/home/user" would
     // otherwise reach `remove_dir_all` below verbatim. Resolve the payload
@@ -212,7 +212,17 @@ fn tool_cache_dir_for(workspace: &str, hosted: &Path) -> String {
 }
 
 /// Inject GITHUB_* and RUNNER_* environment variables into the job context.
-pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
+///
+/// `control_plane` is the registration state the worker validated from
+/// `.runner` at startup. Which plane this runner registered against decides
+/// whether the job's `system.github.token` variable is a usable GitHub
+/// credential; passing it in avoids re-reading runner metadata per job.
+pub fn inject_github_env(
+    job: &mut JobContext,
+    msg: &serde_json::Value,
+    control_plane: crate::settings::ControlPlane,
+) {
+    job.control_plane = control_plane;
     let raw_github = msg
         .get("contextData")
         .and_then(|cd| cd.get("github"))
@@ -224,7 +234,7 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
     // Decode to a flat JSON object.
     let github = decode_typed_value(&raw_github);
 
-    let workspace = job.workspace.as_deref().unwrap_or("_work/default/default");
+    let workspace = job.workspace.as_deref().unwrap_or("work/default/default");
 
     // Core GITHUB_* variables
     let vars: Vec<(&str, String)> = vec![
@@ -275,23 +285,39 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
         ),
         ("GITHUB_ACTION", str_from_json(&github, "action")),
         ("GITHUB_TOKEN", {
-            // `github.token` only — never `variables.system.github.token`.
-            // That variable is the engine's job-scoped runtime JWT; exporting
-            // it sent a dead credential to api.github.com ("Bad credentials")
-            // on every job without an App/PAT. An empty GITHUB_TOKEN is the
-            // honest value: API clients go anonymous, and checkouts whose
-            // `token:` input defaults to `${{ github.token }}` fetch through
-            // the engine's forge relay.
-            str_from_json(&github, "token")
+            // The official runner builds `github.token` from the
+            // `system.github.token` variable (actions/runner
+            // `ExecutionContext.cs` `InitializeJob`:
+            // `githubContext["token"] = Variables.Get("system.github.token")`,
+            // with `contextData` overlaid on top). The variable is only a
+            // usable GitHub credential when the control plane is GitHub: on a
+            // preloop engine the claim owns that slot — it writes the GitHub
+            // credential it minted (and patches the same value into the
+            // `github.token` context read here) and leaves it empty when it
+            // has none. The runtime JWT never enters this variable or the
+            // step environment. Engine registrations therefore export the
+            // context token alone.
+            let context_token = str_from_json(&github, "token");
+            if context_token.is_empty() && control_plane == crate::settings::ControlPlane::GitHub {
+                // `github_token` is the same credential under the canonical
+                // secret's name; either alias may be the populated one, so
+                // take the first non-empty value.
+                variable_value(msg, "system.github.token")
+                    .or_else(|| variable_value(msg, "github_token"))
+                    .unwrap_or_default()
+            } else {
+                context_token
+            }
         }),
-        // Runner variables — runner name from.runner settings, not job name
-        ("RUNNER_NAME", {
-            // Read from.runner settings file (CWD = runner root from spawn_job)
-            crate::settings::RunnerConfig::load(std::path::Path::new("."))
-                .ok()
-                .map(|c| c.settings.agent_name)
-                .unwrap_or_else(|| job.job_name.clone())
-        }),
+        // Runner variables — the registration name `run_job` copied from the
+        // validated `.runner`, never a per-job re-read of the file.
+        (
+            "RUNNER_NAME",
+            job.env
+                .get("RUNNER_NAME")
+                .cloned()
+                .unwrap_or_else(|| job.job_name.clone()),
+        ),
         ("RUNNER_OS", runner_os().to_string()),
         ("RUNNER_ARCH", runner_arch().to_string()),
         (
@@ -300,6 +326,18 @@ pub fn inject_github_env(job: &mut JobContext, msg: &serde_json::Value) {
                 .parent()
                 .and_then(|p| p.parent())
                 .map(|p| p.join("_temp").to_string_lossy().to_string())
+                .unwrap_or_else(|| "/tmp".to_string()),
+        ),
+        // The repository's own directory under the work folder, which hosted
+        // runners export (`/home/runner/work/<repo>` for a workspace of
+        // `/home/runner/work/<repo>/<repo>`) and actions that look for a
+        // sibling checkout read. A parity probe measured it UNSET on a
+        // preloop guest.
+        (
+            "RUNNER_WORKSPACE",
+            Path::new(workspace)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "/tmp".to_string()),
         ),
         ("RUNNER_TOOL_CACHE", tool_cache_dir(workspace)),
@@ -787,6 +825,13 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string()
+                    } else if ref_type.eq_ignore_ascii_case("containerRegistry") {
+                        ref_val
+                            .get("image")
+                            .and_then(|value| value.as_str())
+                            .filter(|image| !image.is_empty())
+                            .map(|image| format!("docker://{image}"))
+                            .unwrap_or_default()
                     } else if repo_type.eq_ignore_ascii_case("selfRepository") {
                         // v2.336.0 $/ self-repository action reference
                         // (PipelineConstants.SelfRepositoryAlias).
@@ -864,6 +909,7 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
             env,
             raw: step.clone(),
             is_background,
+            post_of: Vec::new(),
         });
     }
 
@@ -875,7 +921,9 @@ pub fn build_step_list(steps: &[serde_json::Value], job_message: &serde_json::Va
 /// Official runner builds three lists:
 /// - pre steps: declared order, `pre-if` defaults to `always()`
 /// - main steps: the workflow steps
-/// - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`
+/// - post steps: LIFO (reverse of main-step order), `post-if` defaults to `always()`;
+///   each names its action step in `post_of`, and `run_steps` runs it only once that
+///   step has started (the official runner registers post hooks at run time)
 ///
 /// State context (`GITHUB_STATE` file) is wired so pre can communicate to post
 /// via `save-state`; `StepContext::build_env()` exposes those values as
@@ -919,12 +967,19 @@ pub fn build_step_list_with_lifecycle(
         // post cleanup is still registered. Keep this aligned with the pinned source
         // (ActionRunner.cs, `RunAsync`, lines 105-110).
         // https://github.com/actions/runner/blob/7d737449ef346f6524f75688d0c9c95fa10ba10a/src/Runner.Worker/ActionRunner.cs#L105-L110
+        // Steps whose action handler registers the post hook: the main step, and
+        // the pre step when the action declares `pre:`. `ActionRunner.RunAsync`
+        // registers the post job step for the Pre stage as well as the Main one,
+        // so a pre step that ran must remain able to clean up after itself even
+        // when the main step is skipped.
+        let mut post_registrations = vec![step.context_name.clone()];
         if !is_local_action {
             // Pre step
             if let Some(pre_main) = &manifest.runs_pre {
                 let pre_if = manifest.runs_pre_if.as_deref().unwrap_or("always()");
                 let pre_context = format!("__pre_{}", step.context_name);
                 let pre_id = format!("__pre_{}", step.id);
+                post_registrations.push(pre_context.clone());
                 pre_steps.push(Step {
                     id: pre_id,
                     context_name: pre_context,
@@ -943,6 +998,7 @@ pub fn build_step_list_with_lifecycle(
                         "uses": uses,
                     }),
                     is_background: false,
+                    post_of: Vec::new(),
                 });
             }
         }
@@ -973,6 +1029,7 @@ pub fn build_step_list_with_lifecycle(
                     "uses": uses,
                 }),
                 is_background: false,
+                post_of: post_registrations,
             });
         }
     }
@@ -1139,6 +1196,29 @@ pub(crate) fn display_name_for_step(id: &str, step_type: &StepType) -> String {
         StepType::Action { uses, .. } if !uses.is_empty() => format!("Run {uses}"),
         _ => id.to_string(),
     }
+}
+
+/// Read the value of one job-message `variables` entry.
+///
+/// Case-insensitive key match, mirroring `JobContext::get_variable`: the wire
+/// is camelCase-ish (`system.github.token`) while producers differ in
+/// spelling. Returns `None` when the variable is absent, its `value` is not a
+/// string, or the string is empty: the job builder writes empty `isSecret`
+/// slots for both token aliases before the claim fills them, and an empty slot
+/// must not shadow the populated alias it is paired with.
+fn variable_value(msg: &serde_json::Value, key: &str) -> Option<String> {
+    let variables = msg.get("variables")?.as_object()?;
+    let key_lower = key.to_lowercase();
+    for (name, entry) in variables {
+        if name.to_lowercase() == key_lower {
+            return entry
+                .get("value")
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
+    }
+    None
 }
 
 fn str_from_json(val: &serde_json::Value, key: &str) -> String {

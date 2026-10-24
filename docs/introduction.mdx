@@ -1,29 +1,44 @@
 ---
 title: Introduction
-description: Run GitHub Actions workflows locally or on your own CI infrastructure with Preloop.
+description: What Preloop runs, and whether you need the self-hosted control plane or the standalone runner.
 ---
 
-Preloop runs your existing GitHub Actions workflows on hardware-isolated microVMs. Keep your `.github/workflows` files unchanged, run them locally against your working tree, and use the same engine in your own CI environment.
+Preloop runs GitHub Actions workflows on hardware-isolated microVMs. Your `.github/workflows` files stay unchanged. You choose where the jobs run: on your own machine, on servers you operate, or on hosts that register with GitHub.
 
-The engine speaks the official `actions/runner` protocol. The official runner can register, poll for jobs, execute them, and report results against Preloop. Preloop also includes a Rust runner that installs 36× smaller and uses up to 19× less peak memory in the published comparison.
+Preloop ships as two products. You can use either one on its own.
 
-For a failed step, run with `preloop run --debug` and attach with `preloop debug <run-id>` to inspect the paused session and retry from that step. If you use `--preserve-on-failure` instead, inspect the retained VM with `preloop shell`.
+![A failed step, a fix in another pane, and a re-run, all local with no push required](/demo/demo.gif)
 
-Preloop is in beta. Source code and releases are available on [GitHub](https://github.com/preloopdev/preloop).
+<CardGroup cols={2}>
+  <Card title="Control plane" icon="server" href="/control-plane/quickstart">
+    Run unmodified workflows locally or on your own infrastructure. `preloop run` executes a workflow against your working tree, including uncommitted files. `preloop serve` runs the engine, which can start runs from GitHub pushes and pull requests through a GitHub App, and can pause a failed job so you can debug it.
+  </Card>
+  <Card title="Runner" icon="terminal" href="/runner/overview">
+    A standalone, drop-in replacement for `actions/runner`. It registers with GitHub or a Preloop server, polls for jobs, and runs them on the host where it is installed. It needs no control plane, microVMs, or background services.
+  </Card>
+</CardGroup>
 
-## Key capabilities
+![Preloop system overview: clients, the control plane, the VM pool, and microVMs](/diagrams/system-overview.svg)
 
-- Drop-in workflow compatibility: adoption starts by changing where jobs run, not rewriting workflow YAML.
-- Hardware-isolated microVMs for jobs, with warm jobs able to fork from a prepared image in about 300 ms.
-- Local runs use the working tree, including uncommitted and untracked files.
-- Pause-on-failure debugging with DAP and step-level retries.
-- GitHub App credentials and per-job tokens for least-privilege GitHub access.
-- NDJSON event output for agents and developer tooling.
-- A webhook watchdog that reconciles deliveries against GitHub when webhook events drift.
+## Where to go next
 
-## Next steps
-
-- [Quickstart](/quickstart): install the CLI and run your first workflow.
-- [Setup guide](/setup): configure GitHub credentials, secrets, and engine settings.
-- [Architecture overview](/system-architecture): explore the system diagrams and components.
-- [CLI reference](/cli_reference): browse commands and flags.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/control-plane/quickstart">
+    Install the CLI and run your first workflow locally.
+  </Card>
+  <Card title="Install" icon="download" href="/control-plane/install">
+    Requirements for macOS, Linux, and WSL2, and running the engine as a service.
+  </Card>
+  <Card title="Configuration" icon="gear" href="/control-plane/configuration">
+    The config file, GitHub credentials, and secrets.
+  </Card>
+  <Card title="CLI reference" icon="terminal" href="/control-plane/reference/cli">
+    Every command and flag.
+  </Card>
+  <Card title="Compatibility" icon="check" href="/compatibility">
+    How closely Preloop matches GitHub Actions, and where it differs.
+  </Card>
+  <Card title="Comparison" icon="scale-balanced" href="/comparison">
+    How Preloop compares with other local and self-hosted CI tools.
+  </Card>
+</CardGroup>

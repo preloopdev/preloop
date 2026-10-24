@@ -287,10 +287,11 @@ def port_free() -> bool:
         return probe.connect_ex((host, int(port))) != 0
 
 
-# `serve` is the documented command and `engine` is the hidden alias that
-# `ensure_engine_running` spawns; both start the same daemon and both own
-# `preloop-runner-*` VMs. Matching only the alias made this scan report "no
-# engine" against an operator's live `preloop serve`, after which the cleanup
+# `serve` is the documented command and `engine` is its hidden alias (the
+# former name, kept so supervisor units and launchers that still invoke it keep
+# working); both start the same daemon and both own `preloop-runner-*` VMs.
+# Matching only one name made this scan report "no engine" against an
+# operator's live `preloop serve`, after which the cleanup
 # below deleted that engine's warm pool mid-job. `preloop-server` is the
 # standalone control-plane binary, matched for the same reason. BSD pgrep
 # speaks POSIX ERE, so the space class is spelled the long way and `\s` is out.

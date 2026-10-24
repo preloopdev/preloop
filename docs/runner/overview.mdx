@@ -1,0 +1,65 @@
+---
+title: Runner overview
+description: preloop-runner is a Rust drop-in for the official GitHub Actions runner. It registers directly with GitHub or a Preloop control plane.
+---
+
+`preloop-runner` is a single binary that replaces the official `actions/runner` on a host. It keeps the same `configure`, `run`, and `remove` workflow as the official `config.sh` and `run.sh`. It registers with a GitHub repository or organization, or with a Preloop control plane, and runs jobs directly on the host. It needs no control plane, no VM runtime, and no background services.
+
+## When to use it
+
+Use the standalone runner for self-hosted GitHub runners on Linux or macOS hosts, when you want a small binary and low memory use per runner.
+
+Use the [control plane](/control-plane/quickstart) when you want jobs isolated in microVMs, local runs of your workflows against your working tree, or pause-on-failure debugging.
+
+| | Standalone runner | Control plane |
+|---|---|---|
+| Where jobs run | Directly on the host, as the runner's user | Hardware-isolated microVMs |
+| What you install | The `preloop-runner` binary, plus `git` | The Preloop engine and a VM runtime |
+
+## What it does
+
+- Registers a self-hosted runner with a GitHub repository or organization, or with a Preloop control plane.
+- Polls for jobs, runs them, streams console output, and reports step status, logs, and results.
+- Runs `run:` steps, JavaScript actions on Node 20 or 24, composite actions, and Docker actions. Job containers (`container:` and `services:`) run through the `docker` CLI on the host.
+- Does not update itself. Upgrade by installing a newer binary.
+- Includes `lint`, which parses a workflow file and expands its jobs without running them.
+
+## Platforms
+
+| Platform | Standalone binary | Container image |
+|---|---|---|
+| Linux, x86_64 | Yes | `linux/amd64` |
+| Linux, arm64 | Yes | `linux/arm64` |
+| macOS, Apple Silicon | Yes | Not applicable |
+| macOS, Intel | Yes | Not applicable |
+| Windows | No | No |
+
+The Linux binaries target glibc (`-gnu` builds). Windows is not published. On Windows, run the Linux binary under WSL2.
+
+## How it compares
+
+The repository's runner comparison ran both runners against the same Preloop server, executing the same two-step workflow, on an Apple M1 Pro under macOS. Each value is the median of three runs. The official runner was `actions/runner` v2.336.0.
+
+| Measure | actions/runner | preloop-runner |
+|---|---|---|
+| Install size, as shipped | 434 MB | 11.9 MB, without Node runtimes |
+| Install size, without Node runtimes | 85 MB | 11.9 MB |
+| Cold start (`--version`) | 97 ms | 29 ms |
+| Idle memory (RSS) | 67.2 MB | 9.0 MB |
+| Peak memory during a job (RSS) | 205.5 MB | 11.1 MB |
+| Job pickup | 268 ms | 100 ms |
+
+The official package bundles Node 20 and Node 24, which accounts for most of its 434 MB. The preloop-runner measurement skipped those runtimes with `--no-externals`, so the second install-size row is the like-for-like comparison. Without them, the official install is about seven times larger.
+
+In the repository's light conformance run, 14 workflows produced no differences between the official runner and `preloop-runner`.
+
+These measurements come from one machine. Expect different numbers on your hardware.
+
+## Next steps
+
+<CardGroup cols={2}>
+<Card title="Install" href="/runner/install">Install the binary, register it, and run it as a service.</Card>
+<Card title="Configuration" href="/runner/configuration">Every command, flag, and environment variable.</Card>
+<Card title="Architecture" href="/runner/architecture">How the listener and the per-job worker process jobs.</Card>
+<Card title="Comparison" href="/comparison">How preloop-runner compares with other local runners.</Card>
+</CardGroup>

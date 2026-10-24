@@ -113,6 +113,39 @@ fn written_log_line_count(line: &str) -> u64 {
     line.bytes().filter(|byte| *byte == b'\n').count() as u64 + 1
 }
 
+/// Context names of action steps whose handler actually started, shared between
+/// `run_steps` and the action handler that registers them.
+///
+/// The official runner registers a post job step from `ActionRunner.RunAsync`,
+/// for the Pre and the Main stage, once the action's definition has loaded
+/// (`ActionRunner.cs`, `RunAsync`: the `HasPost` block runs after
+/// `taskManager.LoadAction`). A generated post hook therefore runs only when the
+/// action it cleans up after entered its handler — a step whose condition passed
+/// but whose environment, file-command setup or action resolution failed never
+/// registers it.
+#[derive(Debug, Clone, Default)]
+pub struct HookRegistrations {
+    started: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl HookRegistrations {
+    /// Record that `context_name`'s action handler started, registering its post
+    /// hook. Idempotent: composite nesting re-enters the same step.
+    pub fn register(&self, context_name: &str) {
+        self.started.lock().insert(context_name.to_owned());
+    }
+
+    /// Drop a registration, used when a replayed range re-runs its steps: a step
+    /// registers its hook again only if it runs again.
+    pub fn unregister(&self, context_name: &str) {
+        self.started.lock().remove(context_name);
+    }
+
+    pub fn is_registered(&self, context_name: &str) -> bool {
+        self.started.lock().contains(context_name)
+    }
+}
+
 pub struct StepContext<'a> {
     pub job: &'a mut JobContext,
     pub step_id: String,
@@ -159,6 +192,8 @@ pub struct StepContext<'a> {
     pub live_logs: Option<Arc<LiveLogQueue>>,
     /// Monotonic line counter for live log feed (per step).
     live_line_counter: std::sync::atomic::AtomicU64,
+    /// Post-hook registrations this step's action makes when it starts.
+    pub hooks: HookRegistrations,
 }
 
 impl<'a> StepContext<'a> {
@@ -231,6 +266,7 @@ impl<'a> StepContext<'a> {
             stdout_partial_is_continuation: std::sync::atomic::AtomicBool::new(false),
             live_logs,
             live_line_counter: std::sync::atomic::AtomicU64::new(1),
+            hooks: HookRegistrations::default(),
         }
     }
 
@@ -591,6 +627,24 @@ impl<'a> StepContext<'a> {
                     }
                 }
             }
+            // eMudhra intermediate CA compromise (2026-10-20): Node's
+            // bundled Mozilla roots still trust the revoked eMudhra
+            // intermediates. Point Node and certifi-based Python at the
+            // system store, which the guest init and bake blacklist keep
+            // clean. Linux-only: host-run runners on other platforms have no
+            // known-clean system bundle at this path. Workflows that set
+            // these themselves keep their values.
+            #[cfg(target_os = "linux")]
+            {
+                if std::path::Path::new("/etc/ssl/certs/ca-certificates.crt").exists() {
+                    env.entry("NODE_OPTIONS".to_owned())
+                        .or_insert_with(|| "--use-openssl-ca".to_owned());
+                    env.entry("PIP_CERT".to_owned())
+                        .or_insert_with(|| "/etc/ssl/certs/ca-certificates.crt".to_owned());
+                    env.entry("REQUESTS_CA_BUNDLE".to_owned())
+                        .or_insert_with(|| "/etc/ssl/certs/ca-certificates.crt".to_owned());
+                }
+            }
             // GitHub-hosted parity: hosted runners run steps as a dedicated
             // user in a systemd session, so USER/LOGNAME (the runner account)
             // and XDG_RUNTIME_DIR (to /run/user/<uid>, existing) are present
@@ -653,8 +707,35 @@ impl<'a> StepContext<'a> {
     /// cap. Callers that only peek near the head must use `log_head`.
     /// (Residual: disk-scale logs rematerialize here as pre-PR; the
     /// write-path caps bound per-line copies, not total file size.)
+    ///
+    /// The assembled text carries the job's `MaskType::Regex` hints (see
+    /// [`Self::mask_assembled_log`]).
     pub fn log_content(&self) -> String {
-        Self::read_log_file(&self.log_file, None)
+        self.mask_assembled_log(Self::read_log_file(&self.log_file, None))
+    }
+
+    /// Apply the job's `MaskType::Regex` hints to a whole assembled log.
+    ///
+    /// The write path ([`Self::write_chunk`]) sees one physical line at a time
+    /// and masks each of them exactly as the official runner does, so a hint
+    /// whose pattern can span a newline (`(?s)…`, `\s+`) has nothing to match
+    /// against there. The assembled text is what leaves the runner — the
+    /// uploaded step log, the merged job log, the debug excerpt — so it gets
+    /// the same pattern pass over the whole text. Line preservation keeps the
+    /// physical record count, and therefore every line checkpoint
+    /// [`Self::log_content_since`] slices by, intact. A job without pattern
+    /// hints (no `MaskType::Regex` in its message) returns the text untouched.
+    fn mask_assembled_log(&self, content: String) -> String {
+        let has_patterns = self
+            .job
+            .pattern_masks
+            .read()
+            .map(|patterns| !patterns.is_empty())
+            .unwrap_or(false);
+        if !has_patterns || content.is_empty() {
+            return content;
+        }
+        self.job.mask_secrets_preserving_lines_with(&content, &[])
     }
 
     /// Bounded prefix of the step log for diagnostic scans. Never use for
@@ -830,6 +911,58 @@ mod tests {
         let env = ctx.build_env();
         assert_eq!(env.get("STEP_VAR").unwrap(), "from_step");
         assert_eq!(env.get("JOB_VAR").unwrap(), "overridden");
+    }
+
+    /// The 2026-10-20 eMudhra CA compromise hotfix: jobs must default to the
+    /// system trust store (kept clean by the guest init and the bake
+    /// blacklist), not Node's bundled roots or certifi's copy.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_env_defaults_to_system_ca_store() {
+        let mut job = make_job();
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert_eq!(
+            env.get("NODE_OPTIONS").map(String::as_str),
+            Some("--use-openssl-ca")
+        );
+        assert_eq!(
+            env.get("PIP_CERT").map(String::as_str),
+            Some("/etc/ssl/certs/ca-certificates.crt")
+        );
+        assert_eq!(
+            env.get("REQUESTS_CA_BUNDLE").map(String::as_str),
+            Some("/etc/ssl/certs/ca-certificates.crt")
+        );
+    }
+
+    #[test]
+    fn build_env_keeps_explicit_node_options() {
+        let mut job = make_job();
+        job.env
+            .insert("NODE_OPTIONS".into(), "--max-old-space-size=4096".into());
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert_eq!(
+            env.get("NODE_OPTIONS").map(String::as_str),
+            Some("--max-old-space-size=4096")
+        );
+    }
+
+    /// Host-run runners outside Linux have no golden CA bundle; leave their
+    /// CA environment untouched.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn build_env_leaves_host_ca_env_alone() {
+        let mut job = make_job();
+        let ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+
+        let env = ctx.build_env();
+        assert!(!env.contains_key("NODE_OPTIONS"));
+        assert!(!env.contains_key("PIP_CERT"));
+        assert!(!env.contains_key("REQUESTS_CA_BUNDLE"));
     }
 
     /// A managed runner (orchestrator set PRELOOP_RUNNER_USER/UID) gets the
@@ -1146,6 +1279,32 @@ mod tests {
             content.len()
         );
         assert!(content.contains("pad-8"), "tail of recorded log missing");
+    }
+
+    /// A hint whose pattern spans a newline has nothing to match against on
+    /// the per-line write path; the assembled log is where it applies, and
+    /// line preservation keeps the record count — and the checkpoints slicing
+    /// by line — valid.
+    #[test]
+    fn assembled_log_applies_cross_line_pattern_hints() {
+        let mut job = make_job();
+        job.apply_mask_hints(&[preloop_gha_protocol::azdo::MaskHint {
+            hint_type: preloop_gha_protocol::azdo::MaskType::Regex,
+            value: "(?s)BEGIN.*END".to_owned(),
+        }]);
+        let mut ctx = StepContext::new(&mut job, "s1".into(), "Step".into());
+        ctx.write_chunk(b"BEGIN\ncross-line-token\nEND\ntail\n");
+
+        // Per-line masking cannot see the span: the pattern needs the newline.
+        assert!(
+            ctx.log_lines.iter().any(|l| l.contains("cross-line-token")),
+            "the per-line path cannot match a cross-line pattern"
+        );
+
+        let content = ctx.log_content();
+        assert!(!content.contains("cross-line-token"), "{content}");
+        assert!(content.contains("***"), "{content}");
+        assert_eq!(content.lines().count(), 4, "{content}");
     }
 
     /// Diagnostic path stays bounded: log_head returns at most the budget

@@ -4,10 +4,12 @@
 //! lines are queued, batched by step, and sent to `FeedStreamUrl` while the
 //! normal step-log blob upload remains the durable source of truth.
 
+use crate::worker::contexts::LiveMaskSet;
 use futures::SinkExt;
+use preloop_gha_protocol::masking::PatternMasker;
 use rand::RngExt;
-use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -49,7 +51,10 @@ impl std::fmt::Debug for LiveLogQueue {
 
 pub struct LiveLogQueue {
     lines: Mutex<VecDeque<ConsoleLineInfo>>,
-    masks: Arc<RwLock<HashSet<String>>>,
+    /// Value masks plus the compiled `MaskType::Regex` hints: drain-path
+    /// masking must redact hint-matched spans, which the value set alone
+    /// cannot express.
+    masks: LiveMaskSet,
     /// Gate synchronizing mask registration with transmission. The
     /// `::add-mask::` path holds it for writing across registration while
     /// each WebSocket batch holds it for reading across the final mask
@@ -70,11 +75,7 @@ impl LiveLogQueue {
     /// step, so an unreachable feed endpoint delayed every job by ~1s. Lines
     /// produced before the socket is up stay queued and go out on the first
     /// drain after it connects.
-    pub fn connect(
-        feed_url: String,
-        access_token: String,
-        masks: Arc<RwLock<HashSet<String>>>,
-    ) -> Arc<Self> {
+    pub fn connect(feed_url: String, access_token: String, masks: LiveMaskSet) -> Arc<Self> {
         let (shutdown_tx, _) = watch::channel(false);
         let queue = Arc::new(Self {
             lines: Mutex::new(VecDeque::new()),
@@ -107,7 +108,7 @@ impl LiveLogQueue {
         let (shutdown_tx, _) = watch::channel(false);
         Arc::new(Self {
             lines: Mutex::new(VecDeque::new()),
-            masks: Arc::new(RwLock::new(HashSet::new())),
+            masks: LiveMaskSet::default(),
             mask_gate: Arc::new(tokio::sync::RwLock::new(())),
             ws: tokio::sync::Mutex::new(None),
             shutdown_tx,
@@ -146,9 +147,25 @@ impl LiveLogQueue {
 
     /// Re-mask lines that are still queued after a newly registered secret.
     /// Lines already dequeued cannot be recalled from the WebSocket.
+    ///
+    /// The job's pattern masks apply here too: a span matched only by a
+    /// `MaskType::Regex` hint is redacted even when no value was registered
+    /// for it.
     pub fn remask_with(&self, secrets: &[String]) {
         let mut lines = self.lines.lock().expect("live log queue poisoned");
-        let masked = mask_lines(lines.iter().map(|entry| entry.line.as_str()), secrets);
+        // A poisoned pattern lock degrades to value-only masking; queued
+        // lines are still re-masked for the new values.
+        let guard = self.masks.patterns.read();
+        let empty: &[Arc<dyn PatternMasker>] = &[];
+        let patterns = match &guard {
+            Ok(patterns) => patterns.as_slice(),
+            Err(_) => empty,
+        };
+        let masked = mask_lines(
+            lines.iter().map(|entry| entry.line.as_str()),
+            secrets,
+            patterns,
+        );
         for (entry, line) in lines.iter_mut().zip(masked) {
             entry.line = line;
         }
@@ -420,15 +437,20 @@ fn truncate_line(line: &str) -> String {
     truncated
 }
 
-/// Re-mask a sequence of physical log lines against the current secrets.
+/// Re-mask a sequence of physical log lines against the current secrets and
+/// pattern maskers.
 ///
 /// Lines are joined, masked, and split so a secret spanning a line boundary
-/// still matches. `mask_secrets_preserving_lines_transform_aware` re-emits
-/// every newline inside a matched secret, so the output line count always
-/// equals the input line count and the split is one-to-one. Matching is
-/// transform-aware (encoded variants, ASCII case-insensitive) like every
-/// other log path.
-fn mask_lines<'a, I>(lines: I, secrets: &[String]) -> Vec<String>
+/// still matches. `mask_secrets_preserving_lines_transform_aware_with_patterns`
+/// re-emits every newline inside a matched secret, so the output line count
+/// always equals the input line count and the split is one-to-one. Matching
+/// is transform-aware (encoded variants, ASCII case-insensitive) like every
+/// other log path, and includes the job's `MaskType::Regex` hints.
+fn mask_lines<'a, I>(
+    lines: I,
+    secrets: &[String],
+    patterns: &[Arc<dyn PatternMasker>],
+) -> Vec<String>
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -436,9 +458,10 @@ where
     if joined.is_empty() {
         return Vec::new();
     }
-    preloop_gha_protocol::masking::mask_secrets_preserving_lines_transform_aware(
+    preloop_gha_protocol::masking::mask_secrets_preserving_lines_transform_aware_with_patterns(
         &joined,
         secrets.iter().map(String::as_str),
+        patterns.iter().map(|pattern| &**pattern),
         &[],
     )
     .split('\n')
@@ -446,13 +469,22 @@ where
     .collect()
 }
 
+/// Mask a batch against the current value and pattern masks.
+///
+/// Returns `None` when a mask lock is poisoned: the batch must not go out
+/// without its masks, so the caller drops it.
 fn mask_wrapper(
     wrapper: &TimelineRecordFeedLinesWrapper,
-    masks: &Arc<RwLock<HashSet<String>>>,
+    masks: &LiveMaskSet,
 ) -> Option<TimelineRecordFeedLinesWrapper> {
-    let masks = masks.read().ok()?;
-    let secrets: Vec<String> = masks.iter().cloned().collect();
-    let value = mask_lines(wrapper.value.iter().map(String::as_str), &secrets);
+    let values = masks.values.read().ok()?;
+    let secrets: Vec<String> = values.iter().cloned().collect();
+    let patterns = masks.patterns.read().ok()?;
+    let value = mask_lines(
+        wrapper.value.iter().map(String::as_str),
+        &secrets,
+        &patterns,
+    );
     Some(TimelineRecordFeedLinesWrapper {
         step_id: wrapper.step_id.clone(),
         start_line: wrapper.start_line,
@@ -532,22 +564,29 @@ pub fn extract_feed_stream_url(job_message: &serde_json::Value) -> Option<String
 /// one step. The callback is best-effort and intentionally independent of the
 /// durable `StepContext` log collection.
 ///
-/// Uses the shared `live_masks` so that `::add-mask::` commands issued mid-step
-/// take effect immediately on the live feed (not just the durable log).
+/// Uses the shared [`LiveMaskSet`] so that `::add-mask::` commands issued
+/// mid-step take effect immediately on the live feed (not just the durable
+/// log), and so `MaskType::Regex` hints redact their matches here too.
 pub fn process_line_callback(
     step_id: &str,
-    live_masks: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    masks: &LiveMaskSet,
     live_logs: Option<&Arc<LiveLogQueue>>,
 ) -> Option<crate::process::LineCallback<'static>> {
     let live_logs = live_logs.cloned()?;
     let step_id = step_id.to_string();
-    let live_masks = live_masks.clone();
+    let masks = masks.clone();
     let next_line = Arc::new(std::sync::atomic::AtomicU64::new(1));
     Some(Box::new(move |line: &str| {
-        let masked = if let Ok(masks) = live_masks.read() {
-            preloop_gha_protocol::masking::mask_secrets(line, masks.iter().map(String::as_str), &[])
-        } else {
-            line.to_string()
+        let masked = match (masks.values.read(), masks.patterns.read()) {
+            (Ok(values), Ok(patterns)) => {
+                preloop_gha_protocol::masking::mask_secrets_with_patterns(
+                    line,
+                    values.iter().map(String::as_str),
+                    patterns.iter().map(|pattern| &**pattern),
+                    &[],
+                )
+            }
+            _ => line.to_string(),
         };
         let line_number = next_line.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         live_logs.enqueue(&step_id, &masked, line_number);
@@ -557,6 +596,13 @@ pub fn process_line_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::contexts::RegexMasker;
+
+    /// The engine's `user:[^@\s]+@host` shape: a pattern hint that redacts a
+    /// span no registered value covers.
+    fn user_host_hint() -> Arc<dyn PatternMasker> {
+        Arc::new(RegexMasker::compile(r"user:[^@\s]+@host").expect("test pattern compiles"))
+    }
 
     #[test]
     fn enqueue_drops_above_threshold_and_truncates() {
@@ -585,7 +631,7 @@ mod tests {
     }
     #[test]
     fn dequeued_batches_are_remasked_from_current_masks() {
-        let masks = Arc::new(RwLock::new(HashSet::new()));
+        let masks = LiveMaskSet::default();
         let wrapper = TimelineRecordFeedLinesWrapper {
             step_id: "step".to_owned(),
             start_line: 1,
@@ -597,7 +643,11 @@ mod tests {
             mask_wrapper(&wrapper, &masks).unwrap().value,
             vec!["token hunter2-secret"]
         );
-        masks.write().unwrap().insert("hunter2-secret".to_owned());
+        masks
+            .values
+            .write()
+            .unwrap()
+            .insert("hunter2-secret".to_owned());
         assert_eq!(
             mask_wrapper(&wrapper, &masks).unwrap().value,
             vec!["token ***"]
@@ -605,7 +655,7 @@ mod tests {
     }
     #[test]
     fn remasked_batch_redacts_secret_spanning_lines() {
-        let masks = Arc::new(RwLock::new(HashSet::new()));
+        let masks = LiveMaskSet::default();
         let wrapper = TimelineRecordFeedLinesWrapper {
             step_id: "step".to_owned(),
             start_line: 1,
@@ -617,10 +667,56 @@ mod tests {
             ],
         };
 
-        masks.write().unwrap().insert("token-a\ntoken-b".to_owned());
+        masks
+            .values
+            .write()
+            .unwrap()
+            .insert("token-a\ntoken-b".to_owned());
         let masked = mask_wrapper(&wrapper, &masks).unwrap();
         assert_eq!(masked.value, vec!["prefix ***", "*** suffix", "unrelated"]);
         assert_eq!(masked.count, 3);
+    }
+
+    #[test]
+    fn drain_remask_redacts_pattern_only_matches() {
+        let queue = LiveLogQueue::disconnected();
+        let line = "login user:hunter2@host ok";
+        // No hints: the line is delivered unchanged — `hunter2` is not a
+        // registered value.
+        queue.enqueue("step", line, 1);
+        queue.remask_with(&[]);
+        let lines = queue.dequeue(DRAIN_LIMIT);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, line);
+
+        queue.masks.patterns.write().unwrap().push(user_host_hint());
+        queue.enqueue("step", line, 2);
+        queue.remask_with(&[]);
+        let lines = queue.dequeue(DRAIN_LIMIT);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, "login *** ok");
+    }
+
+    #[test]
+    fn drain_batch_redacts_pattern_only_matches() {
+        let masks = LiveMaskSet::default();
+        let wrapper = TimelineRecordFeedLinesWrapper {
+            step_id: "step".to_owned(),
+            start_line: 1,
+            count: 1,
+            value: vec!["login user:hunter2@host ok".to_owned()],
+        };
+        // No hints: the batch goes out unchanged.
+        assert_eq!(
+            mask_wrapper(&wrapper, &masks).unwrap().value,
+            vec!["login user:hunter2@host ok"]
+        );
+
+        masks.patterns.write().unwrap().push(user_host_hint());
+        assert_eq!(
+            mask_wrapper(&wrapper, &masks).unwrap().value,
+            vec!["login *** ok"]
+        );
     }
 
     #[test]

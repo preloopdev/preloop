@@ -32,7 +32,7 @@ const DELIVERY_COLUMNS: &str = concat!(
     us!("received_at"),
     ", state, attempts, ",
     us!("lease_until"),
-    ", lease_token::text, last_error"
+    ", lease_token::text, last_error, signer_app_id"
 );
 
 fn delivery_from_row(row: &tokio_postgres::Row) -> Result<WebhookDeliveryRecord, ControlError> {
@@ -46,6 +46,7 @@ fn delivery_from_row(row: &tokio_postgres::Row) -> Result<WebhookDeliveryRecord,
         attempts: row.get::<_, i32>(5).max(0) as u32,
         lease_until_us: row.get(6),
         lease_token: row.get(7),
+        signer_app_id: row.get(9),
         last_error: row.get(8),
     })
 }
@@ -175,16 +176,17 @@ impl PgBackend {
                 concat!(
                     "INSERT INTO webhook_deliveries (delivery_id, installation_id, event, \
                      payload, received_at, state, attempts, lease_until, lease_token, \
-                     last_error) VALUES ($1, $2, $3, $4::text::jsonb, ",
+                     signer_app_id, last_error) VALUES ($1, $2, $3, $4::text::jsonb, ",
                     ts!("$5"),
                     ", $6, $7, ",
                     ts!("$8"),
-                    ", $9::text::uuid, $10) \
+                    ", $9::text::uuid, $10, $11) \
                      ON CONFLICT (delivery_id) DO UPDATE SET \
                      installation_id = EXCLUDED.installation_id, event = EXCLUDED.event, \
                      payload = EXCLUDED.payload, received_at = EXCLUDED.received_at, \
                      state = 'received', attempts = 0, lease_until = NULL, \
-                     lease_token = NULL, last_error = NULL \
+                     lease_token = NULL, signer_app_id = EXCLUDED.signer_app_id, \
+                     last_error = NULL \
                      WHERE webhook_deliveries.state = 'failed'"
                 ),
                 &[
@@ -197,6 +199,7 @@ impl PgBackend {
                     &(delivery.attempts.min(i32::MAX as u32) as i32),
                     &delivery.lease_until_us,
                     &token,
+                    &delivery.signer_app_id,
                     &delivery.last_error,
                 ],
             )
@@ -242,7 +245,7 @@ impl PgBackend {
                     us!("d.received_at"),
                     ", d.state, d.attempts, ",
                     us!("d.lease_until"),
-                    ", d.lease_token::text, d.last_error"
+                    ", d.lease_token::text, d.last_error, d.signer_app_id"
                 ),
                 &[&now, &lease_until, &codec::limit(limit)],
             )

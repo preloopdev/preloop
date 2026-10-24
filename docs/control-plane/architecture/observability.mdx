@@ -1,0 +1,78 @@
+---
+title: Observability
+description: Where Preloop sends logs, Prometheus metrics, OpenTelemetry signals, and operational health state.
+---
+
+Preloop keeps operational signals available locally and can export logs, traces, and metrics over OTLP/HTTP. Use `/metrics` for Prometheus scraping, `/api/v1/status` for a structured snapshot, and the process logs for event-level diagnosis.
+
+![Preloop observability signals](/diagrams/observability.svg)
+
+## Signals and destinations
+
+| Signal | Local surface | Export or sink |
+| --- | --- | --- |
+| Logs | `stderr` or journald through `tracing_subscriber` | Always retained locally; optionally exported as OTLP logs. |
+| Metrics | Authenticated `GET /metrics` in Prometheus 0.0.4 text format | The in-process OpenTelemetry manual reader and, when configured, OTLP metrics. |
+| Traces | Request spans and internal spans | OTLP traces over HTTP. Non-public HTTP requests carry route, surface, method, and status attributes with bounded labels. |
+| Operational state | Authenticated `GET /api/v1/status` | JSON snapshot for operators, dashboards, and readiness diagnosis. |
+| Liveness/readiness | `GET /healthz` and `GET /readyz` | Load balancers and supervisors. |
+
+## Prometheus metrics
+
+`/metrics` is protected by the native bearer guard. The exporter is always present, even when no OTLP backend is configured, so a local Prometheus scrape does not require a collector.
+
+OpenTelemetry names are converted to Prometheus names by replacing dots and hyphens with underscores, adding unit suffixes such as `_seconds` or `_bytes`, and adding `_total` to monotonic counters. Common instruments include:
+
+- `preloop_job_completed_total` and `preloop_job_queue_wait_seconds` for conclusions and queue latency;
+- `preloop_broker_poll_total`, `preloop_runner_session_transition_total`, and `preloop_concurrency_decision_total` for protocol and scheduling activity;
+- `preloop_job_queue_depth`, `preloop_job_claimable`, `preloop_job_unclaimable`, and `preloop_job_dependency_blocked` for queue pressure;
+- `preloop_pool_desired`, `preloop_pool_idle`, `preloop_pool_busy`, and `preloop_pool_slot_failures_total` for the local runner pool; and
+- `preloop_host_mem_*`, `preloop_host_swap_*`, `preloop_host_engine_rss_bytes`, `preloop_host_vm_rss_bytes`, and host RAM pressure gauges when host telemetry is available.
+
+HTTP request metrics use bounded labels for method, route template, surface, and status class. Surfaces include native, runner, broker, results, Git, OIDC, and live logs; concrete IDs and query strings are not labels.
+
+## OTLP/HTTP export
+
+`preloop-observability` reads the standard OpenTelemetry environment variables:
+
+| Variable | Effect |
+| --- | --- |
+| `OTEL_SERVICE_NAME` | Service resource name; defaults to `preloop`. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Generic OTLP/HTTP base. Presence enables export; the implementation adds `/v1/logs`, `/v1/traces`, and `/v1/metrics` per signal. `none` disables it. |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Complete logs endpoint; overrides the generic endpoint for logs. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Complete traces endpoint; overrides the generic endpoint for traces. |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Complete metrics endpoint; overrides the generic endpoint for metrics. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Comma-separated headers inherited by all signals, such as an ingest credential. |
+| `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_METRICS_HEADERS` | Per-signal headers; each overrides the generic headers for that signal. |
+| `PRELOOP_LOG_FORMAT` | `auto`, `pretty`, or `json`; `auto` uses pretty output on a TTY and JSON otherwise. |
+| `RUST_LOG` | `tracing` filter; defaults to `info`. |
+
+No OTLP endpoint is assumed when these variables are absent; Preloop does not silently send data to `localhost:4318`. Export is fail-open: an exporter outage does not reject a workflow. Queues are bounded and local stderr/journald logging remains available when OTLP is configured.
+
+## Operational status
+
+`GET /api/v1/status` returns the cached `OperationalSnapshot`. It includes:
+
+- overall state (`ok`, `degraded`, `blocked`, or `shutting_down`), service version, instance, and uptime;
+- queued, active, and completed runs;
+- ready, dependency-blocked, concurrency-blocked, pending-expansion, claimable, and unclaimable jobs;
+- concurrency groups, scheduler state, registered runners and sessions, leases, and assignments;
+- runner-pool desired/preparing/building/provisioning/idle/busy/paused counts and queue labels;
+- control-store backend and failure streak, state-directory storage, cache/artifact usage, and retention activity;
+- GitHub webhook/check-run health and rate-limit observations;
+- debug-session counts, OTLP enabled/export timestamps/dropped records, task heartbeats, and active conditions.
+
+The snapshot is refreshed by the state sampler. `/readyz` returns `503` when shutdown is requested, a critical task heartbeat is stale, or the sampler snapshot is older than 15 seconds. `/healthz` is a lighter liveness response and reports the protocol version and shutdown flag.
+
+## OpenObserve contribution setup
+
+The repository includes an optional OpenObserve Compose setup under `contrib/openobserve`. It is not started by Preloop. The compose file pins an image digest, binds the UI/API to `127.0.0.1:5080`, requires `ZO_ROOT_USER_PASSWORD`, keeps a seven-day telemetry retention window, and stores data in the `openobserve-data` volume.
+
+Start it from the repository with:
+
+```sh
+export ZO_ROOT_USER_PASSWORD='use-a-local-secret'
+docker compose -f contrib/openobserve/compose.yml up -d
+```
+
+Configure the OTLP endpoint and authentication headers for the OpenObserve instance using the `OTEL_EXPORTER_OTLP_*` variables above. Keep the service loopback-bound or put an authenticated proxy in front of it; the Compose reference intentionally does not publish an unauthenticated telemetry UI.

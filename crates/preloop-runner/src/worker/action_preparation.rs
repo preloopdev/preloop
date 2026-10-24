@@ -606,6 +606,7 @@ mod tests {
             env: Default::default(),
             raw: serde_json::json!({}),
             is_background: false,
+            post_of: Vec::new(),
         }];
 
         let paths = prepare_remote_actions(&msg, workspace.to_str().unwrap(), &steps, "plan")

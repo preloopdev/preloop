@@ -85,6 +85,7 @@ jobs:
       - run: |
           cargo clippy --locked -p preloop-gha-protocol -p preloop-gha-parser -p preloop-gha-expressions -p preloop-cache -p preloop-artifacts -p runner-watch -p preloop-conformance --all-targets -- -D warnings
           cargo clippy --locked -p preloop-runner -p preloop-runner-server -p preloop-runner-client -p preloop-dap --all-targets
+          cargo clippy --locked -p preloop-runner-server --lib -- -D dead_code
 
   rust-test:
     # Sharded unit/integration suite. Each shard runs 1/4 of the tests (split
@@ -119,6 +120,21 @@ jobs:
           # replay metadata. Fetch each flow directly instead of the complete
           # pinned corpus (which also contains 100+ MB container captures).
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("versions.toml", "rb"))["runner_version"])')
+          # The shipped pin can move ahead of the flat capture corpus (the
+          # compatibility pin is bumped before the flows are recorded): v2.337.0
+          # holds only nested gh-official/* captures. Fall back to the newest
+          # corpus that has the flat scenarios instead of failing every shard on
+          # a directory whose files are absent.
+          root=.runner-watch/golden
+          if [ ! -f "$root/v${version}/06-multi-step/flows.jsonl" ]; then
+            for candidate in $(ls "$root" | sed -n 's/^v\([0-9][0-9.]*\)$/\1/p' | sort -Vr); do
+              if [ -f "$root/v${candidate}/06-multi-step/flows.jsonl" ]; then
+                echo "note: no flat captures for v${version}; materializing v${candidate}" >&2
+                version=$candidate
+                break
+              fi
+            done
+          fi
           git lfs install --local --force
           includes=""
           for scenario in \

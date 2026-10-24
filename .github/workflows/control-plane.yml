@@ -17,7 +17,7 @@ on:
       - "migrations/**"
       - "fixtures/control-migrations/**"
       - "docs/control-schema.sql"
-      - "docs/control-migrations.md"
+      - "docs/contributing/control-migrations.md"
       - ".github/workflows/control-plane.yml"
   workflow_dispatch:
 

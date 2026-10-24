@@ -1,0 +1,45 @@
+digraph job_lifecycle {
+  graph [rankdir=TB, bgcolor="white", splines=spline, nodesep=0.32, ranksep=0.46, fontname="Helvetica", newrank=true, pad=0.2];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#f8fafc", color="#cbd5e1", margin="0.13,0.08"];
+  edge  [color="#64748b", arrowsize=0.65, fontname="Helvetica", fontsize=9, fontcolor="#475569"];
+
+  subgraph cluster_trigger {
+    label="Trigger"; fontsize=13; fontcolor="#7c3aed"; style="rounded,dashed"; color="#7c3aed"; margin=12;
+    trigger [label="1  Webhook or API run\nGitHub delivery, dispatch,\nor POST /api/v1/runs", fillcolor="#ede9fe"];
+  }
+
+  subgraph cluster_plan {
+    label="Plan"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    parse [label="2  Parse and match\nparse_workflow()\nmatch_event() filters", fillcolor="#e0f2fe"];
+    expand [label="3  Expand jobs\nexpand_jobs_with_reusables_and_\nshas_and_inputs_and_event()\nmatrix cells + needs DAG", fillcolor="#e0f2fe"];
+  }
+
+  subgraph cluster_queue {
+    label="Queue and claim"; fontsize=13; fontcolor="#0369a1"; style="rounded,dashed"; color="#0369a1"; margin=12;
+    enqueue [label="4  Enqueue\nControlBackend.submit_run\njobs + outbox_events", fillcolor="#bae6fd"];
+    acquire [label="5  Acquire\nrunner poll_session / acquire_for_runner\n/broker/{runner_id}/acquirejob", fillcolor="#bae6fd"];
+  }
+
+  subgraph cluster_exec {
+    label="Execution (microVM pool)"; fontsize=13; fontcolor="#b45309"; style="rounded,dashed"; color="#b45309"; margin=12;
+    pool [label="6  Fork a job VM\nRunner pool (preloop-orchestrator)\nforks a microVM per job from the\nresident golden via preloop-vm's\nVmProvider (SmolVM by default)", fillcolor="#fef3c7"];
+    run [label="7  Execute\nAgentJobRequestMessage\nlistener → worker → steps\ninside the guest", fillcolor="#fef3c7"];
+  }
+
+  subgraph cluster_report {
+    label="Report and settle"; fontsize=13; fontcolor="#15803d"; style="rounded,dashed"; color="#22c55e"; margin=12;
+    report [label="8  Report\nTimeline, Logfiles, live logs\ncompletejob / FinishJob", fillcolor="#dcfce7"];
+    settle [label="9  Settle\nControlBackend.complete_job\nstatus, needs promotion, release", fillcolor="#dcfce7"];
+    checks [label="10  GitHub Checks\ncheck_run_updates projector\nleased sender with retry/backoff", fillcolor="#bbf7d0"];
+  }
+
+  trigger -> parse [label="workflow YAML"];
+  parse -> expand [label="matched trigger"];
+  expand -> enqueue [label="AgentJobRequestMessage\ntemplate"];
+  enqueue -> acquire [label="ready queue"];
+  acquire -> pool [label="claim + message"];
+  pool -> run [label="fork from the golden"];
+  run -> report [label="logs, timeline, result"];
+  report -> settle [label="completion input"];
+  settle -> checks [label="outbox projection"];
+}

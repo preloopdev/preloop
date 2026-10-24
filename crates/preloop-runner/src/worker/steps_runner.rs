@@ -35,6 +35,13 @@ pub struct Step {
     pub raw: serde_json::Value,
     /// Background steps run without DAP step-pauses, matching the official runner.
     pub is_background: bool,
+    /// For a generated post hook: the context names of the steps whose
+    /// execution registers it — the action's main step, and its generated
+    /// `Pre` step when the action declares `pre:`. The official runner
+    /// registers a post job step from `ActionRunner.RunAsync` for the Pre and
+    /// the Main stage, so the hook runs only once one of those steps entered
+    /// its action handler. Empty for every other step.
+    pub post_of: Vec<String>,
 }
 
 /// What kind of step this is.
@@ -77,6 +84,7 @@ struct BackgroundStepStart {
     queue: Arc<Mutex<ServerQueue>>,
     step_number: u32,
     display_name: String,
+    hooks: super::execution_context::HookRegistrations,
 }
 
 impl BackgroundStepCoordinator {
@@ -92,16 +100,7 @@ impl BackgroundStepCoordinator {
         let mut bg_job = job.clone();
         self.tasks.push(tokio::spawn(async move {
             let _permit = permit.acquire_owned().await.expect("background semaphore");
-            run_background_step(
-                start.step,
-                &mut bg_job,
-                &start.workspace,
-                start.cancel_rx,
-                start.queue,
-                start.step_number,
-                start.display_name,
-            )
-            .await
+            run_background_step(&mut bg_job, start).await
         }));
     }
 
@@ -159,6 +158,50 @@ fn proxy_setup_line(ts: &str, scheme: &str, proxy: &str) -> String {
     format!("{ts} Runner is running behind proxy server '{shown}' for all {scheme} requests.")
 }
 
+/// Proxy variables whose URLs may carry a password.
+pub(crate) const PROXY_ENV_NAMES: [&str; 4] =
+    ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"];
+
+/// Mask values for the passwords of the authenticated proxies in the
+/// environment (ADR 0263: "A password provided for a proxy will be masked in
+/// the logs").
+///
+/// The official runner registers `HttpProxyPassword`/`HttpsProxyPassword`
+/// with its secret masker at host start (`HostContext`). Every job log line
+/// that carries the proxy URL, such as the `docker create -e HTTPS_PROXY=…`
+/// command line or a step echoing `$HTTPS_PROXY`, then reads
+/// `user:***@host`. Both casings are read because steps and containers
+/// inherit both. The environment sits behind `lookup` for tests.
+pub(crate) fn proxy_password_masks(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut masks = Vec::new();
+    for name in PROXY_ENV_NAMES {
+        for mask in lookup(name)
+            .as_deref()
+            .map(preloop_gha_protocol::masking::url_password_masks)
+            .unwrap_or_default()
+        {
+            if !masks.contains(&mask) {
+                masks.push(mask);
+            }
+        }
+    }
+    masks
+}
+
+/// Mask a container step's collected lines with the job masks, replay them
+/// to the runner log, and return the masked copy for the step log.
+///
+/// The lines echo `docker create` in full, including inlined `-e KEY=VALUE`
+/// env such as the proxy URLs, and the `docker logs` output of service
+/// containers, so no sink may see the raw lines.
+fn replay_container_log(job: &JobContext, lines: &[String]) -> String {
+    let masked = job.mask_secrets(&lines.join("\n"));
+    for line in masked.lines() {
+        info!("{line}");
+    }
+    masked
+}
+
 /// Run all steps sequentially, returning the job conclusion.
 ///
 /// Watches `cancel_rx` — when it becomes `true`, the current step is abandoned
@@ -186,6 +229,10 @@ pub async fn run_steps(
     let mut init_failed = false;
     let mut cancelled = false;
     let mut background = BackgroundStepCoordinator::new(10);
+    // Action steps that entered their handler, i.e. whose post hooks are
+    // registered. A generated post hook runs only if its action is in this set;
+    // the official runner registers post hooks while the action runs.
+    let hooks = super::execution_context::HookRegistrations::default();
     let now = crate::worker::helpers::iso_now();
 
     // Queue initial "Set up job" step as completed (number 1, official convention)
@@ -206,12 +253,11 @@ pub async fn run_steps(
 
     // Build "Set up job" log content matching official runner
     {
-        let runner_name = job.env.get("RUNNER_NAME").cloned().unwrap_or_else(|| {
-            crate::settings::RunnerConfig::load(std::path::Path::new("."))
-                .ok()
-                .map(|c| c.settings.agent_name)
-                .unwrap_or_else(|| "preloop-runner".to_string())
-        });
+        let runner_name = job
+            .env
+            .get("RUNNER_NAME")
+            .cloned()
+            .unwrap_or_else(|| "preloop-runner".to_string());
         let machine_name = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
@@ -273,7 +319,7 @@ pub async fn run_steps(
         setup_lines.push(format!("{ts} Prepare all required actions"));
         setup_lines.push(format!("{ts} Complete job name: {}", job.job_name));
 
-        let setup_content = setup_lines.join("\n");
+        let setup_content = job.mask_secrets(&setup_lines.join("\n"));
         {
             let mut q = queue.lock().await;
             q.record_step_logs(&setup_step_id, &setup_content);
@@ -326,6 +372,11 @@ pub async fn run_steps(
             init_logs.push(format!("##[error]{error:#}"));
         }
 
+        // The `##[command]` lines echo `docker create` in full, including
+        // inlined `-e KEY=VALUE` env such as the proxy URLs, so the step log
+        // goes through the job masks like every other log path.
+        let init_content = job.mask_secrets(&init_logs.join("\n"));
+
         let init_end = crate::worker::helpers::iso_now();
         let init_conclusion = if init_result.is_ok() {
             step_conclusion::SUCCEEDED
@@ -348,14 +399,13 @@ pub async fn run_steps(
             });
             // Attach init logs to synthetic step
             if !init_logs.is_empty() {
-                q.record_step_logs(&init_step_id, &init_logs.join("\n"));
+                q.record_step_logs(&init_step_id, &init_content);
             }
         }
         if let Some(rpt) = reporting {
             // Upload init container logs
             if !init_logs.is_empty() {
-                let content = init_logs.join("\n");
-                crate::worker::reporting::upload_step_log(rpt, &init_step_id, &content).await;
+                crate::worker::reporting::upload_step_log(rpt, &init_step_id, &init_content).await;
             }
         }
 
@@ -454,14 +504,23 @@ pub async fn run_steps(
         }
 
         // Evaluate the step condition. Official runner treats expression
-        // evaluation errors as step failures, not skips.
-        match should_run_step(step, job) {
+        // evaluation errors as step failures, not skips. A post hook whose
+        // action never registered it is skipped without evaluating its condition.
+        let orphaned_post_hook = post_hook_orphaned(step, &hooks);
+        let decision = if orphaned_post_hook {
+            Ok(false)
+        } else {
+            should_run_step(step, job)
+        };
+        match decision {
             Ok(true) => {}
             Ok(false) => {
-                info!(
-                    "Skipping step '{}' (condition not met)",
-                    resolved_display_name
-                );
+                let reason = if orphaned_post_hook {
+                    "its action step did not run"
+                } else {
+                    "condition not met"
+                };
+                info!("Skipping step '{}' ({reason})", resolved_display_name);
                 job.steps.insert(
                     step.context_name.clone(),
                     StepResult {
@@ -542,6 +601,7 @@ pub async fn run_steps(
                     queue: queue.clone(),
                     step_number,
                     display_name: resolved_display_name,
+                    hooks: hooks.clone(),
                 },
             );
             continue;
@@ -573,6 +633,9 @@ pub async fn run_steps(
             step.context_name.clone(),
             resolved_display_name.clone(),
         );
+        // An action step registers its post hook from its own handler, so the
+        // registration is visible to the hook step scheduled after it.
+        step_ctx.hooks = hooks.clone();
         // The official runner fails the step when a step-env expression
         // cannot be evaluated (AssertString throws; StepsRunner marks the
         // step failed). Never silently keep a literal `${{ }}` in the
@@ -1375,6 +1438,11 @@ pub async fn run_steps(
             // re-run. Restoring only the target snapshot leaves saveState and
             // annotations from later steps visible during their second pass.
             clear_replayed_step_state(step_ctx.job, &job_step_summaries, target, idx);
+            // A replayed step registers its post hook again only if it runs again,
+            // so its earlier registration is stale for the range about to re-run.
+            for replayed in &steps[target..=idx] {
+                hooks.unregister(&replayed.context_name);
+            }
             // Restore the snapshot captured before the *target* step, not
             // the current step. Without this, the target step's prior
             // GITHUB_ENV/GITHUB_PATH/state writes remain and are doubled.
@@ -1453,14 +1521,14 @@ pub async fn run_steps(
 
         // Run cleanup
         let mut cleanup_log = Vec::new();
+        let mut cleanup_content = String::new();
         if let Some(state) = &job.container_state {
-            if let Err(e) = super::container_ops::cleanup_containers(state, &mut cleanup_log).await
+            if let Err(e) =
+                super::container_ops::cleanup_containers(state, job, &mut cleanup_log).await
             {
                 warn!("Container cleanup failed: {e:#}");
             }
-            for line in &cleanup_log {
-                info!("{line}");
-            }
+            cleanup_content = replay_container_log(job, &cleanup_log);
         }
 
         let stop_end = crate::worker::helpers::iso_now();
@@ -1477,14 +1545,14 @@ pub async fn run_steps(
             });
             // Attach cleanup logs to synthetic step
             if !cleanup_log.is_empty() {
-                q.record_step_logs(&stop_step_id, &cleanup_log.join("\n"));
+                q.record_step_logs(&stop_step_id, &cleanup_content);
             }
         }
         if let Some(rpt) = reporting {
             // Upload cleanup logs
             if !cleanup_log.is_empty() {
-                let content = cleanup_log.join("\n");
-                crate::worker::reporting::upload_step_log(rpt, &stop_step_id, &content).await;
+                crate::worker::reporting::upload_step_log(rpt, &stop_step_id, &cleanup_content)
+                    .await;
             }
         }
     }
@@ -1546,6 +1614,15 @@ fn clear_replayed_step_state(
         job.state.remove(&summary.context_name);
         job.step_annotations.remove(&summary.context_name);
     }
+}
+
+/// Whether `step` is a post hook that none of its action steps registered.
+fn post_hook_orphaned(step: &Step, hooks: &super::execution_context::HookRegistrations) -> bool {
+    !step.post_of.is_empty()
+        && !step
+            .post_of
+            .iter()
+            .any(|registration| hooks.is_registered(registration))
 }
 
 fn should_run_step(step: &Step, job: &JobContext) -> Result<bool> {
@@ -1678,16 +1755,22 @@ async fn execute_step(
 }
 
 async fn run_background_step(
-    step: Step,
     job: &mut JobContext,
-    workspace: &str,
-    cancel_rx: watch::Receiver<bool>,
-    queue: Arc<Mutex<ServerQueue>>,
-    step_number: u32,
-    display_name: String,
+    start: BackgroundStepStart,
 ) -> BackgroundStepResult {
+    let BackgroundStepStart {
+        step,
+        workspace,
+        cancel_rx,
+        queue,
+        step_number,
+        display_name,
+        hooks,
+    } = start;
+    let workspace = workspace.as_str();
     let started_at = crate::worker::helpers::iso_now();
     let mut ctx = StepContext::new(job, step.context_name.clone(), display_name.clone());
+    ctx.hooks = hooks;
     {
         let expr_ctx = ctx.job.build_expression_context();
         for (key, value) in &step.env {
@@ -1812,7 +1895,7 @@ async fn initialize_containers(
     use super::container_ops::*;
 
     // Check Docker availability
-    if !check_docker(log).await? {
+    if !check_docker(job, log).await? {
         anyhow::bail!("Docker is not available");
     }
 
@@ -1820,10 +1903,10 @@ async fn initialize_containers(
     let network = generate_network_name();
 
     // Clean up stale containers from previous runs
-    cleanup_stale(&label, log).await?;
+    cleanup_stale(&label, job, log).await?;
 
     // Create job network
-    create_network(&network, &label, log).await?;
+    create_network(&network, &label, job, log).await?;
 
     // A container's network namespace resolves the engine origin the job
     // message advertises (the runner's loopback bridge) to the container
@@ -1878,7 +1961,7 @@ async fn initialize_containers(
             &runner_externals,
             &runner_actions,
             &toolcache,
-            job.container_engine.as_deref(),
+            job,
             log,
         )
         .await?;
@@ -1890,21 +1973,13 @@ async fn initialize_containers(
     let mut service_containers = Vec::new();
     for service in service_specs {
         let name = container_name(&service.image, &label);
-        let id = start_service_container(
-            service,
-            &name,
-            &label,
-            &network,
-            job.container_engine.as_deref(),
-            log,
-        )
-        .await?;
+        let id = start_service_container(service, &name, &label, &network, job, log).await?;
         service_containers.push((service.alias.clone(), id, name));
     }
 
     // Wait for health checks
     if !service_containers.is_empty() {
-        wait_for_services_healthy(&service_containers, log).await?;
+        wait_for_services_healthy(&service_containers, job, log).await?;
     }
 
     // Store container state in job context
@@ -1971,9 +2046,7 @@ async fn initialize_containers(
         }
     }
 
-    for line in log.iter() {
-        info!("{line}");
-    }
+    replay_container_log(job, log);
 
     Ok(())
 }

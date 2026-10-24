@@ -1,0 +1,98 @@
+---
+title: MicroVM pool
+description: How preloop serve runs each job in a microVM — VM providers, golden forks, the warm pool, and teardown.
+---
+
+Every job that `preloop serve` runs itself executes in its own microVM. The runner pool prepares one golden image per environment, boots it forkable, and hands each job a copy-on-write clone that is deleted when the job ends. The pool reaches every VM through the `VmProvider` trait.
+
+![MicroVM pool architecture](/diagrams/vm-pool.svg)
+
+## Substrates
+
+| Driver | Selected by | Runtime | Hosts |
+| --- | --- | --- | --- |
+| **SmolVM** (public driver) | `smolvm` in `PRELOOP_SANDBOX_DRIVERS`, the default | libkrun: Hypervisor.framework on macOS, KVM on Linux | macOS arm64, Linux arm64/x86_64 |
+
+A substrate is a driver behind a host agent. Each host agent attaches the drivers named in `PRELOOP_SANDBOX_DRIVERS` (default `smolvm`), and the sandbox service places work on them. SmolVM is the public driver.
+
+The pool reaches the driver through the `VmProvider` trait. The trait (create, start, start forkable, fork, exec, copy, pack, delete) declares what the driver supports through `capabilities()`, and the pool chooses its strategy from those declarations instead of assuming SmolVM semantics.
+
+<Note>
+**Single-host CI pool (current limitation).** `preloop engine` embeds the sandbox service and gives the runner pool a direct in-process handle, so the pool assumes the service, its host agent and the VMs share the engine's host: it mounts the runner bundle and externals from engine paths, passes golden packs as engine file paths, sizes capacity from the engine's disk and memory, and reaches the guest through a socket on that host. Host agents on other machines can join a service and serve other clients, but CI jobs from this engine run only on its own host. Running the pool against a remote service is tracked in #776 (part of #773).
+</Note>
+
+## How a job gets a machine
+
+<Steps>
+  <Step title="Prepare the golden">
+    The pool resolves the base image for the environment — the published official golden for `ubuntu-latest`/`ubuntu-24.04`, otherwise `PRELOOP_RUNNER_BASE_IMAGE` or the `[golden] base_image` recorded by `preloop init`. It downloads the packed artifact or bakes one with the runner contract, then starts the machine forkable so its state can be cloned.
+  </Step>
+  <Step title="Fork one clone per job">
+    When a job is queued, a slot forks the golden (`machine fork --freeze-source`). The clone shares the golden's memory and disks copy-on-write and needs no boot or provisioning.
+  </Step>
+  <Step title="Run one job">
+    The guest `preloop-runner` is configured and started through guest exec, registers with the control plane, and runs a single job.
+  </Step>
+  <Step title="Delete the machine">
+    The runner is single-use. The slot stops and deletes the microVM when the job ends, then forks a replacement — a fresh VM for every job, with the golden as the only reused state.
+  </Step>
+</Steps>
+
+The guest reaches the control plane through a control bridge: the host socket is mounted into the VM at `/run/preloop-control/engine.sock`, and the guest binds the loopback origin the server advertises, so job-side tools (`git`, actions, `curl`) that only know that origin still connect. Where a mounted socket is not available, the bridge forwards over TCP to the host address instead.
+
+## Golden images
+
+Golden artifacts live under `<PRELOOP_HOME>/vms/`, keyed by base image and environment fingerprint, with an adoption record at `<PRELOOP_HOME>/vms/goldens/<name>.fingerprint`. A missing artifact or a changed fingerprint (new runner contract, new runtime version, different architecture inputs) triggers a rebake; a matching stopped golden is adopted and re-armed on the next start instead of being rebuilt.
+
+`runs-on` selects the base. Labels containing `ubuntu-latest` or `ubuntu-24.04` resolve to the official golden; `ubuntu-22.04` and custom labels keep the configured image rather than silently selecting a 24.04 guest. Runners advertise the matching Ubuntu label plus the pool's base labels. See [VM images](/control-plane/operate/vm-images) for what a golden contains and which versions are pinned.
+
+SmolVM fork bases carry a single retained checkpoint. If it is lost, the pool re-arms the golden — stop, restart forkable, retry the fork — and waits for live clones to drain when one blocks the re-freeze. A base that cannot be re-armed fails that provision instead of silently booting something that is not the golden, and the slot retries with backoff.
+
+## Warm pool and demand
+
+The pool is demand-driven by default:
+
+- Only the golden stays resident. A runner is forked when jobs are queued, up to `available_parallelism / cpus per runner` and the host memory cap.
+- Set `PRELOOP_RUNNER_POOL_ENABLED=1` to keep a warm set of registered runners instead. `PRELOOP_RUNNER_POOL_SIZE` overrides the target (0–64); the automatic target is derived from host CPUs and memory and capped at 8. Each warm slot still holds one VM at a time and refills after every job.
+- The memory cap is `(host memory − 2048 MiB) / PRELOOP_RUNNER_MEMORY_MIB`, minus one ceiling for the resident golden. Warm mode is reduced to that cap at startup; jobs above the cap wait instead of starting more VMs.
+- A warm runner whose environment no longer matches the queued job is recycled after a short grace period. Jobs stay queued if they never match.
+
+If no matching runner appears, a ready job gets a 120-second grace window; while the pool is preparing its golden the short clock is suspended, with a one-hour backstop. `runs-on` labels no pool can satisfy fail as unschedulable instead of waiting out the hour. See [Job lifecycle](/control-plane/architecture/job-lifecycle) and [Limits](/control-plane/operate/limits).
+
+<Accordion title="Pool configuration reference">
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `PRELOOP_RUNNER_POOL_ENABLED` | `false` | Keep a warm set of idle runners instead of forking on demand. |
+| `PRELOOP_RUNNER_POOL_SIZE` | host-derived, cap 8 | Warm target, 0–64. |
+| `PRELOOP_USE_FORK` | `true` | Fork each runner from the golden; `false` creates a full VM per job. |
+| `PRELOOP_RUNNER_BASE_IMAGE` | official golden | Base image to bake a golden from. |
+| `PRELOOP_RUNNER_CPUS` | `8` | vCPUs per runner. |
+| `PRELOOP_RUNNER_MEMORY_MIB` | `4096` | Memory ceiling per runner (minimum 1024); feeds the host memory cap. |
+| `PRELOOP_RUNNER_STORAGE_GB` | `80` | Per-VM storage ceiling; sparsely backed, not allocated up front. |
+| `PRELOOP_RUNNER_OVERLAY_GB` | provider default | Root overlay size. |
+| `PRELOOP_RUNNER_MIN_FREE_DISK_GB` | `20` | Free-space reserve required before a fork or create; `0` disables. |
+
+</Accordion>
+
+## Teardown and crash recovery
+
+On shutdown the pool lets every slot stop its runner, stops the golden fork bases without deleting them so the next start adopts them, and deletes the machines it owns. The CLI gives the pool 30 seconds to settle, then aborts it and purges what is left.
+
+Crash recovery is deliberate about the two things that look like a missing VM when they are not: hypervisors that outlive a detached boot, and macOS layer images still attached to a data directory. Startup — and a periodic reconcile while serving — kills orphaned hypervisor processes, detaches orphaned layer mounts, removes data directories the provider registry no longer knows about, and prunes pack intermediates. Machines this pool owns without a current golden record are treated as stale and deleted.
+
+A stop can also be refused *by smolvm* rather than fail: `machine stop` requires the guest agent to advertise `quiesced-shutdown-v1`, and a guest agent older than the installed smolvm (≥ 1.16) cannot. The engine therefore refuses to boot from a guest-agent rootfs it can prove does not match the resolved binary, and prefers the rootfs that ships next to it over a stale copy in the data directory; the surfaced error names both rootfs paths, both agent hashes, the agent version the guest logged at boot, and the remedy (`preloop update --ensure-runtime`). See [Stale guest-agent rootfs](/control-plane/operate/vm-images#stale-guest-agent-rootfs).
+
+A failed job that requested preservation is the one exception to immediate deletion: the VM is held for a debug session and reaped after 600 seconds idle. See [Debugging](/control-plane/guides/debugging).
+
+## Disk sizing
+
+Each runner gets a sparse storage ceiling — `PRELOOP_RUNNER_STORAGE_GB`, default 80 GiB — so the number is reserved, not allocated up front. Before any fork or create, the pool requires `PRELOOP_RUNNER_MIN_FREE_DISK_GB` (default 20 GiB) of free space on the host; a full host waits and re-measures rather than failing the job or filling the disk. Unpacking a golden writes several times the packed artifact's size, so keep staging room for that on top of the reserve.
+
+## Requirements
+
+- **Linux:** `/dev/kvm` for the microVM pool.
+- **macOS:** Apple Silicon with Hypervisor.framework.
+- **Disk:** the golden artifact plus staging space (roughly 9.6 GB compressed for the official image) and the per-VM reserve above.
+
+See [Install](/control-plane/install) for setup and [Deploy](/control-plane/operate/deploy) for service exposure.
