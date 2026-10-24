@@ -339,6 +339,13 @@ pub async fn run_job(
             }
         }
     }
+    // Start the broker probe before action preparation so setup failures still
+    // report the requested ConnectivityCheck telemetry.
+    let mut ws_probe = super::job_extension::BrokerWsProbe::spawn_with_http(
+        &job_ctx,
+        reporting.as_ref().map(|rpt| rpt.token()),
+        reporting.as_ref().map(|rpt| rpt.results.http().clone()),
+    );
     // Workspace setup happens only once the lease is valid: an invalid or
     // cancelled lease must not wipe an existing checkout (`setup_workspace`
     // `remove_dir_all`s the work directory). The gate above returns early on
@@ -354,6 +361,9 @@ pub async fn run_job(
             Ok(paths) => paths,
             Err(error) => {
                 error!("Set up job failed while preparing actions: {error:#}");
+                if let (Some(probe), Some(rpt)) = (ws_probe.take(), reporting.as_ref()) {
+                    probe.finish(&rpt.connectivity_telemetry).await;
+                }
                 job_ctx.job_status = super::contexts::JobStatus::Failure;
                 report_completion(
                     &job_message,
@@ -786,6 +796,12 @@ pub async fn run_job(
             col: None,
             end_column: None,
         });
+    }
+
+    // Collect the broker websocket probe into telemetry (official:
+    // `_brokerWebSocketProbeToken.Cancel(); await _brokerWebSocketProbeTask`).
+    if let (Some(probe), Some(rpt)) = (ws_probe.take(), reporting.as_ref()) {
+        probe.finish(&rpt.connectivity_telemetry).await;
     }
 
     if was_lease_lost && !was_timeout {
