@@ -111,6 +111,30 @@ const DEFAULT_NODE_SHA256: &[(&str, &str)] = &[
         "node24_24.19.0_win-arm64",
         "755b023e729dac63c4d746883ca97903abfc278813d7b9b106ed3aea87b3278c",
     ),
+    (
+        "node24_24.21.0_linux-arm64",
+        "724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5",
+    ),
+    (
+        "node24_24.21.0_linux-x64",
+        "6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff",
+    ),
+    (
+        "node24_24.21.0_darwin-arm64",
+        "bed7eea5325e1108f32ce5228ddd6a5f0f08a499ee42aa7442aea583702f6057",
+    ),
+    (
+        "node24_24.21.0_darwin-x64",
+        "1462cb3b3046b815cf8ea436d3da450ec1a9f11dac7e5a46b0ada5305d7e8097",
+    ),
+    (
+        "node24_24.21.0_win-x64",
+        "158f7685b44de51f6c0df1d153526cbcd3e1bc739a8dfc607721cef75de9e541",
+    ),
+    (
+        "node24_24.21.0_win-arm64",
+        "8779b1bde1d39f8d420e3b57aa657b39891af434d3de44a919044cec06785921",
+    ),
 ];
 
 fn main() {
