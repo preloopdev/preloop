@@ -139,6 +139,16 @@
         "dependencies"
       ],
       "automerge": false
+    },
+    {
+      "matchDatasources": [
+        "node-version"
+      ],
+      "matchDepNames": [
+        "node24"
+      ],
+      "allowedVersions": "/^24\\./",
+      "description": "node24_externals_version is the Node 24 runtime the official runner bundles for `using: node24` actions: actions/runner externals.sh NODE24_VERSION for the pinned runner_version. The node-version datasource is not filtered by major, so without this bound Renovate can offer a newer Node major, which check-node-pin-parity and the pinned checksum tables reject. Keep this pin on the 24 line."
     }
   ],
   "customManagers": [
