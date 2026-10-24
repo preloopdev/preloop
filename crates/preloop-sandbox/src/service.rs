@@ -1645,11 +1645,12 @@ impl Service {
                         && s.state == SandboxState::Ready
                 })
                 .filter(|s| sandbox_meets(state, s, &request.requires))
+                // Cordoned providers keep their warm members but never lease them.
                 .filter(|s| {
                     state
                         .providers
                         .get(&s.provider_id)
-                        .is_some_and(|rec| !rec.provider.cordoned)
+                        .is_none_or(|rec| !rec.provider.cordoned)
                 })
                 // Oldest first, so warm members rotate and none goes stale.
                 .min_by_key(|s| (s.created_at, s.id.as_str()))
