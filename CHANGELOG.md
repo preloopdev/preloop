@@ -114,6 +114,14 @@ Releases before v0.27.0 predate the changelog.
   ready job that still has no row and logs the count at info, so a missed path
   can no longer stall the queue until a restart.
 
+### Security
+
+- **Deferred matrix legs inside a reusable callee keep the caller's cap
+  across a PostgreSQL reload.** Materialization stores the capped placeholder
+  plan for callee nodes even when they are not reusable-call placeholders, so
+  the runtime fan-out still re-applies the caller's OIDC grant and token
+  permissions, along with the callee's `job_workflow_ref`/`workflow_sha`.
+
 ## [0.35.5] - 2026-10-21
 
 ### Security

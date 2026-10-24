@@ -1621,6 +1621,77 @@ pub(crate) mod suite {
         }
     }
 
+    /// Materialization must persist the capped callee plan even when the
+    /// deferred matrix node is not itself a reusable-call placeholder.
+    pub(crate) async fn materialized_deferred_matrix_keeps_caller_plan(
+        backend: &dyn ControlBackend,
+    ) {
+        let run_id = RunId::new();
+        let mut fan = submit_job(run_id, "fan", 2);
+        fan.queued.needs = vec![JobId("gen".to_owned())];
+        fan.queued.deferred_matrix = Some("${{ fromJSON(needs.gen.outputs.m) }}".to_owned());
+        backend
+            .submit_run(submit_run(run_id, vec![submit_job(run_id, "gen", 1), fan]))
+            .await
+            .unwrap();
+        // Completing `gen` promotes the deferred node into the expansion queue.
+        backend
+            .complete_job(JobCompletionInput {
+                run_id,
+                job_id: JobId("gen".to_owned()),
+                agent_job_id: None,
+                status: ExecutionStatus::Success,
+                outputs: BTreeMap::from([("m".to_owned(), serde_json::json!({"x": [1, 2]}))]),
+                runner_id: None,
+            })
+            .await
+            .unwrap();
+        let claim = backend.claim_expansion().await.unwrap().unwrap();
+        assert_eq!(claim.job.job_id, JobId("fan".to_owned()));
+
+        let mut callee = built_matrix_leg(run_id, "call/fan", "call/fan", 0, 1);
+        callee.plan.matrix_index = None;
+        callee.plan.matrix_total = None;
+        callee.plan.deferred_matrix = Some("${{ fromJSON(inputs.matrix) }}".to_owned());
+        callee.plan.workflow_file = Some(".github/workflows/reusable.yml".to_owned());
+        callee.plan.inputs = BTreeMap::from([(
+            "matrix".to_owned(),
+            serde_json::json!("{\"target\":[\"a\",\"b\"]}"),
+        )]);
+        callee.plan.oidc_id_token_granted = false;
+        callee.plan.permissions =
+            Some(BTreeMap::from([("contents".to_owned(), "read".to_owned())]));
+        callee.plan.oidc_job_workflow_ref =
+            Some("owner/repo/.github/workflows/reusable.yml@refs/heads/main".to_owned());
+        callee.plan.workflow_sha = Some("a".repeat(40));
+        assert!(callee.plan.reusable_call.is_none());
+        let expected = callee.plan.clone();
+        backend
+            .apply_expansion(ExpansionApply {
+                job: claim.job,
+                generation: claim.generation,
+                built: Ok(crate::control::logic::BuiltExpansion::Matrix { jobs: vec![callee] }),
+            })
+            .await
+            .unwrap();
+
+        // claim_expansion reloads the persisted graph in a new transaction.
+        let claim = backend.claim_expansion().await.unwrap().unwrap();
+        assert_eq!(claim.job.job_id, expected.id);
+        let crate::control::logic::ExpansionPlan::Matrix(inputs) = claim.plan.unwrap() else {
+            panic!("the materialized callee must plan a matrix expansion");
+        };
+        assert_eq!(inputs.workflow_file, expected.workflow_file);
+        assert_eq!(inputs.scoped_inputs, expected.inputs);
+        let stored = inputs
+            .base_plan
+            .expect("the caller-capped plan must survive reload");
+        assert!(!stored.oidc_id_token_granted);
+        assert_eq!(stored.permissions, expected.permissions);
+        assert_eq!(stored.oidc_job_workflow_ref, expected.oidc_job_workflow_ref);
+        assert_eq!(stored.workflow_sha, expected.workflow_sha);
+    }
+
     /// Cancelling a run that already completed is a no-op: the terminal
     /// conclusion is preserved (pg guards the transition; lite must too).
     pub(crate) async fn cancel_of_terminal_run_preserves_conclusion(backend: &dyn ControlBackend) {
@@ -9437,6 +9508,14 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn materialized_deferred_matrix_keeps_caller_plan() {
+        let Some((_pg, backend)) = backend().await else {
+            return skip_no_postgres();
+        };
+        suite::materialized_deferred_matrix_keeps_caller_plan(&backend).await;
+    }
+
+    #[tokio::test]
     async fn cancel_of_terminal_run_preserves_conclusion() {
         let Some((_pg, backend)) = backend().await else {
             return skip_no_postgres();
@@ -11375,6 +11454,12 @@ mod lite {
     #[tokio::test]
     async fn deferred_matrix_expansion_scopes_its_inputs() {
         suite::deferred_matrix_expansion_scopes_its_inputs(&LiteBackend::in_memory().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn materialized_deferred_matrix_keeps_caller_plan() {
+        suite::materialized_deferred_matrix_keeps_caller_plan(&LiteBackend::in_memory().unwrap())
             .await;
     }
 

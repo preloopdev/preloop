@@ -87,6 +87,7 @@ fn expansion_plan(record: &crate::models::RunRecord, job: &QueuedJob) -> Option<
         needs_outputs,
         workflow_file,
         scoped_inputs,
+        base_plan: stored_plan.cloned(),
     })))
 }
 
