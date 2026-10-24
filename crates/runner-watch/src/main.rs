@@ -563,8 +563,10 @@ fn extract_latest_tag(feed: &str) -> Option<String> {
 
 async fn diff(config: &Config, args: &DiffArgs) -> anyhow::Result<()> {
     fs::create_dir_all(DEFAULT_ROOT)?;
-    let old_repo = ensure_runner_checkout(config, &args.from).await?;
-    let new_repo = ensure_runner_checkout(config, &args.to).await?;
+    let from = canonical_runner_tag(&args.from);
+    let to = canonical_runner_tag(&args.to);
+    let old_repo = ensure_runner_checkout(config, &from).await?;
+    let new_repo = ensure_runner_checkout(config, &to).await?;
     let skip_set = build_globset(&config.skip_paths.patterns)?;
     let mut entries = Vec::new();
     let files =
@@ -594,11 +596,19 @@ async fn diff(config: &Config, args: &DiffArgs) -> anyhow::Result<()> {
         .with_context(|| format!("write {}", out.display()))?;
     let mut state = read_state()?;
     state.phase = Some("diffed".to_string());
-    state.from = Some(args.from.clone());
-    state.to = Some(args.to.clone());
+    state.from = Some(from);
+    state.to = Some(to);
     write_state(state)?;
     println!("delta entries: {} -> {}", entries.len(), out.display());
     Ok(())
+}
+
+fn canonical_runner_tag(tag: &str) -> String {
+    if tag.starts_with('v') {
+        tag.to_owned()
+    } else {
+        format!("v{tag}")
+    }
 }
 
 async fn ensure_runner_checkout(config: &Config, tag: &str) -> anyhow::Result<PathBuf> {
@@ -4343,6 +4353,12 @@ area = "broker/admin flow"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_runner_tag_adds_v_prefix_only_when_missing() {
+        assert_eq!(canonical_runner_tag("2.338.0"), "v2.338.0");
+        assert_eq!(canonical_runner_tag("v2.337.0"), "v2.337.0");
+    }
 
     #[test]
     fn atom_tag_extraction_finds_release_link() {
