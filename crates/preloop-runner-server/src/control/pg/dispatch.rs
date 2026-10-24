@@ -7493,11 +7493,16 @@ impl PgBackend {
                     plan.concurrency_cancel_in_progress.as_deref(),
                     plan.concurrency_queue.as_deref(),
                 ),
-                reusable: plan.reusable_call.clone().map(|call| ReusableNodeSpec {
-                    call: Some(call),
-                    meta: None,
-                    plan: Some(plan.clone()),
-                }),
+                // A callee-inlined job carries `workflow_file` but no
+                // `reusable_call`; a deferred matrix node among them must keep
+                // its caller-capped plan for the runtime fan-out to re-apply.
+                reusable: (plan.reusable_call.is_some() || plan.workflow_file.is_some()).then(
+                    || ReusableNodeSpec {
+                        call: plan.reusable_call.clone(),
+                        meta: None,
+                        plan: Some(plan.clone()),
+                    },
+                ),
                 fail_fast: Some(plan.fail_fast),
                 continue_on_error: Some(plan.continue_on_error),
                 id_token_granted: artifacts.id_token_granted,

@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before v0.27.0 predate the changelog.
 ## [Unreleased]
 
+### Security
+
+- **Deferred matrix legs inside a reusable callee keep the caller's cap
+  across a PostgreSQL reload.** Materialization stores the capped placeholder
+  plan for callee nodes even when they are not reusable-call placeholders, so
+  the runtime fan-out still re-applies the caller's OIDC grant and token
+  permissions, along with the callee's `job_workflow_ref`/`workflow_sha`.
+
 ## [0.35.5] - 2026-10-21
 
 ### Security
