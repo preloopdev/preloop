@@ -9,7 +9,7 @@ digraph observability {
     src_http   [label="HTTP middleware\nhttp_metrics_middleware\nrequest duration, active\nW3C traceparent, spans", fillcolor="#ede9fe"];
     src_jobs   [label="Job and broker lifecycle\npreloop.job.completed\npreloop.job.queue.wait\npreloop.broker.poll", fillcolor="#ede9fe"];
     src_pool   [label="Runner pool\nPoolStatus snapshot\npreloop.pool.slot_failures", fillcolor="#ede9fe"];
-    src_host   [label="Host and VM telemetry\nsample_host(): RAM, swap, RSS\nVM fleet registry", fillcolor="#ede9fe"];
+    src_host   [label="Sandbox provider telemetry\nhost_report(): RAM, swap, RSS\nhost + per-sandbox stats", fillcolor="#ede9fe"];
     src_github [label="GitHub webhook health\nwebhook watchdog, App health\nGitHub status section", fillcolor="#ede9fe"];
     src_logs   [label="Log events\ntracing events, export_log()\nRUST_LOG, PRELOOP_LOG_FORMAT", fillcolor="#ede9fe"];
   }

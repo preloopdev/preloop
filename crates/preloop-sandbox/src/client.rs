@@ -38,6 +38,8 @@ pub trait SandboxApi: Send + Sync {
     async fn list(&self) -> Result<Vec<Sandbox>>;
     /// `ListProviders`.
     async fn list_providers(&self) -> Result<Vec<Provider>>;
+    /// `Stats`.
+    async fn stats(&self) -> Result<StatsResponse>;
     /// `Exec`.
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>>;
     /// Upload a local tar, extracted at `guest_dir`.
@@ -102,6 +104,9 @@ impl SandboxApi for InProcess {
     }
     async fn list_providers(&self) -> Result<Vec<Provider>> {
         Ok(Service::list_providers(&self.0))
+    }
+    async fn stats(&self) -> Result<StatsResponse> {
+        Ok(Service::stats(&self.0))
     }
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         Service::exec(&self.0, request)
@@ -230,6 +235,9 @@ impl SandboxApi for SandboxClient {
         self.call::<_, ListProvidersResponse>("ListProviders", &ListRequest {})
             .await
             .map(|r| r.providers)
+    }
+    async fn stats(&self) -> Result<StatsResponse> {
+        self.call("Stats", &ListRequest {}).await
     }
     async fn exec(&self, request: ExecRequest) -> Result<BoxStream<'static, Result<ExecEvent>>> {
         Ok(self

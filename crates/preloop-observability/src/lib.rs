@@ -623,7 +623,11 @@ struct Inner {
     heartbeat: TaskHeartbeat,
     limits: LimitRegistry,
     metrics: Arc<metrics::MetricsRegistry>,
-    vm_registry: Arc<vm_telemetry::VmTelemetryRegistry>,
+    /// Base meter instruments are built from. Exposed so other crates
+    /// (e.g. `preloop-sandbox`, which must not depend on this crate's
+    /// `MetricsRegistry`) can register their own instruments on the same
+    /// provider — one source for the OTLP and Prometheus readers, never two.
+    meter: opentelemetry::metrics::Meter,
     tracer: Option<opentelemetry_sdk::trace::Tracer>,
     logger: Option<opentelemetry_sdk::logs::SdkLogger>,
     prometheus_handle: Option<PrometheusHandle>,
@@ -660,7 +664,7 @@ impl Observability {
                 heartbeat: TaskHeartbeat::default(),
                 limits: LimitRegistry::default(),
                 metrics: Arc::new(metrics::MetricsRegistry::default()),
-                vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
+                meter: opentelemetry::metrics::noop::NoopMeterProvider::new().meter("preloop-noop"),
                 tracer: None,
                 logger: None,
                 prometheus_handle: None,
@@ -748,7 +752,7 @@ impl Observability {
         }
         let meter_provider = meter_builder.build();
         let meter = meter_provider.meter("preloop");
-        let metrics = Arc::new(metrics::MetricsRegistry::from_meter(meter));
+        let metrics = Arc::new(metrics::MetricsRegistry::from_meter(meter.clone()));
 
         let tracer = tracer_provider
             .as_ref()
@@ -763,7 +767,7 @@ impl Observability {
                 heartbeat: TaskHeartbeat::default(),
                 limits: LimitRegistry::default(),
                 metrics,
-                vm_registry: Arc::new(vm_telemetry::VmTelemetryRegistry::default()),
+                meter,
                 tracer,
                 logger,
                 prometheus_handle: Some(prometheus_handle),
@@ -807,8 +811,11 @@ impl Observability {
         &self.inner.metrics
     }
 
-    pub fn vm_registry(&self) -> &vm_telemetry::VmTelemetryRegistry {
-        &self.inner.vm_registry
+    /// The shared meter: other crates build their own instrument sets on
+    /// it so they share this process's readers (OTLP + Prometheus) without
+    /// depending on [`metrics::MetricsRegistry`].
+    pub fn meter(&self) -> opentelemetry::metrics::Meter {
+        self.inner.meter.clone()
     }
 
     /// The SDK tracer, when a traces endpoint is configured. `None` for

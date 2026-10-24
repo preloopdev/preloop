@@ -5,6 +5,8 @@
 //! gets its machines from it. The same service is reachable over HTTP
 //! (Connect) so other hosts can join as providers (`preloop sandbox agent`)
 //! and other callers can acquire sandboxes (`preloop sandbox acquire`).
+//! `preloop sandbox stats` prints each provider's host sample, capacity and
+//! sandboxes with their runtime facts.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -110,7 +112,10 @@ impl LocalSandboxes {
     /// Open the service (state under `<home>/state`), attach this host's
     /// SmolVM driver, and serve the API when `PRELOOP_SANDBOX_LISTEN`
     /// (default `127.0.0.1:9191`) can be bound.
-    pub(crate) async fn start(home: &Path) -> anyhow::Result<Self> {
+    pub(crate) async fn start(
+        home: &Path,
+        observability: preloop_observability::Observability,
+    ) -> anyhow::Result<Self> {
         let state = home.join("state");
         // One destructive authority per state directory: a bake or a second
         // engine must not load and reap a running service's leases.
@@ -122,6 +127,9 @@ impl LocalSandboxes {
         let store = store::open(&store_url)
             .await
             .with_context(|| format!("opening sandbox store {store_url}"))?;
+        config.metrics =
+            preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+        let metrics = config.metrics.clone();
         let service = Service::open(store, config).await?;
         let shutdown = CancellationToken::new();
         tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
@@ -139,10 +147,12 @@ impl LocalSandboxes {
             .iter()
             .find(|driver| driver.name() == pool_driver)
             .map(|driver| driver.capabilities());
+        let mut agent_config = AgentConfig::new(local_provider_name(), state.join("sandbox-agent"));
+        agent_config.metrics = metrics;
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             drivers,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
+            agent_config,
         );
         // Register once here so the pool can place immediately; the agent
         // reuses this session instead of registering a second time (which
@@ -196,6 +206,16 @@ impl LocalSandboxes {
             shutdown,
             _lock,
         })
+    }
+
+    /// The service API plus the provider id this process's agent registered
+    /// under — the pool provider whose host sample describes this engine's
+    /// host. Used to publish live sandbox telemetry to the runner server.
+    pub(crate) fn api_and_provider_id(&self) -> (Arc<dyn SandboxApi>, String) {
+        (
+            Arc::new(preloop_sandbox::InProcess(self.service.clone())),
+            self.provider_id.clone(),
+        )
     }
 
     /// The runner pool's machine provider, pinned to the pool driver
@@ -492,11 +512,12 @@ fn resolve_provider_token(configured: Option<String>, state: &Path) -> anyhow::R
 pub(crate) async fn start_if_pool(
     pool_configured: bool,
     home: &Path,
+    observability: preloop_observability::Observability,
 ) -> anyhow::Result<Option<LocalSandboxes>> {
     if !pool_configured {
         return Ok(None);
     }
-    Ok(Some(LocalSandboxes::start(home).await?))
+    Ok(Some(LocalSandboxes::start(home, observability).await?))
 }
 
 /// `preloop sandbox`.
@@ -556,6 +577,8 @@ enum SandboxCommand {
     Ls,
     /// List providers and their capabilities.
     Providers,
+    /// Per-provider host sample, capacity and sandboxes with their runtime facts.
+    Stats,
 }
 
 #[derive(Debug, Args)]
@@ -733,15 +756,18 @@ fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 }
 
 /// Entry point for `preloop sandbox`.
-pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
+pub(crate) async fn run(
+    args: SandboxArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let SandboxArgs {
         service,
         token,
         command,
     } = args;
     match command {
-        SandboxCommand::Serve(serve) => serve_standalone(serve).await,
-        SandboxCommand::Agent(agent) => run_agent(service, agent).await,
+        SandboxCommand::Serve(serve) => serve_standalone(serve, observability).await,
+        SandboxCommand::Agent(agent) => run_agent(service, agent, observability).await,
         command => {
             let state = crate::preloop_home().join("state");
             let (base, token) = resolve_client(&state, service, token)?;
@@ -901,6 +927,7 @@ pub(crate) async fn run(args: SandboxArgs) -> anyhow::Result<()> {
                 ),
                 SandboxCommand::Ls => print_json(&client.list().await?),
                 SandboxCommand::Providers => print_json(&client.list_providers().await?),
+                SandboxCommand::Stats => print_json(&client.stats().await?),
             }
         }
     }
@@ -947,7 +974,10 @@ async fn copy(client: &SandboxClient, source: &str, destination: &str) -> anyhow
     }
 }
 
-async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
+async fn serve_standalone(
+    args: ServeSandboxArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let home = crate::preloop_home();
     let state = home.join("state");
     let _lock = ServiceLock::acquire(&state)?;
@@ -957,14 +987,18 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     let mut config = ServiceConfig::new(state.join("sandbox-blobs"));
     config.placement = placement_from_env()?;
     let store = store::open(&store_url).await?;
+    config.metrics = preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
+    let metrics = config.metrics.clone();
     let service = Service::open(store, config).await?;
     let shutdown = CancellationToken::new();
     tokio::spawn(service.clone().run_maintenance(shutdown.clone()));
     if !args.no_local {
+        let mut agent_config = AgentConfig::new(local_provider_name(), state.join("sandbox-agent"));
+        agent_config.metrics = metrics;
         let agent = Agent::new(
             Arc::new(service.clone()) as Arc<dyn ProviderLink>,
             host_drivers(Some(&named_prefix()), smolvm_slots(), None)?,
-            AgentConfig::new(local_provider_name(), state.join("sandbox-agent")),
+            agent_config,
         );
         tokio::spawn(agent.run(None, shutdown.clone()));
     }
@@ -984,16 +1018,23 @@ async fn serve_standalone(args: ServeSandboxArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_agent(service: Option<String>, args: AgentArgs) -> anyhow::Result<()> {
+async fn run_agent(
+    service: Option<String>,
+    args: AgentArgs,
+    observability: preloop_observability::Observability,
+) -> anyhow::Result<()> {
     let name = args.name.unwrap_or_else(local_provider_name);
     let state = crate::preloop_home().join("state");
     let service = resolve_service(&state, service)?;
     let provider_token = resolve_provider_token(args.provider_token, &state)?;
     let scratch = state.join("sandbox-agent");
+    let mut agent_config = AgentConfig::new(name, scratch);
+    agent_config.metrics =
+        preloop_sandbox::metrics::SandboxMetrics::from_meter(&observability.meter());
     let agent = Agent::new(
         Arc::new(RemoteLink::new(&service, Some(provider_token))),
         host_drivers(Some(&named_prefix()), args.slots, None)?,
-        AgentConfig::new(name, scratch),
+        agent_config,
     );
     let shutdown = CancellationToken::new();
     let stop = shutdown.clone();
@@ -1129,7 +1170,12 @@ mod tests {
     async fn the_service_starts_only_for_a_pool() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        assert!(start_if_pool(false, &home).await.unwrap().is_none());
+        assert!(
+            start_if_pool(false, &home, preloop_observability::Observability::noop())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             !home.exists(),
             "no pool must not open the store or touch the state directory"

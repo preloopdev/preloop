@@ -84,6 +84,29 @@ impl Code {
             _ => Code::Unknown,
         }
     }
+
+    /// Snake-case wire name (`failed_precondition`, …): a bounded label for
+    /// metrics, matching the JSON codec's own rendering.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Code::Canceled => "canceled",
+            Code::Unknown => "unknown",
+            Code::InvalidArgument => "invalid_argument",
+            Code::DeadlineExceeded => "deadline_exceeded",
+            Code::NotFound => "not_found",
+            Code::AlreadyExists => "already_exists",
+            Code::PermissionDenied => "permission_denied",
+            Code::ResourceExhausted => "resource_exhausted",
+            Code::FailedPrecondition => "failed_precondition",
+            Code::Aborted => "aborted",
+            Code::OutOfRange => "out_of_range",
+            Code::Unimplemented => "unimplemented",
+            Code::Internal => "internal",
+            Code::Unavailable => "unavailable",
+            Code::DataLoss => "data_loss",
+            Code::Unauthenticated => "unauthenticated",
+        }
+    }
 }
 
 /// A Connect error.
